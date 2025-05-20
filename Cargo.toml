@@ -1,10 +1,10 @@
 [package]
-name = "web5-rust"
-version = "2.0.0-beta13"
+name = "air"
+version = "1.0.0"
 edition = "2021"
-description = "A rust crate for interacting with Web5"
+description = "A.I.R"
 license = "BSD-3-Clause"
-repository = "https://github.com/CalebCouch/web5-rust.git"
+repository = "https://github.com/CalebCouch/air.git"
 
 [dependencies]
 hex = "0.4.3"
@@ -22,7 +22,6 @@ url = { version = "2.5.0", features = ["serde"] }
 reqwest = { version="0.11.23"}
 base64 = "0.22.1"
 chrono = { version="0.4.38", features = ["serde"] }
-ecies = "0.2.7"
 typetag = "0.2.16"
 downcast-rs = "1.2.1"
 cast_trait_object = "0.1.3"
@@ -33,7 +32,7 @@ num-traits = "0.2.19"
 leveldb = {version="0.8.6", optional=true}
 db-key = "0.0.5"
 z-base-32 = "0.1.4"
-rusqlite = "0.28.0"
+rusqlite = {version="0.34.0", features =["serde_json"]}
 jsonrpc-v2 = "0.13.0"
 actix-web = "4.8.0"
 async-trait = "0.1.81"
@@ -48,16 +47,17 @@ bitcoin_hashes = {version = "0.14.0", features = ["schemars"]}
 bitcoin = {version = "0.32.2", features = ["serde"]}
 uuid = {version="1.10.0", features = ["v4", "v5", "serde"]}
 either = {version="1.13.0", features = ["serde"]}
-simple-database = {version = "1.2.1", features=["rusqlite"]}#{path="../simple-database"}
-simple-crypto = "1.0.3" #{path="../simple-crypto"}
+simple-crypto = {path="../simple_crypto"}
 log = "0.4.22"
 futures = "0.3.31"
 itertools = "0.13.0"
 snafu = { version = "0.8.5", features = ["backtrace"] }
+rusqlite_kv = {path="../rusqlite_kv"}
+easy_secp256k1 = {path="../easy_secp256k1", features=["serde"]}
+serde_rusqlite = "0.38.0"
+dyn-hash = "0.2.2"
+dyn-eq = "0.1.3"
 
 [features]
-default = ["agent"]
-leveldb = ["dep:leveldb"]
-agent = []
-dwn = []
-advanced = ["agent"]
+default = ["tcp"]
+tcp = []
