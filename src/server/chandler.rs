@@ -4,14 +4,14 @@ use serde::{Serialize, Deserialize};
 
 use std::fmt::Debug;
 
-use crate::did::DidResolver;
-use super::Handler;
+use crate::orange_name::OrangeResolver;
+use super::{Handler, Error};
 
 #[async_trait::async_trait(?Send)]
 pub trait Service: Send {
     fn name(&self) -> String;
     fn catalog(&self) -> String;
-    async fn process(&mut self, resolver: &mut dyn DidResolver, request: String) -> String;
+    async fn process(&mut self, resolver: &mut dyn OrangeResolver, request: String) -> String;
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
@@ -20,24 +20,44 @@ pub enum Request {
     Service(String, String),
     //Catalog,
 }
+impl Request {
+    pub fn batch(requests: Vec<Request>) -> Request {
+        Request::Batch(requests.into_iter().map(Box::new).collect())
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash)]
 pub enum Response {
     Batch(Vec<Box<Response>>),
     OutOfService(String),
+    Service(String),
     //Catalog(BTreeMap<String, String>),
-    Ok(String)
+}
+impl Response {
+    pub fn service<T: for<'a> Deserialize<'a>>(&self) -> Result<T, Error> {
+        match self {
+            Response::Service(response) => serde_json::from_str(response).map_err(Error::mr),
+            e => Err(Error::mr(e))
+        }
+    }
+
+    pub fn batch(self) -> Result<Vec<Response>, Error> {
+        match self {
+            Response::Batch(response) => Ok(response.into_iter().map(|r| *r).collect()),
+            e => Err(Error::mr(e))
+        }
+    }
 }
 
 pub struct Chandler {
     dir: SecretKey,
-    resolver: Box<dyn DidResolver + Send>,
+    resolver: Box<dyn OrangeResolver>,
     services: Vec<Box<dyn Service>>
 }
 
 impl Chandler {
-    pub fn new(dir: SecretKey, resolver: Box<dyn DidResolver + Send>) -> Self {
-        Chandler{dir, resolver, services: Vec::new()}
+    pub fn new(dir: SecretKey, resolver: impl OrangeResolver + 'static) -> Self {
+        Chandler{dir, resolver: Box::new(resolver), services: Vec::new()}
     }
     pub fn add_service(&mut self, service: impl Service + 'static) {
         self.services.push(Box::new(service));
@@ -58,7 +78,7 @@ impl Chandler {
                 Response::Batch(responses)
             },
             Request::Service(name, payload) => match self.services.iter_mut().find(|s| s.name() == name) {
-                Some(service) => Response::Ok(service.process(&mut *self.resolver, payload).await),
+                Some(service) => Response::Service(service.process(&mut *self.resolver, payload).await),
                 None => Response::OutOfService(name)
             },
             //Request::Catalog => Response::Catalog(self.services.iter().map(|s| (s.name(), s.catalog())).collect()),
@@ -68,6 +88,7 @@ impl Chandler {
 
 #[async_trait::async_trait(?Send)]
 impl Handler for Chandler {
+    //TODO: Sign Responses for Clientside verification
     //TODO: Add Payment System and Request Batches
     //Vec<Vec<Request>> Each Vec<Request> is a batch that must be executed in order(Payment failure to
     //one stops the batch)

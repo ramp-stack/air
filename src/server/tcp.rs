@@ -5,7 +5,7 @@ use super::{Handler, ClientError};
 pub struct Server;
 impl Server {
     pub async fn start(mut handler: impl Handler){
-        for mut stream in TcpListener::bind("localhost:5702").expect("Could not bind port 5702").incoming().flatten() {
+        for mut stream in TcpListener::bind("0.0.0.0:5702").expect("Could not bind port 5702").incoming().flatten() {
             let mut request = Vec::new();
             stream.read_to_end(&mut request).unwrap();
             stream.write_all(&handler.handle(&request).await).unwrap();
@@ -15,7 +15,7 @@ impl Server {
 }
 
 pub struct Client;
-#[async_trait::async_trait(?Send)]
+#[async_trait::async_trait]
 impl super::Client for Client {
     async fn send(&mut self, url: &str, request: &[u8]) -> Result<Vec<u8>, ClientError> {
         let mut stream = TcpStream::connect(url)?;

@@ -1,55 +1,19 @@
 use rusqlite::{OptionalExtension, Connection, params};
-use serde::{Serialize, Deserialize};
-use secp256k1::PublicKey;
 use std::path::PathBuf;
+use std::str::FromStr;
 
-use crate::server::Service;
-use crate::did::{DidResolver, Signature, Did, Error};
+use crate::server::Service as ServiceTrait;
+use crate::orange_name::{OrangeResolver, OrangeName, Signed as DidSigned, Error};
 use easy_secp256k1::Signed as KeySigned;
-use chrono::Utc;
+use crate::{DateTime, Id, now};
 
-use super::{NAME, PrivateItem};
-
-#[derive(Serialize, Deserialize, Clone, Debug, Hash)]
-pub struct Catalog {
-    //cost_per_read: u32,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, Hash)]
-pub enum Request{
-    CreatePrivate(KeySigned<PrivateItem>),//Discover Signed Item
-    ReadPrivate(KeySigned<()>),//Signed Discover, Include Size Limit?
-    UpdatePrivate(KeySigned<KeySigned<PrivateItem>>),//Discover Signed Delete Signed NewItem
-    DeletePrivate(KeySigned<PublicKey>),//Delete Signed Discover
-
-  //CreatePublic(Signed<PublicItem>),
-  //ReadPublic(String),//Sqlite Query, Include limit?
-  //UpdatePublic(Signed<PublicItem>),
-  //DeletePublic(Signed<String>),
-
-    CreateDM(Did, Vec<u8>),
-    ReadDM(Did, Signature, i64, i64)
-}
-
-#[derive(Serialize, Deserialize, Default, Clone, Debug, Hash)]
-pub enum Response {
-    InvalidRequest(String),
-    InvalidSignature(String),
-    InvalidDelete(Option<PublicKey>),
-    ReadPrivate(Option<KeySigned<PrivateItem>>),
-    PrivateConflict(KeySigned<PrivateItem>),
-  //ReadPublic(Vec<(Signed<PublicItem>, DateTime::<Utc>)>),
-  //PublicConflict(Signed<PublicItem>),
-    ReadDM(Vec<Vec<u8>>),
-    #[default]
-    Empty,
-}
+use super::{NAME, Catalog, Request, Response, PrivateItem, PublicItem, Op};
 
 #[async_trait::async_trait(?Send)]
-impl Service for StorageService {
+impl ServiceTrait for Service {
     fn name(&self) -> String {NAME.to_string()}
     fn catalog(&self) -> String {serde_json::to_string(&Catalog{}).unwrap()}
-    async fn process(&mut self, resolver: &mut dyn DidResolver, request: String) -> String {
+    async fn process(&mut self, resolver: &mut dyn OrangeResolver, request: String) -> String {
         let response = match serde_json::from_str(&request) {
             Ok(request) => self._process(resolver, request).await,
             Err(e) => Response::InvalidRequest(e.to_string())
@@ -58,31 +22,38 @@ impl Service for StorageService {
     }
 }
 
-pub struct StorageService(Connection);
-impl StorageService {
+pub struct Service(Connection);
+impl Service {
     pub async fn new(
         path: Option<PathBuf>,
     ) -> Result<Self, rusqlite::Error> {
         let database = Connection::open(path.unwrap_or(PathBuf::from(NAME)))?;
-        database.execute("CREATE TABLE if not exists private(discover TEXT NOT NULL UNIQUE, del TEXT, payload BLOB NOT NULL);", [])?;
+        database.execute("CREATE TABLE if not exists public(
+            id TEXT NOT NULL UNIQUE,
+            signer TEXT NOT NULL,
+            protocol TEXT NOT NULL,
+            timestamp INTERGER NOT NULL,
+            payload BLOB NOT NULL
+        );", [])?;
+        database.execute("CREATE TABLE if not exists private(discover TEXT NOT NULL UNIQUE, del TEXT, payload BLOB NOT NULL, timestamp INTERGER NOT NULL);", [])?;
         database.execute("CREATE TABLE if not exists dms(recipient TEXT NOT NULL, payload BLOB NOT NULL, timestamp INTERGER NOT NULL);", [])?;
-        Ok(StorageService(database))
+        Ok(Service(database))
     }
 
-    async fn _process(&self, resolver: &mut dyn DidResolver, request: Request) -> Response {
+    async fn _process(&self, resolver: &mut dyn OrangeResolver, request: Request) -> Response {
         match request {
             Request::CreatePrivate(signed) => {
                 match signed.verify() {
                     Ok(discover) => {
                         if discover != signed.as_ref().discover {return Response::InvalidRequest("Discover key mismatch between Signature and Payload".to_string());}
-                        if let Some(conflict) = self.0.query_row(&format!("SELECT * FROM private WHERE discover='{}'", discover),
-                            [], |r| Ok(serde_json::from_slice(&r.get::<&str, Vec<u8>>("payload")?).unwrap())
+                        if let Some((conflict, datetime)) = self.0.query_row(&format!("SELECT * FROM private WHERE discover='{}'", discover),
+                            [], |r| Ok((serde_json::from_slice(&r.get::<&str, Vec<u8>>("payload")?).unwrap(), r.get::<&str, i64>("timestamp")?))
                         ).optional().unwrap() {
-                            Response::PrivateConflict(conflict)
+                            Response::PrivateConflict(conflict, DateTime::from_timestamp(datetime, 0).unwrap())
                         } else {
                             self.0.execute(
-                                "INSERT INTO private(discover, del, payload) VALUES (?1, ?2, ?3);",
-                                params![discover.to_string(), signed.as_ref().delete.map(|d| d.to_string()), serde_json::to_vec(&signed).unwrap()]
+                                "INSERT INTO private(discover, del, payload, timestamp) VALUES (?1, ?2, ?3, ?4);",
+                                params![discover.to_string(), signed.as_ref().delete.map(|d| d.to_string()), serde_json::to_vec(&signed).unwrap(), now().timestamp()]
                             ).unwrap();
                             Response::Empty
                         }
@@ -94,8 +65,8 @@ impl StorageService {
                 match signed.verify() {
                     Ok(discover) => Response::ReadPrivate(
                         self.0.query_row(&format!("SELECT * FROM private WHERE discover='{}'", discover),
-                            [], |r| Ok(serde_json::from_slice(&r.get::<&str, Vec<u8>>("payload")?).unwrap())
-                        ).optional().unwrap()
+                            [], |r| Ok((serde_json::from_slice(&r.get::<&str, Vec<u8>>("payload")?).unwrap(), r.get::<&str, i64>("timestamp")?))
+                        ).optional().unwrap().map(|(i, d)| (i, DateTime::from_timestamp(d, 0).unwrap()))
                     ),
                     Err(e) => Response::InvalidSignature(e.to_string())
                 }
@@ -114,8 +85,11 @@ impl StorageService {
                                 self.0.execute("DELETE FROM private WHERE discover=?1;", [discover.to_string()]).unwrap();
                             }
                             self.0.execute(
-                                "INSERT INTO private(discover, del, payload) VALUES (?1, ?2, ?3);",
-                                params![discover.to_string(), signed.as_ref().as_ref().delete.map(|d| d.to_string()), serde_json::to_vec(signed.as_ref()).unwrap()]
+                                "INSERT INTO private(discover, del, payload, timestamp) VALUES (?1, ?2, ?3, ?4);",
+                                params![
+                                    discover.to_string(), signed.as_ref().as_ref().delete.map(|d| d.to_string()),
+                                    serde_json::to_vec(signed.as_ref()).unwrap(), now().timestamp()
+                                ]
                             ).unwrap();
                             Response::Empty
                         },
@@ -142,56 +116,106 @@ impl StorageService {
                     Err(e) => Response::InvalidSignature(e.to_string())
                 }
             },
-          //DwnRequest::CreatePublic(item) => {
-          //    if item.0.verify(&*self.did_resolver, None).await.is_ok() {
-          //        if let Some(item) = self.public_database.get::<PublicDwnItem>(&item.primary_key()).await? {
-          //            return Ok(DwnResponse::PublicConflict(item));
-          //        }
-          //        self.public_database.set(&item).await?;
-          //        DwnResponse::Empty
-          //    } else {DwnResponse::InvalidAuth("Signature".to_string())}
-          //},
-          //DwnRequest::ReadPublic(filters, sort_options) => {
-          //    DwnResponse::ReadPublic(self.public_database.query::<PublicDwnItem>(&filters, sort_options).await?.0)
-          //},
-          //DwnRequest::UpdatePublic(item) => {
-          //    if let Ok(verifier) = item.0.verify(&*self.did_resolver, None).await {
-          //        if let Some(oitem) = self.public_database.get::<PublicDwnItem>(&item.primary_key()).await? {
-          //            if verifier != *oitem.0.signer() {
-          //                return Ok(DwnResponse::InvalidAuth("Signature".to_string()));
-          //            }
-          //        }
-          //        self.public_database.set(&item).await?;
-          //        DwnResponse::Empty
-          //    } else {DwnResponse::InvalidAuth("Signature".to_string())}
-          //},
-          //DwnRequest::DeletePublic(req) => {
-          //    if let Ok(verifier) = req.verify(&*self.did_resolver, None).await {
-          //        if let Some(item) = self.public_database.get::<PublicDwnItem>(req.inner().as_bytes()).await? {
-          //            if verifier != *item.0.signer() {
-          //                return Ok(DwnResponse::InvalidAuth("Signature".to_string()));
-          //            }
-          //        }
-          //        DwnResponse::Empty
-          //    } else {DwnResponse::InvalidAuth("Signature".to_string())}
-          //},
+            Request::CreatePublic(signed) => {
+                match signed.verify(resolver, None).await {
+                    Ok(signer) => {
+                        let id = Id::random();
+                        self.0.execute(
+                            "INSERT INTO public(id, signer, protocol, timestamp, payload) VALUES (?1, ?2, ?3, ?4, ?5);",
+                            params![id.to_string(), signer.to_string(), signed.as_ref().protocol.to_string(), now().timestamp(), serde_json::to_vec(&signed).unwrap()]
+                        ).unwrap();
+                        Response::CreatedPublic(id)
+                    },
+                    Err(e) => Response::InvalidSignature(e.to_string())
+                }
+            },
+            Request::ReadPublic(filter) => {
+                let mut first = false;
+                let query = format!("SELECT * FROM public{}{}{}{}",
+                    filter.id.map(|i| {first = true; format!(" WHERE id='{}'", i)}).unwrap_or("".to_string()),
+                    filter.author.map(|a| {let r = format!(" {}signer='{}'", if first {"AND "} else {"WHERE "}, a); first = true; r}).unwrap_or("".to_string()),
+                    filter.protocol.map(|p| {let r = format!(" {}protocol='{}'", if first {"AND "} else {"WHERE "}, p); first = true; r}).unwrap_or("".to_string()),
+                    filter.datetime.map(|(op, d)| {
+                        let r = format!(" {}timestamp{}", if first {"AND "} else {"WHERE "}, match op {
+                            Op::LS => format!("<{}", d.timestamp()),
+                            Op::LSE => format!("<={}", d.timestamp()),
+                            Op::E => format!("={}", d.timestamp()),
+                            Op::GRE => format!(">={}", d.timestamp()),
+                            Op::GR => format!(">{}", d.timestamp()),
+                        });
+                        first = true;
+                        r
+                    }).unwrap_or("".to_string())
+                );
+                println!("Query: {}", query);
+                let mut stmt = self.0.prepare(&query).unwrap();
+                Response::ReadPublic(stmt.query_map([], |r| Ok((
+                    Id::from_str(&r.get::<&str, String>("id")?).unwrap(),
+                    serde_json::from_slice::<DidSigned<PublicItem>>(&r.get::<&str, Vec<u8>>("payload")?).unwrap(),
+                    DateTime::from_timestamp(r.get(3)?, 0).unwrap()
+                ))).unwrap().collect::<Result<Vec<_>, rusqlite::Error>>().unwrap())
+            },
+            Request::UpdatePublic(signed) => match signed.verify(resolver, None).await {
+                Ok(author) => {
+                    let (id, payload) = signed.into_inner();
+                    match payload.verify(resolver, None).await {
+                        Ok(author2) if author == author2 => match self.0.query_row(&format!("SELECT signer FROM public WHERE id='{}'", id),
+                                [], |r| Ok(OrangeName::from_str(&r.get::<&str, String>("signer")?).unwrap())
+                        ).optional().unwrap() {
+                            Some(author3) if author2 == author3 => {
+                                self.0.execute("DELETE FROM public WHERE id=?1;", [id.to_string()]).unwrap();
+                                self.0.execute(
+                                    "INSERT INTO public(id, signer, protocol, timestamp, payload) VALUES (?1, ?2, ?3, ?4, ?5);",
+                                    params![id.to_string(), author3.to_string(), payload.as_ref().protocol.to_string(), now().timestamp(), serde_json::to_vec(&payload).unwrap()]
+                                ).unwrap();
+                                Response::Empty
+                            },
+                            Some(_) => Response::InvalidSignature("Signer dose not match current author".to_string()),
+                            None => {
+                                self.0.execute(
+                                    "INSERT INTO public(id, signer, protocol, timestamp, payload) VALUES (?1, ?2, ?3, ?4, ?5);",
+                                    params![id.to_string(), author2.to_string(), payload.as_ref().protocol.to_string(), now().timestamp(), serde_json::to_vec(&payload).unwrap()]
+                                ).unwrap();
+                                Response::Empty
+                            }
+                        },
+                        Ok(_) => Response::InvalidSignature("Signers do not match".to_string()),
+                        Err(e) => Response::InvalidSignature(e.to_string())
+                    }
+                },
+                Err(e) => Response::InvalidSignature(e.to_string())
+            },
+            Request::DeletePublic(signed) => match signed.verify(resolver, None).await {
+                Ok(author) => {
+                    let id = signed.into_inner();
+                    match self.0.query_row(&format!("SELECT signer FROM public WHERE id='{}'", id),
+                            [], |r| Ok(OrangeName::from_str(&r.get::<&str, String>("signer")?).unwrap())
+                    ).optional().unwrap() {
+                        Some(author2) if author == author2 => {
+                            self.0.execute("DELETE FROM public WHERE id=?1;", [id.to_string()]).unwrap();
+                            Response::Empty
+                        },
+                        Some(_) => Response::InvalidSignature("Signer dose not match current author".to_string()),
+                        None => Response::Empty
+                    }
+                },
+                Err(e) => Response::InvalidSignature(e.to_string())
+            },
             Request::CreateDM(recipient, payload) => {
                 self.0.execute(
                     "INSERT INTO dms(recipient, payload, timestamp) VALUES (?1, ?2, ?3);",
-                    params![recipient.to_string(), payload, Utc::now().timestamp()]
+                    params![recipient.to_string(), payload, now().timestamp()]
                 ).unwrap();
                 Response::Empty
             },
-            Request::ReadDM(did, signature, time, since) => {
-                let now = Utc::now().timestamp();
-                match resolver.verify(&did, &signature, &[time.to_le_bytes(), since.to_le_bytes()].concat(), None).await {
-                    Ok(_) => match time <= now && time >= now-10_000 {
+            Request::ReadDM(signed) => {
+                let now = now().timestamp();
+                let time = signed.as_ref().0.timestamp();
+                let since = signed.as_ref().1.timestamp();
+                match signed.verify(resolver, None).await {
+                    Ok(name) => match time <= now && time >= now-10_000 {
                         true => {
-                            let mut stmt = self.0.prepare(&format!("SELECT payload FROM dms WHERE recipient='{}' AND timestamp >= {}", did, since)).unwrap();
-                            self.0.execute(
-                                "INSERT OR REPLACE INTO read_dms(recipient, timestamp) VALUES (?1, ?2);",
-                                params![did.to_string(), Utc::now().timestamp()]
-                            ).unwrap();
+                            let mut stmt = self.0.prepare(&format!("SELECT payload FROM dms WHERE recipient='{}' AND timestamp >= {}", name, since)).unwrap();
                             Response::ReadDM(stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<Vec<_>, rusqlite::Error>>().unwrap())
                         },
                         false => Response::InvalidSignature("Expired".to_string())

@@ -4,10 +4,10 @@ mod tcp;
 pub use tcp::Client as TcpClient;
 
 mod chandler;
-pub use chandler::{Chandler, Service, Request as ChandlerRequest, Response as ChandlerResponse};
+pub use chandler::{Chandler, Service, Request, Response};
 
 mod purser;
-pub use purser::{Purser, Request, DefaultPurser, Error, ServiceRequest, BatchRequest, AnyRequest, AnyResponse};
+pub use purser::{Purser, DefaultPurser, Error};
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -23,8 +23,8 @@ impl std::fmt::Display for ClientError {
     }
 }
 
-#[async_trait::async_trait(?Send)]
-pub trait Client {
+#[async_trait::async_trait]
+pub trait Client: Send {
     async fn send(&mut self, url: &str, request: &[u8]) -> Result<Vec<u8>, ClientError>;
 }
 
