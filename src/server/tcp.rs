@@ -1,23 +1,23 @@
 use std::net::{TcpListener, TcpStream, Shutdown};
 use std::io::{Write, Read};
-use super::{Handler, ClientError};
+use super::{Chandler, ClientError};
 
 pub struct Server;
 impl Server {
-    pub async fn start(mut handler: impl Handler){
+    pub async fn start(mut chandler: Chandler){
         for mut stream in TcpListener::bind("0.0.0.0:5702").expect("Could not bind port 5702").incoming().flatten() {
             let mut request = Vec::new();
             stream.read_to_end(&mut request).unwrap();
-            stream.write_all(&handler.handle(&request).await).unwrap();
+            stream.write_all(&chandler.handle(&request).await).unwrap();
             stream.shutdown(Shutdown::Write).unwrap();
         }
     }
 }
 
+#[derive(Default)]
 pub struct Client;
-#[async_trait::async_trait]
-impl super::Client for Client {
-    async fn send(&mut self, url: &str, request: &[u8]) -> Result<Vec<u8>, ClientError> {
+impl Client {
+    pub async fn send(&mut self, url: &str, request: &[u8]) -> Result<Vec<u8>, ClientError> {
         let mut stream = TcpStream::connect(url)?;
         stream.write_all(request)?;
         stream.shutdown(Shutdown::Write)?;

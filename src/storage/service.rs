@@ -13,7 +13,7 @@ use super::{NAME, Catalog, Request, Response, PrivateItem, PublicItem, Op};
 impl ServiceTrait for Service {
     fn name(&self) -> String {NAME.to_string()}
     fn catalog(&self) -> String {serde_json::to_string(&Catalog{}).unwrap()}
-    async fn process(&mut self, resolver: &mut dyn OrangeResolver, request: String) -> String {
+    async fn process(&mut self, resolver: &mut OrangeResolver, request: String) -> String {
         let response = match serde_json::from_str(&request) {
             Ok(request) => self._process(resolver, request).await,
             Err(e) => Response::InvalidRequest(e.to_string())
@@ -40,7 +40,7 @@ impl Service {
         Ok(Service(database))
     }
 
-    async fn _process(&self, resolver: &mut dyn OrangeResolver, request: Request) -> Response {
+    async fn _process(&self, resolver: &mut OrangeResolver, request: Request) -> Response {
         match request {
             Request::CreatePrivate(signed) => {
                 match signed.verify() {

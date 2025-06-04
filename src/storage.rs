@@ -106,26 +106,26 @@ impl Request {
         Request::DeletePrivate(KeySigned::new(discover, delete))
     }
 
-    pub async fn create_dm(resolver: &mut dyn OrangeResolver, secret: &OrangeSecret, recipient: OrangeName, payload: Vec<u8>) -> Result<Self, Error> {
+    pub async fn create_dm(resolver: &mut OrangeResolver, secret: &OrangeSecret, recipient: OrangeName, payload: Vec<u8>) -> Result<Self, Error> {
         let com = resolver.key(&recipient, Some("easy_access_com"), None).await?;
         Ok(Request::CreateDM(recipient, com.easy_encrypt(serde_json::to_vec(&(secret.name(), resolver.sign(secret, &payload).await?, payload)).unwrap()).unwrap()))
     }
 
-    pub async fn read_dm(resolver: &mut dyn OrangeResolver, secret: &OrangeSecret, since: DateTime) -> Result<Self, Error> {
+    pub async fn read_dm(resolver: &mut OrangeResolver, secret: &OrangeSecret, since: DateTime) -> Result<Self, Error> {
         Ok(Request::ReadDM(DidSigned::new(resolver, secret, (now(), since)).await?))
     }
 
-    pub async fn create_public(resolver: &mut dyn OrangeResolver, secret: &OrangeSecret, item: PublicItem) -> Result<Self, Error> {
+    pub async fn create_public(resolver: &mut OrangeResolver, secret: &OrangeSecret, item: PublicItem) -> Result<Self, Error> {
         Ok(Request::CreatePublic(DidSigned::new(resolver, secret, item).await?))
     }
 
     pub fn read_public(filter: Filter) -> Self {Request::ReadPublic(filter)}
 
-    pub async fn update_public(resolver: &mut dyn OrangeResolver, secret: &OrangeSecret, id: Id, item: PublicItem) -> Result<Self, Error> {
+    pub async fn update_public(resolver: &mut OrangeResolver, secret: &OrangeSecret, id: Id, item: PublicItem) -> Result<Self, Error> {
         let signed = DidSigned::new(resolver, secret, item).await?;
         Ok(Request::UpdatePublic(DidSigned::new(resolver, secret, (id, signed)).await?))
     }
-    pub async fn delete_public(resolver: &mut dyn OrangeResolver, secret: &OrangeSecret, id: Id) -> Result<Self, Error> {
+    pub async fn delete_public(resolver: &mut OrangeResolver, secret: &OrangeSecret, id: Id) -> Result<Self, Error> {
         Ok(Request::DeletePublic(DidSigned::new(resolver, secret, id).await?))
     }
 }

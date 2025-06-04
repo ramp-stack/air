@@ -26,7 +26,7 @@ pub enum Processed {
 }
 
 impl Processed {
-    pub fn create_pubilc(self) -> Id {match self {Self::CreatePublic(id) => id, _ => panic!("")}}
+    pub fn create_public(self) -> Id {match self {Self::CreatePublic(id) => id, _ => panic!("")}}
     pub fn read_public(self) -> Vec<(Id, OrangeName, PublicItem, DateTime)> {match self {Self::ReadPublic(items) => items, _ => panic!("")}}
 }
 
@@ -48,27 +48,27 @@ impl Client {
         Client(Request::delete_private(discover, delete), MidState::Key(delete.easy_public_key()))
     }
 
-    pub async fn create_dm(resolver: &mut dyn OrangeResolver, secret: &OrangeSecret, recipient: OrangeName, payload: Vec<u8>) -> Result<Self, Error> {
+    pub async fn create_dm(resolver: &mut OrangeResolver, secret: &OrangeSecret, recipient: OrangeName, payload: Vec<u8>) -> Result<Self, Error> {
         Ok(Client(Request::create_dm(resolver, secret, recipient, payload).await?, MidState::Empty))
     }
-    pub async fn read_dm(resolver: &mut dyn OrangeResolver, secret: &OrangeSecret, since: DateTime) -> Result<Self, Error> {
+    pub async fn read_dm(resolver: &mut OrangeResolver, secret: &OrangeSecret, since: DateTime) -> Result<Self, Error> {
         Ok(Client(Request::read_dm(resolver, secret, since).await?, MidState::Secret(secret.clone())))
     }
-    pub async fn create_public(resolver: &mut dyn OrangeResolver, secret: &OrangeSecret, item: PublicItem) -> Result<Self, Error> {
+    pub async fn create_public(resolver: &mut OrangeResolver, secret: &OrangeSecret, item: PublicItem) -> Result<Self, Error> {
         Ok(Client(Request::create_public(resolver, secret, item).await?, MidState::Empty))
     }
     pub fn read_public(filter: Filter) -> Self {Client(Request::ReadPublic(filter.clone()), MidState::Filter(filter))}
-    pub async fn update_public(resolver: &mut dyn OrangeResolver, secret: &OrangeSecret, id: Id, item: PublicItem) -> Result<Self, Error> {
+    pub async fn update_public(resolver: &mut OrangeResolver, secret: &OrangeSecret, id: Id, item: PublicItem) -> Result<Self, Error> {
         Ok(Client(Request::update_public(resolver, secret, id, item).await?, MidState::Empty))
     }
-    pub async fn delete_public(resolver: &mut dyn OrangeResolver, secret: &OrangeSecret, id: Id) -> Result<Self, Error> {
+    pub async fn delete_public(resolver: &mut OrangeResolver, secret: &OrangeSecret, id: Id) -> Result<Self, Error> {
         Ok(Client(Request::delete_public(resolver, secret, id).await?, MidState::Empty))
     }
 
     pub fn build_request(&self) -> ChandlerRequest {
         ChandlerRequest::Service(NAME.to_string(), serde_json::to_string(&self.0).unwrap())
     }
-    pub async fn process_response(&self, resolver: &mut dyn OrangeResolver, response: ChandlerResponse) -> Result<Processed, Error> {
+    pub async fn process_response(&self, resolver: &mut OrangeResolver, response: ChandlerResponse) -> Result<Processed, Error> {
         Ok(match (&self.0, &self.1, response.service()?) {
             (Request::CreatePrivate(_) | Request::ReadPrivate(_), MidState::Key(key), Response::PrivateConflict(signed, date)) 
                 if *signed.signer() == *key && signed.verify().is_ok() && signed.as_ref().discover == *key 

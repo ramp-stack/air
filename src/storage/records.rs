@@ -462,13 +462,13 @@ impl Client {
         Ok(Client(super::Client::delete_private(discover, &delete), MidState::Delete))
     }
 
-    pub async fn share(cache: &mut Cache, resolver: &mut dyn OrangeResolver, secret: &OrangeSecret, recipient: &OrangeName, perms: &Permissions, path: &RecordPath) -> Result<Self, Error> {
+    pub async fn share(cache: &mut Cache, resolver: &mut OrangeResolver, secret: &OrangeSecret, recipient: &OrangeName, perms: &Permissions, path: &RecordPath) -> Result<Self, Error> {
         let header = cache.get(path).ok_or(ValidationError::MissingRecord(path.to_string()))?;
         let header = header.clone().set(perms)?;
         Ok(Client(super::Client::create_dm(resolver, secret, recipient.clone(), serde_json::to_vec(&header)?).await?, MidState::Share))
     }
 
-    pub async fn receive(resolver: &mut dyn OrangeResolver, secret: &OrangeSecret, since: DateTime) -> Result<Self, Error> {
+    pub async fn receive(resolver: &mut OrangeResolver, secret: &OrangeSecret, since: DateTime) -> Result<Self, Error> {
         Ok(Client(super::Client::read_dm(resolver, secret, since).await?, MidState::Receive))
     }
 
@@ -486,7 +486,7 @@ impl Client {
 
     pub fn build_request(&self) -> Request {self.0.build_request()}
 
-    pub async fn process_response(&self, cache: &mut Cache, resolver: &mut dyn OrangeResolver, response: Response) -> Result<Processed, Error> {
+    pub async fn process_response(&self, cache: &mut Cache, resolver: &mut OrangeResolver, response: Response) -> Result<Processed, Error> {
         Ok(match (&self.1, self.0.process_response(resolver, response).await?) {
             (MidState::Discover(_,_,_,_,_), super::Processed::PrivateItem(None)) | (MidState::Discover(None,_,_,_,_), super::Processed::PrivateItem(_)) => Processed::Discover(None),
             (MidState::Discover(Some(read), parent_header, parent, index, protocols), super::Processed::PrivateItem(Some((item, date)))) => 

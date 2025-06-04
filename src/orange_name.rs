@@ -93,50 +93,33 @@ impl std::fmt::Debug for Endpoint {
     }
 }
 
-#[async_trait::async_trait]
-pub trait OrangeResolver: Send {
-    async fn sign(&mut self, secret: &OrangeSecret, payload: &[u8]) -> Result<OrangeSignature, Error>;
-    async fn verify(&mut self, name: &OrangeName, sig: &OrangeSignature, payload: &[u8], _when: Option<DateTime>) -> Result<(), Error>;
-    async fn secret_keys(&mut self, secret: &OrangeSecret, tag: Option<&str>, _when: Option<DateTime>) -> Result<Vec<(String, SecretKey)>, Error>;
-    async fn keys(&mut self, name: &OrangeName, tag: Option<&str>, _when: Option<DateTime>) -> Result<Vec<(String, PublicKey)>, Error>;
-    async fn endpoints(&mut self, _name: &OrangeName, tag: Option<&str>, _when: Option<DateTime>) -> Result<Vec<(String, Endpoint)>, Error>;
-
-    async fn key(&mut self, name: &OrangeName, tag: Option<&str>, when: Option<DateTime>) -> Result<PublicKey, Error> {
-        Ok(self.keys(name, tag, when).await?.first().ok_or(Error::Resolution(format!("Missing Key: {}", tag.unwrap_or("Any"))))?.1)
-    }
-    async fn endpoint(&mut self, name: &OrangeName, tag: Option<&str>, when: Option<DateTime>) -> Result<Endpoint, Error> {
-        Ok(self.endpoints(name, tag, when).await?.first().ok_or(Error::Resolution(format!("Missing Endpoint: {}", tag.unwrap_or("Any"))))?.1.clone())
-    }
-}
-
 #[derive(Debug)]
-pub struct DefaultOrangeResolver;
-#[async_trait::async_trait]
-impl OrangeResolver for DefaultOrangeResolver {
-    async fn sign(&mut self, secret: &OrangeSecret, payload: &[u8]) -> Result<OrangeSignature, Error> {
+pub struct OrangeResolver;
+impl OrangeResolver {
+    pub async fn sign(&mut self, secret: &OrangeSecret, payload: &[u8]) -> Result<OrangeSignature, Error> {
         Ok(match secret {
             OrangeSecret::Temporary(key) => OrangeSignature::Temporary(key.easy_sign(payload))
         })
     }
-    async fn verify(&mut self, name: &OrangeName, sig: &OrangeSignature, payload: &[u8], _when: Option<DateTime>) -> Result<(), Error> {
+    pub async fn verify(&mut self, name: &OrangeName, sig: &OrangeSignature, payload: &[u8], _when: Option<DateTime>) -> Result<(), Error> {
         match sig {
             OrangeSignature::Temporary(sig) => name.0.easy_verify(sig, payload).map_err(ResolutionError::from)?
         }
         Ok(())
     }
-    async fn secret_keys(&mut self, secret: &OrangeSecret, tag: Option<&str>, _when: Option<DateTime>) -> Result<Vec<(String, SecretKey)>, Error> {
+    pub async fn secret_keys(&mut self, secret: &OrangeSecret, tag: Option<&str>, _when: Option<DateTime>) -> Result<Vec<(String, SecretKey)>, Error> {
         match tag {
             Some(tag) if tag != "easy_access_com" => Ok(Vec::new()),
             _ => Ok(vec![("easy_access_com".to_string(), secret.key())]),
         }
     }
-    async fn keys(&mut self, name: &OrangeName, tag: Option<&str>, _when: Option<DateTime>) -> Result<Vec<(String, PublicKey)>, Error> {
+    pub async fn keys(&mut self, name: &OrangeName, tag: Option<&str>, _when: Option<DateTime>) -> Result<Vec<(String, PublicKey)>, Error> {
         match tag {
             Some(tag) if tag != "easy_access_com" => Ok(Vec::new()),
             _ => Ok(vec![("easy_access_com".to_string(), name.0)]),
         }
     }
-    async fn endpoints(&mut self, _name: &OrangeName, tag: Option<&str>, _when: Option<DateTime>) -> Result<Vec<(String, Endpoint)>, Error> {
+    pub async fn endpoints(&mut self, _name: &OrangeName, tag: Option<&str>, _when: Option<DateTime>) -> Result<Vec<(String, Endpoint)>, Error> {
         match tag {
             Some(tag) if tag != "default" => Ok(Vec::new()),
             _ => Ok(vec![("default".to_string(), Endpoint(
@@ -145,18 +128,25 @@ impl OrangeResolver for DefaultOrangeResolver {
             ))]),
         }
     }
+
+    pub async fn key(&mut self, name: &OrangeName, tag: Option<&str>, when: Option<DateTime>) -> Result<PublicKey, Error> {
+        Ok(self.keys(name, tag, when).await?.first().ok_or(Error::Resolution(format!("Missing Key: {}", tag.unwrap_or("Any"))))?.1)
+    }
+    pub async fn endpoint(&mut self, name: &OrangeName, tag: Option<&str>, when: Option<DateTime>) -> Result<Endpoint, Error> {
+        Ok(self.endpoints(name, tag, when).await?.first().ok_or(Error::Resolution(format!("Missing Endpoint: {}", tag.unwrap_or("Any"))))?.1.clone())
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Hash)]
 pub struct Signed<T>(OrangeName, OrangeSignature, T);
 impl<T: Hash + Serialize + for<'a> Deserialize<'a> + Clone + Debug> Signed<T> {
-    pub async fn new(resolver: &mut dyn OrangeResolver, secret: &OrangeSecret, inner: T) -> Result<Self, Error> {
+    pub async fn new(resolver: &mut OrangeResolver, secret: &OrangeSecret, inner: T) -> Result<Self, Error> {
         let signature = resolver.sign(secret, EasyHash::core_hash(&inner).as_ref()).await?;
         Ok(Signed(secret.name(), signature, inner))
     }
     pub fn into_inner(self) -> T {self.2}
     pub fn signer(&self) -> &OrangeName {&self.0}
-    pub async fn verify(&self, resolver: &mut dyn OrangeResolver, when: Option<DateTime>) -> Result<OrangeName, Error> {
+    pub async fn verify(&self, resolver: &mut OrangeResolver, when: Option<DateTime>) -> Result<OrangeName, Error> {
         resolver.verify(&self.0, &self.1, EasyHash::core_hash(&self.2).as_ref(), when).await?;
         Ok(self.0.clone())
     }
