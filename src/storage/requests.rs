@@ -26,8 +26,9 @@ pub enum Processed {
 }
 
 impl Processed {
-    pub fn create_public(self) -> Id {match self {Self::CreatePublic(id) => id, _ => panic!("")}}
-    pub fn read_public(self) -> Vec<(Id, OrangeName, PublicItem, DateTime)> {match self {Self::ReadPublic(items) => items, _ => panic!("")}}
+    pub fn create_public(self) -> Id {match self {Self::CreatePublic(id) => id, _ => panic!("Not Create Public")}}
+    pub fn read_public(self) -> Vec<(Id, OrangeName, PublicItem, DateTime)> {match self {Self::ReadPublic(items) => items, _ => panic!("Not Read Public")}}
+    pub fn assert_empty(self) {if !matches!(self, Processed::Empty) {panic!("Not Empty")}}
 }
 
 pub struct Client(Request, MidState);
