@@ -17,6 +17,7 @@ pub enum Error {
     ConnectionFailed(String),
     CriticalOrange(String)
 }
+impl std::error::Error for Error {}
 impl Error {pub(crate) fn mr(e: impl Debug) -> Self {Error::MaliciousResponse(format!("{:?}", e))}}
 impl From<orange_name::Error> for Error {fn from(error: orange_name::Error) -> Self {match error{
     orange_name::Error::Critical(error) => {Error::CriticalOrange(error)}

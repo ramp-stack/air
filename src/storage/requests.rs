@@ -1,5 +1,6 @@
 use secp256k1::{SecretKey, PublicKey};
 use easy_secp256k1::EasySecretKey;
+use serde::{Serialize, Deserialize};
 
 use super::{Request, Response, PrivateItem, NAME, PublicItem, Filter};
 use crate::server::{Request as ChandlerRequest, Response as ChandlerResponse, Error};
@@ -15,7 +16,7 @@ enum MidState {
     Empty,
 }
 
-#[derive(Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum Processed {
     CreatePublic(Id),
     PrivateItem(Option<(PrivateItem, DateTime)>),
