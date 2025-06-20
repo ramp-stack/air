@@ -8,8 +8,8 @@ impl Server {
         for mut stream in TcpListener::bind("0.0.0.0:5702").expect("Could not bind port 5702").incoming().flatten() {
             let mut request = Vec::new();
             stream.read_to_end(&mut request).unwrap();
-            stream.write_all(&chandler.handle(&request).await).unwrap();
-            stream.shutdown(Shutdown::Write).unwrap();
+            let _ = stream.write_all(&chandler.handle(&request).await);
+            let _ = stream.shutdown(Shutdown::Write);
         }
     }
 }
