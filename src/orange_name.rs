@@ -129,6 +129,9 @@ impl OrangeResolver {
         }
     }
 
+    pub async fn secret_key(&mut self, secret: &OrangeSecret, tag: Option<&str>, when: Option<DateTime>) -> Result<SecretKey, Error> {
+        Ok(self.secret_keys(secret, tag, when).await?.first().ok_or(Error::Resolution(format!("Missing Key: {}", tag.unwrap_or("Any"))))?.1)
+    }
     pub async fn key(&mut self, name: &OrangeName, tag: Option<&str>, when: Option<DateTime>) -> Result<PublicKey, Error> {
         Ok(self.keys(name, tag, when).await?.first().ok_or(Error::Resolution(format!("Missing Key: {}", tag.unwrap_or("Any"))))?.1)
     }

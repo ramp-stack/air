@@ -12,7 +12,7 @@ use crate::orange_name::{self, OrangeResolver, OrangeSecret, OrangeName};
 use crate::server::{Request, Response};
 use super::PrivateItem;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ValidationError {
     ///Action presence mismatched with protocol
     ActionMismatch(String),
@@ -31,7 +31,7 @@ impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {write!(f, "{:?}", self)}
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Error {
     MaliciousResponse(String),
     ConnectionFailed(String),
@@ -434,8 +434,8 @@ pub enum Processed {
     Read(Option<(Record, DateTime)>),
     Update(bool),
     Delete(bool),
-    Share,
     Receive(Vec<(OrangeName, RecordPath)>),
+    Empty
 }
 
 pub struct Client(super::Client, MidState);
@@ -537,7 +537,7 @@ impl Client {
             (MidState::Update, super::Processed::DeleteKey(_)) => Processed::Update(false),
             (MidState::Delete, super::Processed::Empty) => Processed::Delete(true),
             (MidState::Delete, super::Processed::DeleteKey(_)) => Processed::Delete(false),
-            (MidState::Share, super::Processed::Empty) => Processed::Share,
+            (MidState::Share, super::Processed::Empty) => Processed::Empty,
             (MidState::Receive, super::Processed::ReadDM(sent)) => {
                 Processed::Receive(sent.into_iter().flat_map(|(s, p)| {
                     let header = serde_json::from_slice::<Header>(&p).ok()?;

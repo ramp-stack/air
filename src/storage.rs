@@ -14,6 +14,7 @@ pub use service::Service;
 
 mod requests;
 pub use requests::{Client, Processed};
+
 pub mod records;
 
 const NAME: &str = "STORAGE";
