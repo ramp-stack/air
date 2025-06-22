@@ -66,10 +66,12 @@ impl Client {
     }
     pub async fn process_response(&self, resolver: &mut OrangeResolver, response: ChandlerResponse) -> Result<Processed, Error> {
         Ok(match (&self.0, &self.1, response.service()?) {
-            (Request::CreatePrivate(_) | Request::ReadPrivate(_), MidState::Key(key), Response::PrivateConflict(signed, date)) 
+            (Request::CreatePrivate(_), MidState::Key(key), Response::PrivateConflict(signed, date)) |
+            (Request::ReadPrivate(_), MidState::Key(key), Response::ReadPrivate(Some((signed, date))))
                 if *signed.signer() == *key && signed.verify().is_ok() && signed.as_ref().discover == *key 
                     => Processed::PrivateItem(Some((signed.into_inner(), date))),
-            (Request::CreatePrivate(_) | Request::ReadPrivate(_), MidState::Key(_), Response::Empty) => Processed::PrivateItem(None),
+            (Request::CreatePrivate(_), MidState::Key(_), Response::Empty) |
+            (Request::ReadPrivate(_), MidState::Key(_), Response::ReadPrivate(None)) => Processed::PrivateItem(None),
             (Request::UpdatePrivate(_) | Request::DeletePrivate(_), MidState::Key(_), Response::Empty) => Processed::DeleteKey(None),
             (Request::UpdatePrivate(_) | Request::DeletePrivate(_), MidState::Key(mkey), Response::InvalidDelete(key)) if key != Some(*mkey) => Processed::DeleteKey(key),
             (Request::CreateDM(_, _), MidState::Empty, Response::Empty) => Processed::Empty,
