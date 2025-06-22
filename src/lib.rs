@@ -16,6 +16,7 @@ impl std::ops::DerefMut for Id {fn deref_mut(&mut self) -> &mut Self::Target {&m
 impl From<[u8; 32]> for Id {fn from(id: [u8; 32]) -> Self {Id(id)}}
 impl Id {
     pub const MAX: Id = Id([u8::MAX; 32]);
+    pub const MIN: Id = Id([u8::MIN; 32]);
     pub fn hash<H: std::hash::Hash>(h: &H) -> Self {Id(*easy_secp256k1::EasyHash::core_hash(h).as_ref())}
     pub fn random() -> Self {Id(secp256k1::rand::random())}
 }

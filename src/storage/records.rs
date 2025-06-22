@@ -343,7 +343,7 @@ impl Pointer {
     fn generate(&self) -> Protocol {Protocol::new(
         Validation::new(None, None, BTreeMap::new(), false),
         HeaderInfo::new(None, BTreeMap::new(), serde_json::to_vec(&self.0).unwrap()),
-        Id::MAX
+        Id::MAX, 
     )}
 }
 
