@@ -157,7 +157,7 @@ pub struct Permissions {
     pub keys: BTreeMap<String, bool>,
 }
 impl Permissions {
-    pub fn new(children: Option<(bool, bool)>, delete: Option<bool>, keys: BTreeMap<String, bool>) -> Self {
+    pub const fn new(children: Option<(bool, bool)>, delete: Option<bool>, keys: BTreeMap<String, bool>) -> Self {
         Permissions{children, delete, keys}
     }
 }
@@ -206,8 +206,11 @@ impl KeySet {
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug, Default, Hash)]
 pub struct ChildrenValidation {
     pub children: Vec<Id>,
+    /// Can anyone with access to this protocol discover all children?
     pub anyone_discover: bool,
+    /// Can anyone with access to this protocol read all children?
     pub anyone_read: bool,
+    /// Can anyone with access to this protocol create pointers to children?
     pub allow_pointers: bool,
 }
 impl ChildrenValidation {
@@ -321,6 +324,7 @@ impl KeyGen {
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug, Hash)]
 pub struct Protocol {
+    /// Validates a record
     validation: Validation,
     header: HeaderInfo,
     id: Id
