@@ -391,6 +391,7 @@ impl Cache {
         let delete = header_info.delete.map(|d| d.get(&record_key)).transpose()?;
         let others = header_info.others.into_iter().map(|(n, k)| Ok((n, k.get(&record_key)?))).collect::<Result<BTreeMap<String, Key>, easy_secp256k1::Error>>()?;
         let validation = protocol.validation;
+        println!("{:?}", self.1.keys().map(|k| k.to_string()).collect::<Vec<_>>());
         let parent_h = self.get(parent).ok_or(ValidationError::MissingRecord(parent.to_string()))?;
         if !parent_h.1.is_child(&protocol.id) {return Err(ValidationError::InvalidProtocol(protocol.id).into());}
         let children = parent_h.0.children.ok_or(ValidationError::InvalidParent(parent.to_string()))?;
@@ -433,7 +434,7 @@ enum MidState {
 }
 
 pub enum Processed {
-    Discover(Option<(RecordPath, DateTime)>),
+    Discover(Option<RecordPath>, Option<DateTime>),
     Create(RecordPath, Option<(Result<Record, ValidationError>, DateTime)>),
     Read(Option<(Record, DateTime)>),
     Update(bool),
@@ -512,7 +513,8 @@ impl Client {
 
     pub async fn process_response(&self, cache: &mut Cache, resolver: &mut OrangeResolver, response: Response) -> Result<Processed, Error> {
         Ok(match (&self.1, self.0.process_response(resolver, response).await?) {
-            (MidState::Discover(_,_,_,_,_), super::Processed::PrivateItem(None)) | (MidState::Discover(None,_,_,_,_), super::Processed::PrivateItem(_)) => Processed::Discover(None),
+            (MidState::Discover(_,_,_,_,_), super::Processed::PrivateItem(None)) => Processed::Discover(None, None),
+            (MidState::Discover(None,_,_,_,_), super::Processed::PrivateItem(Some((_, date)))) => Processed::Discover(None, Some(date)),
             (MidState::Discover(Some(read), parent_header, parent, index, protocols), super::Processed::PrivateItem(Some((item, date)))) => 
                 Processed::Discover(Record::from_item(item, *read).ok().and_then(|record| {
                 parent_header.validate_child(&record.header).ok()?;
@@ -529,8 +531,8 @@ impl Client {
 
                 let id = header.id();
                 cache.cache(parent.clone(), header);
-                Some((parent.join(id), date))
-            })),
+                Some(parent.join(id))
+            }), Some(date)),
             (MidState::Create(record, path), super::Processed::PrivateItem(item)) => Processed::Create(
                 path.clone(), item.and_then(|(item, date)| Record::from_item(item, *record.header.0.read).map(|r| (*record != r).then_some(r)).transpose().map(|r| (r, date)))
             ),
