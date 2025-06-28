@@ -65,6 +65,7 @@ impl Client {
         ChandlerRequest::Service(NAME.to_string(), serde_json::to_string(&self.0).unwrap())
     }
     pub async fn process_response(&self, resolver: &mut OrangeResolver, response: ChandlerResponse) -> Result<Processed, Error> {
+        // println!("Processing respons");
         Ok(match (&self.0, &self.1, response.service()?) {
             (Request::CreatePrivate(_), MidState::Key(key), Response::PrivateConflict(signed, date)) |
             (Request::ReadPrivate(_), MidState::Key(key), Response::ReadPrivate(Some((signed, date))))
@@ -86,10 +87,11 @@ impl Client {
                 for signed in items {
                     match signed.verify(resolver, None).await {
                         Err(e) if e.is_critical() => {return Err(e.into());},
-                        Err(_) => {},
+                        Err(e) => {},
                         Ok(name) => {results.push((name, signed.into_inner()));}
                     }
                 }
+                println!("Results {:?}", results);
                 Processed::ReadDM(results)
             },
             (Request::CreatePublic(_), MidState::Empty, Response::CreatedPublic(id)) => Processed::CreatePublic(id),

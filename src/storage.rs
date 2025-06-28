@@ -109,7 +109,7 @@ impl Request {
 
     pub async fn create_dm(resolver: &mut OrangeResolver, secret: &OrangeSecret, recipient: OrangeName, payload: Vec<u8>) -> Result<Self, Error> {
         let com = resolver.key(&recipient, Some("easy_access_com"), None).await?;
-        Ok(Request::CreateDM(recipient, com.easy_encrypt(serde_json::to_vec(&(secret.name(), resolver.sign(secret, &payload).await?, payload)).unwrap()).unwrap()))
+        Ok(Request::CreateDM(recipient, com.easy_encrypt(serde_json::to_vec(&DidSigned::new(resolver, secret, payload).await.unwrap()).unwrap()).unwrap()))
     }
 
     pub async fn read_dm(resolver: &mut OrangeResolver, secret: &OrangeSecret, since: DateTime) -> Result<Self, Error> {

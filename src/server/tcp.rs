@@ -18,11 +18,16 @@ impl Server {
 pub struct Client;
 impl Client {
     pub async fn send(&mut self, url: &str, request: &[u8]) -> Result<Vec<u8>, ClientError> {
+        // println!(" ## SEND ## ");
         let mut stream = TcpStream::connect(url)?;
+        // println!(" ## STREAM ## ");
         stream.write_all(request)?;
+        // println!(" ## WRITE ALL ## ");
         stream.shutdown(Shutdown::Write)?;
+        // println!(" ## SHUTDOWN ## ");
         let mut response = Vec::new();
         stream.read_to_end(&mut response)?;
+        // println!(" ## READ ## ");
         Ok(response)
     }
 }

@@ -41,10 +41,15 @@ impl Purser {
     pub fn new() -> Self {Purser{client: Client}}
 
     pub async fn send(&mut self, resolver: &mut OrangeResolver, recipient: &Endpoint, request: Request) -> Result<Response, Error> {
+        // println!("(( PURSER SEND ))");
         let one_time_key = SecretKey::easy_new();
+        // println!("(( SECRET KEY ))");
         let com = resolver.key(&recipient.0, Some("easy_access_com"), None).await?;
+        // println!("(( RESOLVER ))");
         let payload = com.easy_encrypt(serde_json::to_vec(&(one_time_key.easy_public_key(), &request)).unwrap()).unwrap();
+        // println!("(( PAYLOAD ))");
         let response = self.client.send(recipient.1.as_str(), &payload).await?;
+        // println!("(( RESPONSE ))");
         serde_json::from_slice::<Response>(&one_time_key.easy_decrypt(&response).map_err(Error::mr)?).map_err(Error::mr)
     }
 
