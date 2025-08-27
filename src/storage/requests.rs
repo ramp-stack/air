@@ -3,10 +3,42 @@ use easy_secp256k1::EasySecretKey;
 use serde::{Serialize, Deserialize};
 
 use super::{Request, Response, PrivateItem, NAME, PublicItem, Filter};
-use crate::server::{Request as ChandlerRequest, Response as ChandlerResponse, Error};
+use crate::server::{Request as ChandlerRequest, Response as ChandlerResponse, Error, Status};
 use crate::{Id, DateTime};
 
 use crate::orange_name::{self, OrangeResolver, OrangeSecret, OrangeName, Signed as DidSigned};
+
+//  pub enum ReadPrivate{
+//      New(PublicKey, Request, Vec<Endpoint>),
+//      Waiting(PublicKey),
+//  }
+//  impl ReadPrivate {
+//      pub fn new(sec_discover: &SecretKey, endpoints: Vec<Endpoint>) -> Self {
+//          ReadPrivate::New(sec_discover.easy_public_key(), Request::read_private(sec_discover), endpoints)
+//      }
+//  }
+//  impl MultiRequest for ReadPrivate {
+//      type Result = Option<(DateTime, Option<PrivateItem>)>;
+//      fn run(&mut self, resolver: &mut OrangeResolver, secret: &OrangeSecret, responses: Vec<Vec<Response>>) -> Status {
+//          match *self {
+//              Self::New(key, request, endpoints) => {
+//                  *self = ReadPrivate::Waiting(key);
+//                  Status::Requests(vec![(request.into(), endpoints)])
+//              },
+//              Self::Waiting(key) => match responses[0][0] {
+//                  Response::ReadPrivate(response) => {
+//                      Status::Finished(Box::new(response.map(|(d, r)| (d, r.and_then(|signed|
+//                          (*signed.signer() == key && signed.verify().is_ok() && signed.as_ref().discover == key).then_some(
+//                              signed.into_inner()
+//                          )
+//                      )))))
+//                  },
+//                  _ => {panic!("Error");}
+//              }
+//          }
+//      }
+//  }
+
 
 #[derive(Debug)]
 enum MidState {
@@ -16,10 +48,13 @@ enum MidState {
     Empty,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Processed {
     CreatePublic(Id),
-    PrivateItem(Option<(PrivateItem, DateTime)>),
+    PrivateItem(Option<(DateTime, Option<PrivateItem>)>),
+    PrivateHeader(Option<(DateTime, Option<Vec<u8>>)>),
+    PrivateCreate(Option<DateTime>),
     ReadPublic(Vec<(Id, OrangeName, PublicItem, DateTime)>),
     DeleteKey(Option<PublicKey>),
     ReadDM(Vec<(OrangeName, Vec<u8>)>),
@@ -28,17 +63,21 @@ pub enum Processed {
 
 pub struct Client(Request, MidState);
 impl Client {
-    pub fn create_private(sec_discover: &SecretKey, delete: Option<PublicKey>, payload: Vec<u8>) -> Self {
+    pub fn create_private(sec_discover: &SecretKey, delete: Option<PublicKey>, header: Vec<u8>, payload: Vec<u8>) -> Self {
         let discover = sec_discover.easy_public_key();
-        Client(Request::create_private(sec_discover, delete, payload), MidState::Key(discover))
+        Client(Request::create_private(sec_discover, delete, header, payload), MidState::Key(discover))
+    }
+    pub fn read_private_header(sec_discover: &SecretKey) -> Self {
+        let discover = sec_discover.easy_public_key();
+        Client(Request::read_private_header(sec_discover), MidState::Key(discover))
     }
     pub fn read_private(sec_discover: &SecretKey) -> Self {
         let discover = sec_discover.easy_public_key();
         Client(Request::read_private(sec_discover), MidState::Key(discover))
     }
-    pub fn update_private(discover: &SecretKey, delete: &SecretKey, payload: Vec<u8>) -> Self {
-        Client(Request::update_private(discover, delete, payload), MidState::Key(delete.easy_public_key()))
-    }
+  //pub fn update_private(discover: &SecretKey, delete: &SecretKey, header: Vec<u8>, payload: Vec<u8>) -> Self {
+  //    Client(Request::update_private(discover, delete, header, payload), MidState::Key(delete.easy_public_key()))
+  //}
 
     pub fn delete_private(discover: PublicKey, delete: &SecretKey) -> Self {
         Client(Request::delete_private(discover, delete), MidState::Key(delete.easy_public_key()))
@@ -66,14 +105,21 @@ impl Client {
     }
     pub async fn process_response(&self, resolver: &mut OrangeResolver, response: ChandlerResponse) -> Result<Processed, Error> {
         Ok(match (&self.0, &self.1, response.service()?) {
-            (Request::CreatePrivate(_), MidState::Key(key), Response::PrivateConflict(signed, date)) |
-            (Request::ReadPrivate(_), MidState::Key(key), Response::ReadPrivate(Some((signed, date))))
-                if *signed.signer() == *key && signed.verify().is_ok() && signed.as_ref().discover == *key 
-                    => Processed::PrivateItem(Some((signed.into_inner(), date))),
-            (Request::CreatePrivate(_), MidState::Key(_), Response::Empty) |
-            (Request::ReadPrivate(_), MidState::Key(_), Response::ReadPrivate(None)) => Processed::PrivateItem(None),
-            (Request::UpdatePrivate(_) | Request::DeletePrivate(_), MidState::Key(_), Response::Empty) => Processed::DeleteKey(None),
-            (Request::UpdatePrivate(_) | Request::DeletePrivate(_), MidState::Key(mkey), Response::InvalidDelete(key)) if key != Some(*mkey) => Processed::DeleteKey(key),
+            (Request::ReadPrivateHeader(_), MidState::Key(key), Response::ReadPrivateHeader(response)) =>
+                Processed::PrivateHeader(response.map(|(d, r)| (d, r.and_then(|signed| (signed.signer() == key && signed.verify().is_ok()).then_some(signed.into_inner()))))),
+          //(Request::ReadPrivateHeader(_), MidState::Key(key), Response::ReadPrivateHeader(Some((signed, date)), exists))
+          //    if *signed.signer() == *key && signed.verify().is_ok() 
+          //        => Processed::PrivateHeader(Some((signed.into_inner(), date)), exists),
+            (Request::ReadPrivate(_), MidState::Key(key), Response::ReadPrivate(response)) => 
+                Processed::PrivateItem(response.map(|(d, r)| (d, r.and_then(|signed| (signed.signer() == key && signed.verify().is_ok() && signed.as_ref().discover == *key).then_some(signed.into_inner()))))),
+
+          //(Request::ReadPrivate(_), MidState::Key(key), Response::ReadPrivate(Some((signed, date))))
+          //    if *signed.signer() == *key && signed.verify().is_ok() && signed.as_ref().discover == *key 
+          //        => Processed::PrivateItem(Box::new(Some((signed.into_inner(), date))), exists),
+          //(Request::ReadPrivate(_), MidState::Key(_), Response::ReadPrivate(None, exists)) => Processed::PrivateItem(Box::new(None), exists),
+            (Request::DeletePrivate(_), MidState::Key(_), Response::Empty) => Processed::DeleteKey(None),
+            (Request::DeletePrivate(_), MidState::Key(mkey), Response::InvalidDelete(key)) if key != Some(*mkey) => Processed::DeleteKey(key),
+            (Request::CreatePrivate(_), MidState::Empty, Response::CreatePrivate(date)) => Processed::PrivateCreate(date),
             (Request::CreateDM(_, _), MidState::Empty, Response::Empty) => Processed::Empty,
             (Request::ReadDM(_), MidState::Secret(secret), Response::ReadDM(items)) => {
                 let key = resolver.secret_keys(secret, Some("easy_access_com"), None).await?.first()
@@ -97,7 +143,9 @@ impl Client {
                 let mut results = Vec::new();
                 for (id, signed, date) in items {
                     let name = signed.verify(resolver, Some(date)).await.map_err(Error::mr)?;
-                    results.push(filter.filter((id, name, signed.into_inner(), date)).ok_or(Error::mr("Item does not match filter"))?);
+                    if filter.filter(&id, &name, signed.as_ref(), &date) {
+                        results.push((id, name, signed.into_inner(), date));
+                    } else {return Err(Error::mr("Item does not match filter"));}
                 }
                 Processed::ReadPublic(results)
             },

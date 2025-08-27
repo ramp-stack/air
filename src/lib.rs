@@ -2,13 +2,14 @@ pub mod orange_name;
 pub mod server;
 pub mod storage;
 
-use serde::{Serialize, Deserialize};
 use easy_secp256k1::Hashable;
 
 pub type DateTime = chrono::DateTime::<chrono::Utc>;
 pub fn now() -> DateTime {chrono::Utc::now()}
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Copy)]
+#[derive(serde_with::SerializeDisplay)]
+#[derive(serde_with::DeserializeFromStr)]
 pub struct Id([u8; 32]);
 impl AsRef<[u8]> for Id {fn as_ref(&self) -> &[u8] {&self.0}}
 impl std::ops::Deref for Id {type Target = [u8; 32]; fn deref(&self) -> &Self::Target {&self.0}}

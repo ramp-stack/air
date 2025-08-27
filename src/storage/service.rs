@@ -4,10 +4,9 @@ use std::str::FromStr;
 
 use crate::server::Service as ServiceTrait;
 use crate::orange_name::{OrangeResolver, OrangeName, Signed as DidSigned, Error};
-use easy_secp256k1::Signed as KeySigned;
 use crate::{DateTime, Id, now};
 
-use super::{NAME, Catalog, Request, Response, PrivateItem, PublicItem, Op};
+use super::{NAME, Catalog, Request, Response, PublicItem, Op};
 
 #[async_trait::async_trait(?Send)]
 impl ServiceTrait for Service {
@@ -35,66 +34,76 @@ impl Service {
             timestamp INTERGER NOT NULL,
             payload BLOB NOT NULL
         );", [])?;
-        database.execute("CREATE TABLE if not exists private(discover TEXT NOT NULL UNIQUE, del TEXT, payload BLOB NOT NULL, timestamp INTERGER NOT NULL);", [])?;
-        database.execute("CREATE TABLE if not exists dms(recipient TEXT NOT NULL, payload BLOB NOT NULL, timestamp INTERGER NOT NULL);", [])?;
+        database.execute("CREATE TABLE if not exists private(
+            discover TEXT NOT NULL UNIQUE,
+            timestamp INTERGER NOT NULL,
+            del TEXT,
+            payload BLOB,
+            header BLOB,
+        );", [])?;
+        database.execute("CREATE TABLE if not exists dms(
+            recipient TEXT NOT NULL,
+            payload BLOB NOT NULL,
+            timestamp INTERGER NOT NULL
+        );", [])?;
         Ok(Service(database))
     }
 
     async fn _process(&self, resolver: &mut OrangeResolver, request: Request) -> Response {
-        match request {
+        let time = std::time::Instant::now();
+        let result = match request {
             Request::CreatePrivate(signed) => {
                 match signed.verify() {
                     Ok(discover) => {
                         if discover != signed.as_ref().discover {return Response::InvalidRequest("Discover key mismatch between Signature and Payload".to_string());}
-                        if let Some((conflict, datetime)) = self.0.query_row(&format!("SELECT * FROM private WHERE discover='{}'", discover),
-                            [], |r| Ok((serde_json::from_slice(&r.get::<&str, Vec<u8>>("payload")?).unwrap(), r.get::<&str, i64>("timestamp")?))
+                        if let Some(datetime) = self.0.query_row(&format!("SELECT timestamp FROM private WHERE discover='{discover}'"),
+                            [], |r| Ok(
+                                DateTime::from_timestamp(r.get(0)?, 0).unwrap()
+                            )
                         ).optional().unwrap() {
-                            Response::PrivateConflict(conflict, DateTime::from_timestamp(datetime, 0).unwrap())
+                            Response::CreatePrivate(Some(datetime))
                         } else {
                             self.0.execute(
-                                "INSERT INTO private(discover, del, payload, timestamp) VALUES (?1, ?2, ?3, ?4);",
-                                params![discover.to_string(), signed.as_ref().delete.map(|d| d.to_string()), serde_json::to_vec(&signed).unwrap(), now().timestamp()]
+                                "INSERT INTO private(discover, del, header, payload, timestamp) VALUES (?1, ?2, ?3, ?4, ?5);",
+                                params![
+                                    discover.to_string(),
+                                    signed.as_ref().delete.map(|d| d.to_string()),
+                                    serde_json::to_vec(&signed.as_ref().header).unwrap(),
+                                    serde_json::to_vec(&signed).unwrap(),
+                                    now().timestamp()
+                                ]
                             ).unwrap();
-                            Response::Empty
+                            Response::CreatePrivate(None)
                         }
                     },
                     Err(e) => Response::InvalidSignature(e.to_string())
                 }
             },
-            Request::ReadPrivate(signed) => {
+            Request::ReadPrivateHeader(signed) => {
                 match signed.verify() {
-                    Ok(discover) => Response::ReadPrivate(
-                        self.0.query_row(&format!("SELECT * FROM private WHERE discover='{}'", discover),
-                            [], |r| Ok((serde_json::from_slice(&r.get::<&str, Vec<u8>>("payload")?).unwrap(), r.get::<&str, i64>("timestamp")?))
-                        ).optional().unwrap().map(|(i, d)| (i, DateTime::from_timestamp(d, 0).unwrap()))
-                    ),
+                    Ok(discover) => self.0.query_row(&format!(
+                            "SELECT header, timestamp FROM private WHERE discover='{discover}'"
+                        ), [], |r| Ok(Response::ReadPrivateHeader(Some((
+                            DateTime::from_timestamp(r.get(1).unwrap(), 0).unwrap(),
+                            r.get::<usize, Vec<u8>>(0).optional()?.map(|p|
+                                serde_json::from_slice(&p).unwrap(),
+                            ),
+                        ))))
+                    ).optional().unwrap().unwrap_or(Response::ReadPrivateHeader(None)),
                     Err(e) => Response::InvalidSignature(e.to_string())
                 }
             },
-            Request::UpdatePrivate(signed) => {
+            Request::ReadPrivate(signed) => {
                 match signed.verify() {
-                    Ok(delete) => match signed.as_ref().verify() {
-                        Ok(discover) => {
-                            let old_item: Option<KeySigned<PrivateItem>> = self.0.query_row(&format!("SELECT * FROM private WHERE discover='{}'", discover),
-                                [], |r| Ok(serde_json::from_slice(&r.get::<&str, Vec<u8>>("payload")?).unwrap())
-                            ).optional().unwrap();
-                            if let Some(old_signed) = old_item {
-                                if Some(delete) != old_signed.as_ref().delete {
-                                    return Response::InvalidDelete(old_signed.as_ref().delete);
-                                }
-                                self.0.execute("DELETE FROM private WHERE discover=?1;", [discover.to_string()]).unwrap();
-                            }
-                            self.0.execute(
-                                "INSERT INTO private(discover, del, payload, timestamp) VALUES (?1, ?2, ?3, ?4);",
-                                params![
-                                    discover.to_string(), signed.as_ref().as_ref().delete.map(|d| d.to_string()),
-                                    serde_json::to_vec(signed.as_ref()).unwrap(), now().timestamp()
-                                ]
-                            ).unwrap();
-                            Response::Empty
-                        },
-                        Err(e) => Response::InvalidSignature(e.to_string())
-                    },
+                    Ok(discover) => self.0.query_row(&format!(
+                            "SELECT payload, timestamp FROM private WHERE discover='{discover}'"
+                        ), [], |r| Ok(Response::ReadPrivate(Some((
+                            DateTime::from_timestamp(r.get(1).unwrap(), 0).unwrap(),
+                            r.get::<usize, Vec<u8>>(0).optional()?.map(|p|
+                                serde_json::from_slice(&p).unwrap()
+                            ),
+                        ))))
+                    ).optional().unwrap().unwrap_or(Response::ReadPrivate(None)),
                     Err(e) => Response::InvalidSignature(e.to_string())
                 }
             },
@@ -102,14 +111,22 @@ impl Service {
                 match signed.verify() {
                     Ok(delete) => {
                         let discover = signed.as_ref();
-                        let old_item: Option<KeySigned<PrivateItem>> = self.0.query_row(&format!("SELECT * FROM private WHERE discover='{}'", discover),
-                            [], |r| Ok(serde_json::from_slice(&r.get::<&str, Vec<u8>>("payload")?).unwrap())
+                        let old_delete: Option<String> = self.0.query_row(
+                            &format!("SELECT delete private WHERE discover='{discover}' AND NOT payload=NULL"), [], |r| r.get(0)
                         ).optional().unwrap();
-                        if let Some(old_signed) = old_item {
-                            if Some(delete) != old_signed.as_ref().delete {
-                                return Response::InvalidDelete(old_signed.as_ref().delete);
+                        if let Some(old_delete) = old_delete {
+                            let old_delete = serde_json::from_str(&old_delete).unwrap();
+                            if delete != old_delete {
+                                return Response::InvalidDelete(Some(old_delete));
                             }
-                            self.0.execute("DELETE FROM private WHERE discover=?1;", [discover.to_string()]).unwrap();
+                            self.0.execute(
+                                "INSERT INTO private(discover, payload, header)
+                                 VALUES (?1, NULL, NULL)
+                                 ON CONFLICT DO UPDATE SET
+                                 payload=excluded.payloa,d
+                                 header=excluded.header;
+                                ", [discover.to_string()]
+                            ).unwrap();
                         }
                         Response::Empty
                     },
@@ -132,7 +149,7 @@ impl Service {
             Request::ReadPublic(filter) => {
                 let mut first = false;
                 let query = format!("SELECT * FROM public{}{}{}{}",
-                    filter.id.map(|i| {first = true; format!(" WHERE id='{}'", i)}).unwrap_or("".to_string()),
+                    filter.id.map(|i| {first = true; format!(" WHERE id='{i}'")}).unwrap_or("".to_string()),
                     filter.author.map(|a| {let r = format!(" {}signer='{}'", if first {"AND "} else {"WHERE "}, a); first = true; r}).unwrap_or("".to_string()),
                     filter.protocol.map(|p| {let r = format!(" {}protocol='{}'", if first {"AND "} else {"WHERE "}, p); first = true; r}).unwrap_or("".to_string()),
                     filter.datetime.map(|(op, d)| {
@@ -147,7 +164,7 @@ impl Service {
                         r
                     }).unwrap_or("".to_string())
                 );
-                println!("Query: {}", query);
+                println!("Query: {query}");
                 let mut stmt = self.0.prepare(&query).unwrap();
                 Response::ReadPublic(stmt.query_map([], |r| Ok((
                     Id::from_str(&r.get::<&str, String>("id")?).unwrap(),
@@ -159,7 +176,7 @@ impl Service {
                 Ok(author) => {
                     let (id, payload) = signed.into_inner();
                     match payload.verify(resolver, None).await {
-                        Ok(author2) if author == author2 => match self.0.query_row(&format!("SELECT signer FROM public WHERE id='{}'", id),
+                        Ok(author2) if author == author2 => match self.0.query_row(&format!("SELECT signer FROM public WHERE id='{id}'"),
                                 [], |r| Ok(OrangeName::from_str(&r.get::<&str, String>("signer")?).unwrap())
                         ).optional().unwrap() {
                             Some(author3) if author2 == author3 => {
@@ -188,7 +205,7 @@ impl Service {
             Request::DeletePublic(signed) => match signed.verify(resolver, None).await {
                 Ok(author) => {
                     let id = signed.into_inner();
-                    match self.0.query_row(&format!("SELECT signer FROM public WHERE id='{}'", id),
+                    match self.0.query_row(&format!("SELECT signer FROM public WHERE id='{id}'"),
                             [], |r| Ok(OrangeName::from_str(&r.get::<&str, String>("signer")?).unwrap())
                     ).optional().unwrap() {
                         Some(author2) if author == author2 => {
@@ -215,15 +232,17 @@ impl Service {
                 match signed.verify(resolver, None).await {
                     Ok(name) => match time <= now && time >= now-10_000 {
                         true => {
-                            let mut stmt = self.0.prepare(&format!("SELECT payload FROM dms WHERE recipient='{}' AND timestamp >= {}", name, since)).unwrap();
+                            let mut stmt = self.0.prepare(&format!("SELECT payload FROM dms WHERE recipient='{name}' AND timestamp >= {since}")).unwrap();
                             Response::ReadDM(stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<Vec<_>, rusqlite::Error>>().unwrap())
                         },
                         false => Response::InvalidSignature("Expired".to_string())
                     },
-                    Err(Error::Critical(e)) => panic!("{:?}", e),
+                    Err(Error::Critical(e)) => panic!("{e:?}"),
                     Err(e) => Response::InvalidSignature(e.to_string())
                 }
             }
-        }
+        };
+        println!("completed: {:?}", time.elapsed().as_millis());
+        result
     }
 }

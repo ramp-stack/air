@@ -1,15 +1,19 @@
 use std::net::{TcpListener, TcpStream, Shutdown};
 use std::io::{Write, Read};
+use std::time::Duration;
 use super::{Chandler, ClientError};
 
 pub struct Server;
 impl Server {
     pub async fn start(mut chandler: Chandler){
         for mut stream in TcpListener::bind("0.0.0.0:5702").expect("Could not bind port 5702").incoming().flatten() {
+            stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
             let mut request = Vec::new();
-            stream.read_to_end(&mut request).unwrap();
-            let _ = stream.write_all(&chandler.handle(&request).await);
-            let _ = stream.shutdown(Shutdown::Write);
+            if stream.read_to_end(&mut request).is_ok() {
+                let _ = stream.write_all(&chandler.handle(&request).await);
+                let _ = stream.shutdown(Shutdown::Write);
+            }
         }
     }
 }
@@ -28,5 +32,5 @@ impl Client {
 }
 
 impl From<std::io::Error> for ClientError {
-    fn from(e: std::io::Error) -> Self {ClientError::ConnectionFailed(format!("{:?}", e))}
+    fn from(e: std::io::Error) -> Self {ClientError::ConnectionFailed(format!("{e:?}"))}
 }

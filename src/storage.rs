@@ -6,7 +6,7 @@ use std::hash::Hash;
 use std::fmt::Debug;
 
 use crate::orange_name::{OrangeResolver, OrangeSecret, OrangeName, Signed as DidSigned};
-use crate::server::Error;
+use crate::server::{Request as ChandlerRequest, Error};
 use crate::{DateTime, Id, now};
 
 mod service;
@@ -17,29 +17,32 @@ pub use requests::{Client, Processed};
 
 pub mod records;
 
+//pub mod compiler;
+
 const NAME: &str = "STORAGE";
 
-#[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Hash)]
 pub struct PrivateItem {
     pub discover: PublicKey,
     pub delete: Option<PublicKey>,
+    pub header: KeySigned<Vec<u8>>,
     pub payload: Vec<u8>
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Hash)]
 pub struct DMItem(OrangeName, Vec<u8>);
 
-#[derive(Serialize, Deserialize, Clone, Debug, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
 pub struct PublicItem {
     pub protocol: Id,
     pub header: Vec<u8>,
     pub payload: Vec<u8>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
 pub enum Op {LS, LSE, E, GRE, GR}
 
-#[derive(Serialize, Deserialize, Clone, Debug, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
 pub struct Filter{
     id: Option<Id>,
     author: Option<OrangeName>,
@@ -51,21 +54,21 @@ impl Filter {
         Filter{id, author, protocol, datetime}
     }
 
-    pub fn filter(&self, item: (Id, OrangeName, PublicItem, DateTime)) -> Option<(Id, OrangeName, PublicItem, DateTime)> {
-        if let Some(id) = self.id {if item.0 != id {return None;}}
-        if let Some(author) = &self.author {if item.1 != *author {return None;}}
-        if let Some(protocol) = self.protocol {if item.2.protocol != protocol {return None;}}
+    pub fn filter(&self, oid: &Id, oauthor: &OrangeName, oitem: &PublicItem, odatetime: &DateTime) -> bool {
+        if let Some(id) = &self.id {if id != oid {return false;}}
+        if let Some(author) = &self.author {if author != oauthor {return false;}}
+        if let Some(protocol) = &self.protocol {if protocol != &oitem.protocol {return false;}}
         if let Some((op, datetime)) = &self.datetime {
             match op {
-                Op::LS if item.3 >= *datetime => {return None;},
-                Op::LSE if item.3 > *datetime => {return None;},
-                Op::E if item.3 != *datetime => {return None;},
-                Op::GRE if item.3 < *datetime => {return None;},
-                Op::GR if item.3 <= *datetime => {return None;},
+                Op::LS if odatetime >= datetime => {return false;},
+                Op::LSE if odatetime > datetime => {return false;},
+                Op::E if odatetime != datetime => {return false;},
+                Op::GRE if odatetime < datetime => {return false;},
+                Op::GR if odatetime <= datetime => {return false;},
                 _ => {}
             }
         }
-        Some(item) 
+        true
     }
 }
 
@@ -78,7 +81,7 @@ pub struct Catalog {
 pub enum Request{
     CreatePrivate(KeySigned<PrivateItem>),//Discover Signed Item
     ReadPrivate(KeySigned<()>),//Signed Discover, Include Size Limit?
-    UpdatePrivate(KeySigned<KeySigned<PrivateItem>>),//Discover Signed Delete Signed NewItem
+    ReadPrivateHeader(KeySigned<()>),
     DeletePrivate(KeySigned<PublicKey>),//Delete Signed Discover
 
     CreatePublic(DidSigned<PublicItem>),
@@ -91,18 +94,21 @@ pub enum Request{
 }
 
 impl Request {
-    pub fn create_private(sec_discover: &SecretKey, delete: Option<PublicKey>, payload: Vec<u8>) -> Self {
+    pub fn create_private(sec_discover: &SecretKey, delete: Option<PublicKey>, header: Vec<u8>, payload: Vec<u8>) -> Self {
         let discover = sec_discover.easy_public_key();
-        Request::CreatePrivate(KeySigned::new(PrivateItem{discover, delete, payload}, sec_discover))
+        Request::CreatePrivate(KeySigned::new(PrivateItem{discover, delete, header: KeySigned::new(header, sec_discover), payload}, sec_discover))
     }
     pub fn read_private(discover: &SecretKey) -> Self {
         Request::ReadPrivate(KeySigned::new((), discover))
     }
-    pub fn update_private(discover: &SecretKey, delete: &SecretKey, payload: Vec<u8>) -> Self {
-        Request::UpdatePrivate(KeySigned::new(KeySigned::new(
-            PrivateItem{discover: discover.easy_public_key(), delete: Some(delete.easy_public_key()), payload},
-        discover), delete))
+    pub fn read_private_header(discover: &SecretKey) -> Self {
+        Request::ReadPrivateHeader(KeySigned::new((), discover))
     }
+  //pub fn update_private(discover: &SecretKey, delete: &SecretKey, header: Vec<u8>, payload: Vec<u8>) -> Self {
+  //    Request::UpdatePrivate(KeySigned::new(KeySigned::new(
+  //        PrivateItem{discover: discover.easy_public_key(), delete: Some(delete.easy_public_key()), header: KeySigned::new(header, discover), payload},
+  //    discover), delete))
+  //}
     pub fn delete_private(discover: PublicKey, delete: &SecretKey) -> Self {
         Request::DeletePrivate(KeySigned::new(discover, delete))
     }
@@ -131,13 +137,21 @@ impl Request {
     }
 }
 
+impl From<Request> for ChandlerRequest {
+    fn from(req: Request) -> ChandlerRequest {
+        ChandlerRequest::Service(NAME.to_string(), serde_json::to_string(&req).unwrap())
+    }
+}
+
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Default, Clone, Debug, Hash)]
 pub enum Response {
     InvalidRequest(String),
     InvalidSignature(String),
     InvalidDelete(Option<PublicKey>),
-    ReadPrivate(Option<(KeySigned<PrivateItem>, DateTime)>),
-    PrivateConflict(KeySigned<PrivateItem>, DateTime),
+    ReadPrivate(Option<(DateTime, Option<KeySigned<PrivateItem>>)>),
+    ReadPrivateHeader(Option<(DateTime, Option<KeySigned<Vec<u8>>>)>),
+    CreatePrivate(Option<DateTime>),
     CreatedPublic(Id),
     ReadPublic(Vec<(Id, DidSigned<PublicItem>, DateTime)>),
     ReadDM(Vec<Vec<u8>>),

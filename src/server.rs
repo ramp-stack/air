@@ -7,7 +7,7 @@ mod chandler;
 pub use chandler::{Chandler, Service, Request, Response};
 
 mod purser;
-pub use purser::{Purser, Error};
+pub use purser::{Purser, Status, Error, Compiler, Command, AnyCommand, CommandResult, Context};
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -19,6 +19,6 @@ pub enum ClientError {
 impl std::error::Error for ClientError {}
 impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
