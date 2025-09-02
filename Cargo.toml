@@ -23,6 +23,7 @@ tokio = {version = "1.47.1", features = ["sync", "time"]}
 typetag = "0.2.20"
 erased-serde = "0.4.6"
 inventory = "0.3.21"
+state = "0.6.0"
 
 [features]
 default = ["tcp"]

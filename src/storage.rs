@@ -6,14 +6,14 @@ use std::hash::Hash;
 use std::fmt::Debug;
 
 use crate::orange_name::{OrangeResolver, OrangeSecret, OrangeName, Signed as DidSigned};
-use crate::server::{Request as ChandlerRequest, Error};
+use crate::server::{Request as ChandlerRequest, Error, ServiceRequest};
 use crate::{DateTime, Id, now};
 
 mod service;
 pub use service::Service;
 
 mod requests;
-pub use requests::{Client, Processed};
+//pub use requests::{Client, Processed};
 
 pub mod records;
 
@@ -93,6 +93,10 @@ pub enum Request{
     ReadDM(DidSigned<(DateTime, DateTime)>)
 }
 
+impl ServiceRequest for Request {
+    type Response = Response;
+}
+
 impl Request {
     pub fn create_private(sec_discover: &SecretKey, delete: Option<PublicKey>, header: Vec<u8>, payload: Vec<u8>) -> Self {
         let discover = sec_discover.easy_public_key();
@@ -104,11 +108,6 @@ impl Request {
     pub fn read_private_header(discover: &SecretKey) -> Self {
         Request::ReadPrivateHeader(KeySigned::new((), discover))
     }
-  //pub fn update_private(discover: &SecretKey, delete: &SecretKey, header: Vec<u8>, payload: Vec<u8>) -> Self {
-  //    Request::UpdatePrivate(KeySigned::new(KeySigned::new(
-  //        PrivateItem{discover: discover.easy_public_key(), delete: Some(delete.easy_public_key()), header: KeySigned::new(header, discover), payload},
-  //    discover), delete))
-  //}
     pub fn delete_private(discover: PublicKey, delete: &SecretKey) -> Self {
         Request::DeletePrivate(KeySigned::new(discover, delete))
     }
@@ -143,18 +142,73 @@ impl From<Request> for ChandlerRequest {
     }
 }
 
+pub type Item<I> = Option<(DateTime, Option<KeySigned<I>>)>;
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Default, Clone, Debug, Hash)]
 pub enum Response {
     InvalidRequest(String),
     InvalidSignature(String),
     InvalidDelete(Option<PublicKey>),
-    ReadPrivate(Option<(DateTime, Option<KeySigned<PrivateItem>>)>),
-    ReadPrivateHeader(Option<(DateTime, Option<KeySigned<Vec<u8>>>)>),
+    ReadPrivate(Item<PrivateItem>),
+    ReadPrivateHeader(Item<Vec<u8>>),
     CreatePrivate(Option<DateTime>),
     CreatedPublic(Id),
     ReadPublic(Vec<(Id, DidSigned<PublicItem>, DateTime)>),
     ReadDM(Vec<Vec<u8>>),
     #[default]
     Empty,
+}
+
+impl Response {
+    pub fn create_private(self) -> Result<Option<DateTime>, Error> {match self {
+        Self::CreatePrivate(result) => Ok(result),
+        r => Err(Error::mr(r))
+    }}
+
+    pub fn read_private_header(self) -> Result<Item<Vec<u8>>, Error> {match self {
+        Self::ReadPrivateHeader(result) => Ok(result),
+        r => Err(Error::mr(r))
+    }}
+
+    pub fn read_private(self) -> Result<Item<PrivateItem>, Error> {match self {
+        Self::ReadPrivate(result) => Ok(result),
+        r => Err(Error::mr(r))
+    }}
+
+    pub fn delete_private(self) -> Result<Option<Option<PublicKey>>, Error> {match self {
+        Self::InvalidDelete(result) => Ok(Some(result)),
+        Self::Empty => Ok(None),
+        r => Err(Error::mr(r))
+    }}
+
+    pub fn create_dm(self) -> Result<(), Error> {match self {
+        Self::Empty => Ok(()),
+        r => Err(Error::mr(r))
+    }}
+
+    pub fn read_dm(self) -> Result<Vec<Vec<u8>>, Error> {match self {
+        Self::ReadDM(result) => Ok(result),
+        r => Err(Error::mr(r))
+    }}
+
+    pub fn create_public(self) -> Result<Id, Error> {match self {
+        Self::CreatedPublic(result) => Ok(result),
+        r => Err(Error::mr(r))
+    }}
+
+    pub fn read_public(self) -> Result<Vec<(Id, DidSigned<PublicItem>, DateTime)>, Error> {match self {
+        Self::ReadPublic(result) => Ok(result),
+        r => Err(Error::mr(r))
+    }}
+
+    pub fn update_public(self) -> Result<(), Error> {match self {
+        Self::Empty => Ok(()),
+        r => Err(Error::mr(r))
+    }}
+
+    pub fn delete_public(self) -> Result<(), Error> {match self {
+        Self::Empty => Ok(()),
+        r => Err(Error::mr(r))
+    }}
 }

@@ -8,8 +8,8 @@ use std::cmp::Ordering;
 use std::fmt::Debug;
 
 use crate::{DateTime, Id};
-use crate::orange_name::{self, OrangeResolver, OrangeSecret, OrangeName};
-use crate::server::{Request, Response, Status};
+use crate::orange_name::{self, OrangeResolver, OrangeSecret, OrangeName, Endpoint};
+use crate::server::{Request, Response, Command, Context};
 use super::PrivateItem;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
@@ -392,6 +392,70 @@ impl Pointer {
 }
 
 
+
+
+
+#[derive(Serialize, Deserialize)]
+pub struct Discover{parent: RecordPath, index: u32, endpoint: Endpoint}
+impl Discover {
+    pub fn new(parent: &RecordPath, index: u32, endpoint: Endpoint) -> Self {
+        Discover{parent: parent.clone(), index, endpoint}
+    }
+}
+impl Command for Discover {
+    type Output = Result<Option<(DateTime, Option<RecordPath>)>, Error>;
+
+    async fn run(self, mut ctx: Context) -> Self::Output {
+        let mut store = ctx.store().await;
+        let cache = store.get_mut_or_default();
+        let header = cache.get(self.parent).ok_or(ValidationError::MissingRecord(self.parent.to_string()))?;
+        let children = header.0.children.and_then(|(d, r)| d.secret().map(|d| (d, r))).ok_or(ValidationError::InvalidParent(self.parent.to_string()))?;
+        let discover = children.0.easy_derive(&[self.index])?;
+        let read = children.1.secret().map(|r| r.easy_derive(&[self.index]).unwrap());
+        Ok(match (read, ctx.run(super::requests::ReadPrivateHeader::new(&discover, self.endpoint)).await?) {
+            (_, None) => None,
+            (None, Some((date, _))) => Some((date, None)),
+            (Some(read), Some((date, Some(header)))) => Some((date, Header::de_enc(header, *read).ok().and_then(|header| {
+                parent_header.validate_child(&header).ok()?;
+                let header = if header.protocol_id() == Pointer::id() {
+                    serde_json::from_slice::<Header>(&header.2).ok().and_then(|h| 
+                        parent_header.validate_child(&h).is_ok().then_some(h)
+                    ).filter(|h| h.protocol_id() != Pointer::id())?
+                } else {
+                    let protocol = &header.1;
+                    let my_header = Header::derive(cache, &self.parent, protocol.clone(), header.2.clone(), self.index).ok()?;
+                    if my_header.id() == header.id() {my_header} else {header}
+                };
+
+                let id = header.id();
+                cache.cache(header);
+                Some(self.parent.join(id))
+            })))
+        })
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Cache(
     PathedKey,
@@ -432,264 +496,242 @@ impl std::fmt::Debug for Cache {
     }
 }
 
-//  pub enum Discover {
-//      Request(Client),
-
-//  }
-//  impl Discover {
-//      pub fn new(cache: &mut Cache, parent: &RecordPath, index: u32, servers: Vec<OrangeName>) -> Result<Self, Error> {
-//          Client::discover(cache, parent, index)
-//      }
-//  }
-//  impl MultiRequest for Discover {
-//      fn poll(&self) -> Status {
-//          match self {
-//              Self::New() => Status::Requests(),
-//              Self::Finished(_) => Status::Finished,
-//          } 
-//      }
-//      fn responses(&mut self, responses: Vec<Vec<Response>>) {
-//          responses[0] 
-//      }
+//  #[derive(Debug)]
+//  enum MidState {
+//      Discover(Option<SecretKey>, Header, RecordPath, u32),
+//      Create(RecordPath, Header),
+//      Read(SecretKey, Id),
+//      Delete,
+//      Share,
+//      Receive,
 //  }
 
-
-#[derive(Debug)]
-enum MidState {
-    Discover(Option<SecretKey>, Header, RecordPath, u32),
-    Create(RecordPath, Header),
-    Read(SecretKey, Id),
-    Delete,
-    Share,
-    Receive,
-}
-
-#[allow(clippy::large_enum_variant)]
-#[derive(PartialEq)]
-pub enum Processed {
-    Discover(Option<(DateTime, Option<RecordPath>)>),
-    Create(RecordPath, Option<DateTime>),
-    Read(Option<(DateTime, Option<Record>)>),
-    Delete(bool),
-    Receive(Vec<(OrangeName, RecordPath)>),
-    Empty
-}
-
-pub struct Client(super::Client, MidState);
-impl Client {
-    pub fn discover(cache: &mut Cache, parent: &RecordPath, index: u32) -> Result<Self, Error> { 
-        let header = cache.get(parent).ok_or(ValidationError::MissingRecord(parent.to_string()))?;
-        let children = header.0.children.and_then(|(d, r)| d.secret().map(|d| (d, r))).ok_or(ValidationError::InvalidParent(parent.to_string()))?;
-        let discover = children.0.easy_derive(&[index])?;
-        let read = children.1.secret().map(|r| r.easy_derive(&[index]).unwrap());
-        Ok(Client(super::Client::read_private_header(&discover), MidState::Discover(read, header.clone(), parent.clone(), index)))
-    }
-
-    pub fn create(cache: &mut Cache, parent: &RecordPath, protocol: Protocol, header_data: Vec<u8>, index: u32, perms: &Permissions, payload: Vec<u8>) -> Result<Self, Error> {
-        let o_header = Header::derive(cache, parent, protocol, header_data, index)?;
-        let header = o_header.clone().set(perms)?;
-        let record = Record{header, payload};
-        let discover = &record.header.0.discover;
-        let delete = record.header.0.delete.map(|d| d.public());
-        let payload = record.header.0.read.easy_public_key().easy_encrypt(serde_json::to_vec(&record)?)?;
-        let enc_header = record.header.0.read.easy_public_key().easy_encrypt(serde_json::to_vec(&record.header)?)?;
-        let path = parent.join(record.header.id());
-        Ok(Client(super::Client::create_private(discover, delete, enc_header, payload), MidState::Create(path, o_header)))
-    }
-
-    pub fn read(cache: &mut Cache, path: &RecordPath) -> Result<Self, Error> {
-        let header = cache.get(path).ok_or(ValidationError::MissingRecord(path.to_string()))?;
-        Ok(Client(super::Client::read_private(&header.0.discover), MidState::Read(*header.0.read, Id::hash(&header))))
-    }
-
-    pub fn delete(cache: &mut Cache, path: &RecordPath) -> Result<Self, Error> {
-        let header = cache.get(path).ok_or(ValidationError::MissingRecord(path.to_string()))?;
-        let discover = header.0.discover.easy_public_key();
-        let delete = header.0.delete.and_then(|d| d.secret()).ok_or(ValidationError::MissingPerms("Delete".to_string()))?;
-        Ok(Client(super::Client::delete_private(discover, &delete), MidState::Delete))
-    }
-
-    pub async fn share(cache: &mut Cache, resolver: &mut OrangeResolver, secret: &OrangeSecret, recipient: &OrangeName, perms: &Permissions, path: &RecordPath) -> Result<Self, Error> {
-        let header = &cache.get(path).ok_or(ValidationError::MissingRecord(path.to_string()))?.0;
-        let header = header.clone().set(perms)?;
-        Ok(Client(super::Client::create_dm(resolver, secret, recipient.clone(), serde_json::to_vec(&header)?).await?, MidState::Share))
-    }
-
-    pub async fn receive(resolver: &mut OrangeResolver, secret: &OrangeSecret, since: DateTime) -> Result<Self, Error> {
-        Ok(Client(super::Client::read_dm(resolver, secret, since).await?, MidState::Receive))
-    }
-
-    pub fn create_pointer(cache: &mut Cache, parent: &RecordPath, record: &RecordPath, index: u32) -> Result<Self, Error> {
-        let record_header = cache.get(record).ok_or(ValidationError::MissingRecord(record.to_string()))?.clone();
-        let header = Header::derive(cache, parent, Pointer::get_protocol(), serde_json::to_vec(&record_header)?, index)?;
-        let record = Record{header: header.clone(), payload: vec![]};
-        let discover = &record.header.0.discover;
-        let delete = record.header.0.delete.map(|d| d.public());
-        let payload = record.header.0.read.easy_public_key().easy_encrypt(serde_json::to_vec(&record)?)?;
-        let enc_header = record.header.0.read.easy_public_key().easy_encrypt(serde_json::to_vec(&record.header)?)?;
-        Ok(Client(super::Client::create_private(discover, delete, enc_header, payload), MidState::Create(parent.join(Id::hash(&header)), record_header)))
-    }
-
-    pub fn build_request(&self) -> Request {self.0.build_request()}
-
-    pub async fn process_responses(&self, cache: &mut Cache, resolver: &mut OrangeResolver, responses: Vec<Response>) -> Result<Option<Processed>, Error> {
-        let req = (responses.len() / 2) + 1;//Divide by two round down add one
-        let mut processed = Vec::new();
-        for response in responses {
-            processed.push(self.process_response(cache, resolver, response).await?);
-        }
-
-        let (count, winner) = processed.into_iter().fold((0, None), |mut acc, p| {
-            if acc.0 == 0 {acc.1 = Some(p);}
-            else if acc.1 == Some(p) {acc.0 += 1;}
-            else {acc.0 -= 1;}
-            acc
-        });
-        Ok(if count >= req {Some(winner.unwrap())} else {None})
-    }
-
-    pub async fn process_response(&self, cache: &mut Cache, resolver: &mut OrangeResolver, response: Response) -> Result<Processed, Error> {
-        Ok(match (&self.1, self.0.process_response(resolver, response).await?) {
-            (MidState::Discover(_,_,_,_), super::Processed::PrivateHeader(None)) => Processed::Discover(None),
-            (MidState::Discover(None, _, _, _), super::Processed::PrivateHeader(Some((date, _)))) => {
-                Processed::Discover(Some((date, None)))
-            },
-            (
-                MidState::Discover(Some(read), parent_header, parent, index),
-                super::Processed::PrivateHeader(Some((date, Some(header))))
-            ) => {
-                Processed::Discover(Some((date, Header::de_enc(header, *read).ok().and_then(|header| {
-                    parent_header.validate_child(&header).ok()?;
-                    let header = if header.protocol_id() == Pointer::id() {
-                        serde_json::from_slice::<Header>(&header.2).ok().and_then(|h| 
-                            parent_header.validate_child(&h).is_ok().then_some(h)
-                        ).filter(|h| h.protocol_id() != Pointer::id())?
-                    } else {
-                        let protocol = &header.1;
-                        let my_header = Header::derive(cache, parent, protocol.clone(), header.2.clone(), *index).ok()?;
-                        if my_header.id() == header.id() {my_header} else {header}
-                    };
-
-                    let id = header.id();
-                    cache.cache(header);
-                    Some(parent.join(id))
-                }))))
-            },
-            (MidState::Create(path, o_header), super::Processed::PrivateCreate(date)) => {
-                cache.cache(o_header.clone());
-                Processed::Create(path.clone(), date)
-            },
-            (MidState::Read(read, id), super::Processed::PrivateItem(item)) => Processed::Read(
-                item.map(|(date, item)| (date, item.and_then(|item| Record::from_item(item, *read).ok()).filter(|r| Id::hash(&r.header) == *id)))
-            ),
-            (MidState::Delete, super::Processed::Empty) => Processed::Delete(true),
-            (MidState::Delete, super::Processed::DeleteKey(_)) => Processed::Delete(false),
-            (MidState::Share, super::Processed::Empty) => Processed::Empty,
-            (MidState::Receive, super::Processed::ReadDM(sent)) => {
-                Processed::Receive(sent.into_iter().flat_map(|(s, p)| {
-                    let header = serde_json::from_slice::<Header>(&p).ok()?;
-                    header.validate().ok()?;
-                    let id = Id::hash(&header);
-                    let parent = RecordPath(vec![Pointer::id()]);
-                    let path = parent.join(id);
-                    cache.cache(header);
-                    Some((s, path))
-                }).collect())//TODO: Include who sent the record /fff/bob
-            },
-            res => {return Err(Error::mr(res));}
-        })
-    }
-}
-
-
-//Records are currently Identifyable by its header Id because the header contains the keys used to
-//locate it on any air server and the header data is where all the tags are located
-//
-//
-//If I used name paths /rooma/messages/message21 could point to different records at any path level
-//Unless I can prove that /rooma/messages corrosponds with /abc/efg without any data but my master key
-//
-//Given my master key and /rooma/messages/message21 locate the same record no matter the state
-//
-//1. Discover every record under / until one has "rooma" in the header data will not work because
-//   the original can be deleted an a different record can be created at another index with the
-//   same name
-//2. Discovery order is unimportant 
-//
-//Derive a series of bytes by adding 256 to each one 
-//Reservig 0-255 for special characters
-//0 is used to deleminate pathes
-//
-//
-//
-//Map with deletes disabled is possible because you will always created your index at the next open
-//position and unless a previouse record claimed that index you have it
-//
-//Map with deletes enabled requires looking for VCs from the air server on any records that have
-//been corupted and will therefore be skipped claimed indexs are then
-//
-//
-//
-//Structures will contain the header id of its children 
-//Maps cannot because their children is unknown
-//
-//BTreeMap => Named Map 
-//BTreeSet => Unordered list
-//Vec => Ordered List
-//
-//When working with ordered list air server indexs are not resuable
-//
-//
-//Never let records without a delete key expires okay if its more expensive
-//
-
-
-
-
-
-
-
-
-
-
-
-
-
-//  pub enum CreatePrivate{
-//      New(RecordPath, Protocol, Vec<u8>, u32, Permissions, Vec<u8>, Vec<Endpoint>),
-//      Wating(RecordPath, Header)
+//  #[allow(clippy::large_enum_variant)]
+//  #[derive(PartialEq)]
+//  pub enum Processed {
+//      Discover(Option<(DateTime, Option<RecordPath>)>),
+//      Create(RecordPath, Option<DateTime>),
+//      Read(Option<(DateTime, Option<Record>)>),
+//      Delete(bool),
+//      Receive(Vec<(OrangeName, RecordPath)>),
+//      Empty
 //  }
-//  impl CreatePrivate {
-//      pub fn new(
-//          parent: RecordPath, protocol: Protocol, header_data: Vec<u8>, index: u32, perms: Permissions, payload: Vec<u8>, endpoints: Vec<Endpoint>
-//      ) -> Self {
-//          CreatePrivate::New(parent, protocol, header_data, index, perms, payload, endpoints)
+
+//  pub struct Client(super::Client, MidState);
+//  impl Client {
+//      pub fn discover(cache: &mut Cache, parent: &RecordPath, index: u32) -> Result<Self, Error> { 
+//          let header = cache.get(parent).ok_or(ValidationError::MissingRecord(parent.to_string()))?;
+//          let children = header.0.children.and_then(|(d, r)| d.secret().map(|d| (d, r))).ok_or(ValidationError::InvalidParent(parent.to_string()))?;
+//          let discover = children.0.easy_derive(&[index])?;
+//          let read = children.1.secret().map(|r| r.easy_derive(&[index]).unwrap());
+//          Ok(Client(super::Client::read_private_header(&discover), MidState::Discover(read, header.clone(), parent.clone(), index)))
 //      }
 
-//  }
-//  impl MultiReqest for CreatePrivate {
-//      fn run(&mut self, resolver, secret, state, responses) -> {match *self {
-//          Self::New(parent, protocol, header_data, index, perms, payload, endpoints) => Status {
-//              let cache: &mut Cache = state.get_mut_or_default();
-//              let o_header = Header::derive(cache, parent, protocol, header_data, index)?;
-//              let header = o_header.clone().set(perms)?;
-//              let record = Record{header, payload};
-//              let discover = &record.header.0.discover;
-//              let delete = record.header.0.delete.map(|d| d.public());
-//              let payload = record.header.0.read.easy_public_key().easy_encrypt(serde_json::to_vec(&record)?)?;
-//              let enc_header = record.header.0.read.easy_public_key().easy_encrypt(serde_json::to_vec(&record.header)?)?;
-//              let path = parent.join(record.header.id());
-//              self = CreatePrivate::Waiting(path, o_header);
-//              Status::request(CreatePrivate::new(discover, delete, enc_header, payload, endpoints))
-//          },
-//          Self::Wating(path, o_header), Some(created) => {
+//      pub fn create(cache: &mut Cache, parent: &RecordPath, protocol: Protocol, header_data: Vec<u8>, index: u32, perms: &Permissions, payload: Vec<u8>) -> Result<Self, Error> {
+//          let o_header = Header::derive(cache, parent, protocol, header_data, index)?;
+//          let header = o_header.clone().set(perms)?;
+//          let record = Record{header, payload};
+//          let discover = &record.header.0.discover;
+//          let delete = record.header.0.delete.map(|d| d.public());
+//          let payload = record.header.0.read.easy_public_key().easy_encrypt(serde_json::to_vec(&record)?)?;
+//          let enc_header = record.header.0.read.easy_public_key().easy_encrypt(serde_json::to_vec(&record.header)?)?;
+//          let path = parent.join(record.header.id());
+//          Ok(Client(super::Client::create_private(discover, delete, enc_header, payload), MidState::Create(path, o_header)))
+//      }
 
+//      pub fn read(cache: &mut Cache, path: &RecordPath) -> Result<Self, Error> {
+//          let header = cache.get(path).ok_or(ValidationError::MissingRecord(path.to_string()))?;
+//          Ok(Client(super::Client::read_private(&header.0.discover), MidState::Read(*header.0.read, Id::hash(&header))))
+//      }
+
+//      pub fn delete(cache: &mut Cache, path: &RecordPath) -> Result<Self, Error> {
+//          let header = cache.get(path).ok_or(ValidationError::MissingRecord(path.to_string()))?;
+//          let discover = header.0.discover.easy_public_key();
+//          let delete = header.0.delete.and_then(|d| d.secret()).ok_or(ValidationError::MissingPerms("Delete".to_string()))?;
+//          Ok(Client(super::Client::delete_private(discover, &delete), MidState::Delete))
+//      }
+
+//      pub async fn share(cache: &mut Cache, resolver: &mut OrangeResolver, secret: &OrangeSecret, recipient: &OrangeName, perms: &Permissions, path: &RecordPath) -> Result<Self, Error> {
+//          let header = &cache.get(path).ok_or(ValidationError::MissingRecord(path.to_string()))?.0;
+//          let header = header.clone().set(perms)?;
+//          Ok(Client(super::Client::create_dm(resolver, secret, recipient.clone(), serde_json::to_vec(&header)?).await?, MidState::Share))
+//      }
+
+//      pub async fn receive(resolver: &mut OrangeResolver, secret: &OrangeSecret, since: DateTime) -> Result<Self, Error> {
+//          Ok(Client(super::Client::read_dm(resolver, secret, since).await?, MidState::Receive))
+//      }
+
+//      pub fn create_pointer(cache: &mut Cache, parent: &RecordPath, record: &RecordPath, index: u32) -> Result<Self, Error> {
+//          let record_header = cache.get(record).ok_or(ValidationError::MissingRecord(record.to_string()))?.clone();
+//          let header = Header::derive(cache, parent, Pointer::get_protocol(), serde_json::to_vec(&record_header)?, index)?;
+//          let record = Record{header: header.clone(), payload: vec![]};
+//          let discover = &record.header.0.discover;
+//          let delete = record.header.0.delete.map(|d| d.public());
+//          let payload = record.header.0.read.easy_public_key().easy_encrypt(serde_json::to_vec(&record)?)?;
+//          let enc_header = record.header.0.read.easy_public_key().easy_encrypt(serde_json::to_vec(&record.header)?)?;
+//          Ok(Client(super::Client::create_private(discover, delete, enc_header, payload), MidState::Create(parent.join(Id::hash(&header)), record_header)))
+//      }
+
+//      pub fn build_request(&self) -> Request {self.0.build_request()}
+
+//      pub async fn process_responses(&self, cache: &mut Cache, resolver: &mut OrangeResolver, responses: Vec<Response>) -> Result<Option<Processed>, Error> {
+//          let req = (responses.len() / 2) + 1;//Divide by two round down add one
+//          let mut processed = Vec::new();
+//          for response in responses {
+//              processed.push(self.process_response(cache, resolver, response).await?);
 //          }
-//      }}
-//      fn responses(&mut self, responses: Vec<Vec<ChandlerResponse>>) -> {
 
+//          let (count, winner) = processed.into_iter().fold((0, None), |mut acc, p| {
+//              if acc.0 == 0 {acc.1 = Some(p);}
+//              else if acc.1 == Some(p) {acc.0 += 1;}
+//              else {acc.0 -= 1;}
+//              acc
+//          });
+//          Ok(if count >= req {Some(winner.unwrap())} else {None})
+//      }
+
+//      pub async fn process_response(&self, cache: &mut Cache, resolver: &mut OrangeResolver, response: Response) -> Result<Processed, Error> {
+//          Ok(match (&self.1, self.0.process_response(resolver, response).await?) {
+//              (MidState::Discover(_,_,_,_), super::Processed::PrivateHeader(None)) => Processed::Discover(None),
+//              (MidState::Discover(None, _, _, _), super::Processed::PrivateHeader(Some((date, _)))) => {
+//                  Processed::Discover(Some((date, None)))
+//              },
+//              (
+//                  MidState::Discover(Some(read), parent_header, parent, index),
+//                  super::Processed::PrivateHeader(Some((date, Some(header))))
+//              ) => {
+//                  Processed::Discover(Some((date, Header::de_enc(header, *read).ok().and_then(|header| {
+//                      parent_header.validate_child(&header).ok()?;
+//                      let header = if header.protocol_id() == Pointer::id() {
+//                          serde_json::from_slice::<Header>(&header.2).ok().and_then(|h| 
+//                              parent_header.validate_child(&h).is_ok().then_some(h)
+//                          ).filter(|h| h.protocol_id() != Pointer::id())?
+//                      } else {
+//                          let protocol = &header.1;
+//                          let my_header = Header::derive(cache, parent, protocol.clone(), header.2.clone(), *index).ok()?;
+//                          if my_header.id() == header.id() {my_header} else {header}
+//                      };
+
+//                      let id = header.id();
+//                      cache.cache(header);
+//                      Some(parent.join(id))
+//                  }))))
+//              },
+//              (MidState::Create(path, o_header), super::Processed::PrivateCreate(date)) => {
+//                  cache.cache(o_header.clone());
+//                  Processed::Create(path.clone(), date)
+//              },
+//              (MidState::Read(read, id), super::Processed::PrivateItem(item)) => Processed::Read(
+//                  item.map(|(date, item)| (date, item.and_then(|item| Record::from_item(item, *read).ok()).filter(|r| Id::hash(&r.header) == *id)))
+//              ),
+//              (MidState::Delete, super::Processed::Empty) => Processed::Delete(true),
+//              (MidState::Delete, super::Processed::DeleteKey(_)) => Processed::Delete(false),
+//              (MidState::Share, super::Processed::Empty) => Processed::Empty,
+//              (MidState::Receive, super::Processed::ReadDM(sent)) => {
+//                  Processed::Receive(sent.into_iter().flat_map(|(s, p)| {
+//                      let header = serde_json::from_slice::<Header>(&p).ok()?;
+//                      header.validate().ok()?;
+//                      let id = Id::hash(&header);
+//                      let parent = RecordPath(vec![Pointer::id()]);
+//                      let path = parent.join(id);
+//                      cache.cache(header);
+//                      Some((s, path))
+//                  }).collect())//TODO: Include who sent the record /fff/bob
+//              },
+//              res => {return Err(Error::mr(res));}
+//          })
 //      }
 //  }
+
+
+//  //Records are currently Identifyable by its header Id because the header contains the keys used to
+//  //locate it on any air server and the header data is where all the tags are located
+//  //
+//  //
+//  //If I used name paths /rooma/messages/message21 could point to different records at any path level
+//  //Unless I can prove that /rooma/messages corrosponds with /abc/efg without any data but my master key
+//  //
+//  //Given my master key and /rooma/messages/message21 locate the same record no matter the state
+//  //
+//  //1. Discover every record under / until one has "rooma" in the header data will not work because
+//  //   the original can be deleted an a different record can be created at another index with the
+//  //   same name
+//  //2. Discovery order is unimportant 
+//  //
+//  //Derive a series of bytes by adding 256 to each one 
+//  //Reservig 0-255 for special characters
+//  //0 is used to deleminate pathes
+//  //
+//  //
+//  //
+//  //Map with deletes disabled is possible because you will always created your index at the next open
+//  //position and unless a previouse record claimed that index you have it
+//  //
+//  //Map with deletes enabled requires looking for VCs from the air server on any records that have
+//  //been corupted and will therefore be skipped claimed indexs are then
+//  //
+//  //
+//  //
+//  //Structures will contain the header id of its children 
+//  //Maps cannot because their children is unknown
+//  //
+//  //BTreeMap => Named Map 
+//  //BTreeSet => Unordered list
+//  //Vec => Ordered List
+//  //
+//  //When working with ordered list air server indexs are not resuable
+//  //
+//  //
+//  //Never let records without a delete key expires okay if its more expensive
+//  //
+
+
+
+
+
+
+
+
+
+
+
+
+
+//  //  pub enum CreatePrivate{
+//  //      New(RecordPath, Protocol, Vec<u8>, u32, Permissions, Vec<u8>, Vec<Endpoint>),
+//  //      Wating(RecordPath, Header)
+//  //  }
+//  //  impl CreatePrivate {
+//  //      pub fn new(
+//  //          parent: RecordPath, protocol: Protocol, header_data: Vec<u8>, index: u32, perms: Permissions, payload: Vec<u8>, endpoints: Vec<Endpoint>
+//  //      ) -> Self {
+//  //          CreatePrivate::New(parent, protocol, header_data, index, perms, payload, endpoints)
+//  //      }
+
+//  //  }
+//  //  impl MultiReqest for CreatePrivate {
+//  //      fn run(&mut self, resolver, secret, state, responses) -> {match *self {
+//  //          Self::New(parent, protocol, header_data, index, perms, payload, endpoints) => Status {
+//  //              let cache: &mut Cache = state.get_mut_or_default();
+//  //              let o_header = Header::derive(cache, parent, protocol, header_data, index)?;
+//  //              let header = o_header.clone().set(perms)?;
+//  //              let record = Record{header, payload};
+//  //              let discover = &record.header.0.discover;
+//  //              let delete = record.header.0.delete.map(|d| d.public());
+//  //              let payload = record.header.0.read.easy_public_key().easy_encrypt(serde_json::to_vec(&record)?)?;
+//  //              let enc_header = record.header.0.read.easy_public_key().easy_encrypt(serde_json::to_vec(&record.header)?)?;
+//  //              let path = parent.join(record.header.id());
+//  //              self = CreatePrivate::Waiting(path, o_header);
+//  //              Status::request(CreatePrivate::new(discover, delete, enc_header, payload, endpoints))
+//  //          },
+//  //          Self::Wating(path, o_header), Some(created) => {
+
+//  //          }
+//  //      }}
+//  //      fn responses(&mut self, responses: Vec<Vec<ChandlerResponse>>) -> {
+
+//  //      }
+//  //  }
 
 
 

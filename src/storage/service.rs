@@ -8,19 +8,6 @@ use crate::{DateTime, Id, now};
 
 use super::{NAME, Catalog, Request, Response, PublicItem, Op};
 
-#[async_trait::async_trait(?Send)]
-impl ServiceTrait for Service {
-    fn name(&self) -> String {NAME.to_string()}
-    fn catalog(&self) -> String {serde_json::to_string(&Catalog{}).unwrap()}
-    async fn process(&mut self, resolver: &mut OrangeResolver, request: String) -> String {
-        let response = match serde_json::from_str(&request) {
-            Ok(request) => self._process(resolver, request).await,
-            Err(e) => Response::InvalidRequest(e.to_string())
-        };
-        serde_json::to_string(&response).unwrap()
-    }
-}
-
 pub struct Service(Connection);
 impl Service {
     pub async fn new(
@@ -48,8 +35,13 @@ impl Service {
         );", [])?;
         Ok(Service(database))
     }
+}
 
-    async fn _process(&self, resolver: &mut OrangeResolver, request: Request) -> Response {
+impl ServiceTrait for Service {
+    type Request = Request;
+    fn name(&self) -> String {NAME.to_string()}
+    fn catalog(&self) -> String {serde_json::to_string(&Catalog{}).unwrap()}
+    async fn process(&mut self, resolver: &mut OrangeResolver, request: Request) -> Response {
         let time = std::time::Instant::now();
         let result = match request {
             Request::CreatePrivate(signed) => {

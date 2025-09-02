@@ -2,16 +2,40 @@ use easy_secp256k1::{EasySecretKey, EasyPublicKey};
 use secp256k1::{SecretKey, PublicKey};
 use serde::{Serialize, Deserialize};
 
+use std::pin::Pin;
 use std::fmt::Debug;
 
 use crate::orange_name::OrangeResolver;
 use super::Error;
 
-#[async_trait::async_trait(?Send)]
 pub trait Service: Send {
+    type Request: ServiceRequest;
     fn name(&self) -> String;
     fn catalog(&self) -> String;
-    async fn process(&mut self, resolver: &mut OrangeResolver, request: String) -> String;
+    fn process(&mut self, resolver: &mut OrangeResolver, request: Self::Request) -> impl Future<Output = <Self::Request as ServiceRequest>::Response>;
+}
+
+pub trait ServiceRequest: Into<Request> + Serialize + for<'a> Deserialize<'a> {
+    type Response: Serialize + for<'a> Deserialize<'a> + Send;
+}
+
+trait ErasedService {
+    fn name(&self) -> String;
+    //fn catalog(&self) -> String;
+    fn process<'a>(&'a mut self, resolver: &'a mut OrangeResolver, request: String) -> Pin<Box<dyn Future<Output = String> + 'a>>;
+}
+
+impl<R: ServiceRequest, Self_: Service<Request = R> + Send> ErasedService for Self_ {
+    fn name(&self) -> String {Service::name(self)}
+    //fn catalog(&self) -> String {Service::catalog(self)}
+    fn process<'a>(&'a mut self, resolver: &'a mut OrangeResolver, request: String) -> Pin<Box<dyn Future<Output = String> + 'a>> {
+        Box::pin(async move {
+            serde_json::to_string(&match serde_json::from_str(&request) {
+                Ok(request) => Ok(Service::process(self, resolver, request).await),
+                Err(e) => Err(e.to_string())
+            }).unwrap()
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
@@ -20,13 +44,16 @@ pub enum Request {
     Service(String, String),
     //Catalog,
 }
+impl ServiceRequest for Request {
+    type Response = Response;
+}
 impl Request {
     pub fn batch(requests: Vec<Request>) -> Request {
         Request::Batch(requests.into_iter().map(Box::new).collect())
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Hash)]
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 pub enum Response {
     Batch(Vec<Box<Response>>),
     OutOfService(String),
@@ -34,7 +61,7 @@ pub enum Response {
     //Catalog(BTreeMap<String, String>),
 }
 impl Response {
-    pub fn service<T: for<'a> Deserialize<'a>>(&self) -> Result<T, Error> {
+    pub fn service<R: ServiceRequest>(&self) -> Result<R::Response, Error> {
         match self {
             Response::Service(response) => serde_json::from_str(response).map_err(Error::mr),
             e => Err(Error::mr(e))
@@ -52,7 +79,7 @@ impl Response {
 pub struct Chandler {
     dir: SecretKey,
     resolver: OrangeResolver,
-    services: Vec<Box<dyn Service>>
+    services: Vec<Box<dyn ErasedService>>
 }
 
 impl Chandler {

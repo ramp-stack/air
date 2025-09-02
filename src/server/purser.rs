@@ -3,22 +3,20 @@ use secp256k1::SecretKey;
 use serde::{Serialize, Deserialize};
 
 use std::collections::{VecDeque, BTreeMap, HashMap};
-use std::sync::LazyLock;
-use std::hash::{DefaultHasher, Hasher, Hash};
+use std::hash::Hash;
 use std::fmt::Debug;
 use std::task::Poll;
-use std::any::TypeId;
-use std::pin::pin;
 use std::pin::Pin;
-
-use crate::orange_name::{self, OrangeResolver, OrangeSecret, Endpoint};
+use std::any::TypeId;
+use tokio::sync::mpsc;
+use crate::orange_name::{self, OrangeResolver, Endpoint};
 use crate::Id;
 
-use super::chandler::{Request, Response};
+use super::chandler::{Request, Response, ServiceRequest};
 use super::{Client, ClientError};
 
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::ops::DerefMut;
+use std::sync::{Arc, Mutex};
+use tokio::sync::{Mutex as TokioMutex, MutexGuard as TokioMutexGuard};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
 
@@ -42,6 +40,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {write!(f, "{self:?}")}
 }
 
+#[derive(Default)]
 pub struct Purser {
     client: Client,
 }
@@ -55,7 +54,7 @@ impl Purser {
         let com = resolver.key(&recipient.0, Some("easy_access_com"), None).await?;
         let payload = com.easy_encrypt(serde_json::to_vec(&(one_time_key.easy_public_key(), &request)).unwrap()).unwrap();
         let response = self.client.send(recipient.1.as_str(), &payload).await?;
-        serde_json::from_slice::<Response>(&one_time_key.easy_decrypt(&response).map_err(Error::mr)?).map_err(Error::mr)
+        serde_json::from_slice::<Result<Response, String>>(&one_time_key.easy_decrypt(&response).map_err(Error::mr)?).map_err(Error::mr)?.map_err(Error::mr)
     }
 
     pub async fn send_batch(&mut self, resolver: &mut OrangeResolver, requests: Vec<(Request, Vec<Endpoint>)>) -> Result<Vec<Vec<Response>>, Error> {
@@ -69,337 +68,371 @@ impl Purser {
     }
 }
 
-pub enum Status {
-    Requests(Vec<(Request, Vec<Endpoint>)>),
-    Finished(Box<dyn AnySend>)
-}
-impl Status {
-    pub fn finished(res: impl AnySend + 'static) -> Self {
-        Status::Finished(Box::new(res))
-    }
-}
+pub trait AnySend: std::any::Any + Send {}
+impl<A: std::any::Any + Send> AnySend for A {}
 
-pub trait AnySend: std::any::Any + Send + erased_serde::Serialize {}
-impl<A: std::any::Any + Send + Serialize> AnySend for A {}
-erased_serde::serialize_trait_object!(AnySend);
-
-pub trait AnyError: AnySend + std::error::Error + erased_serde::Serialize {}
+pub trait AnyError: AnySend + std::error::Error {}
 impl<E: AnySend + std::error::Error> AnyError for E {}
-erased_serde::serialize_trait_object!(AnyError);
+impl std::error::Error for Box<dyn AnyError> {}
 
-#[derive(Serialize, Deserialize)]
-pub struct CommandResult(String);
+trait CastAnySend {fn cast<T: 'static>(self) -> T;}
+impl CastAnySend for Box<dyn AnySend> {fn cast<T: 'static>(self) -> T {
+    *(self as Box<dyn std::any::Any>).downcast().unwrap()
+}}
+
+trait AnyRequest<Output> {fn any(self) -> Box<dyn MultiRequest<Box<dyn AnySend>>>;}
+impl<Output: Send + 'static, M: MultiRequest<Output> + 'static> AnyRequest<Output> for M {
+    fn any(self) -> Box<dyn MultiRequest<Box<dyn AnySend>>> {
+        Box::new(Box::new(self) as Box<dyn MultiRequest<Output>>)
+    }
+}
+
+pub struct CommandResult(Box<dyn AnySend>);
 impl CommandResult {
-    pub fn to<C: Command + 'static>(self) -> Option<Result<C::Output, C::Error>> {
-        serde_json::from_str(&self.0).ok()
+    pub fn cast<A: AnySend>(self) -> Option<A> {
+        (self.0 as Box<dyn std::any::Any>).downcast::<A>().ok().map(|t| *t)
     }
 }
 
-pub trait Command: AnySend + erased_serde::Serialize {
-    type Output: Send + Serialize + for<'a> Deserialize<'a> where Self: Sized;
-    type Error: AnyError + Serialize + for<'a> Deserialize<'a> where Self: Sized;
-    fn run(self, ctx: Context) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send where Self: Sized;
+pub trait Command: AnySend {
+    type Output: AnySend + where Self: Sized;
+    fn run(self, ctx: Context) -> impl Future<Output = Self::Output> + Send where Self: Sized;
 }
-erased_serde::serialize_trait_object!(Command);
-
-pub trait _Command {
-    fn serialize(&self) -> Result<(u64, String), serde_json::Error>;
-}
-
-impl<C: Command> _Command for C {
-    fn serialize(&self) -> Result<(u64, String), serde_json::Error> {
-        println!("2");
-        let mut hasher = DefaultHasher::new();
-        TypeId::of::<C>().hash(&mut hasher);
-        let mut writer = Vec::with_capacity(128);
-        let mut serializer = serde_json::Serializer::new(writer);
-        erased_serde::serialize(self, &mut serializer)?;
-        unsafe {
-            Ok((hasher.finish(), String::from_utf8_unchecked(serializer.into_inner())))
-        }
-    }
-}
-
-use serde::Serializer;
-use serde::Deserializer;
 
 pub trait AnyCommand: Send {
-    fn run(self: Box<Self>, ctx: Context) -> Pin<Box<dyn Future<Output = Result<Box<dyn AnySend>, Box<dyn AnyError>>> + Send>>; 
-    fn my_serialize(&self) -> Result<(u64, String), serde_json::Error>;
+    fn run(self: Box<Self>, ctx: Context) -> PBFut<Box<dyn AnySend>>; 
 }
 
-impl Serialize for Box<dyn AnyCommand> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        println!("0");
-        match AnyCommand::my_serialize(self) {
-            Err(e) => Err(serde::ser::Error::custom(e)),
-            Ok(o) => Ok(o)
-        }?.serialize(serializer)
+impl<A: AnySend + 'static, Self_: Command<Output = A> + Send> AnyCommand for Self_ {
+    fn run(self: Box<Self>, ctx: Context) -> PBFut<Box<dyn AnySend>> {
+        Box::pin(async move {Box::new((*self).run(ctx).await) as Box<dyn AnySend>})
     }
 }
-
-impl<'de> Deserialize<'de> for Box<dyn AnyCommand> {
-    fn deserialize<D: Deserializer<'de>>(mut deserializer: D) -> Result<Self, D::Error> {
-        let (id, s) = <(u64, String)>::deserialize(deserializer)?;
-        Ok(inventory::iter::<RegisteredCommand>().find_map(|RegisteredCommand(rc_id, des)|
-                (id == rc_id()).then_some(des(&mut Box::new(<dyn erased_serde::Deserializer>::erase(&mut serde_json::Deserializer::from_str(&s)))).unwrap())
-        ).unwrap_or_else(|| {panic!("Unregistered command with id {id}");}))
-    }
-}
-
-impl<E: AnyError + 'static, A: AnySend + 'static, Self_: Command<Output = A, Error = E> + Send> AnyCommand for Self_ {
-    fn run(mut self: Box<Self>, ctx: Context) -> Pin<Box<dyn Future<Output = Result<Box<dyn AnySend>, Box<dyn AnyError>>> + Send>> {
-        Box::pin(async move {match (*self).run(ctx).await {
-            Ok(a) => Ok(Box::new(a) as Box<dyn AnySend>),
-            Err(e) => Err(Box::new(e) as Box<dyn AnyError>)
-        }})
-    }
-    fn my_serialize(&self) -> Result<(u64, String), serde_json::Error> {
-        println!("1");
-        _Command::serialize(self)
-    }
-}
-
-impl<'de> Deserialize<'de> for Box<dyn AnySend> {
-    fn deserialize<D: Deserializer<'de>>(mut deserializer: D) -> Result<Self, D::Error> {
-        panic!("Do NOT Deserialize Box<dyn AnySend>");
-    }
-}
-
-impl<'de> Deserialize<'de> for Box<dyn AnyError> {
-    fn deserialize<D: Deserializer<'de>>(mut deserializer: D) -> Result<Self, D::Error> {
-        panic!("Do NOT Deserialize Box<dyn AnyError>");
-    }
-}
-
-impl std::error::Error for Box<dyn AnyError> {}
 
 impl Command for Box<dyn AnyCommand> {
     type Output = Box<dyn AnySend>;
-    type Error = Box<dyn AnyError>;
 
-    fn run(self, ctx: Context) -> impl Future<Output = Result<Self::Output, Self::Error>> {
+    fn run(self, ctx: Context) -> impl Future<Output = Self::Output> {
         AnyCommand::run(self, ctx)
     }
-
 }
 
-pub type CommandFuture<C> = Pin<Box<dyn Future<Output = Result<<C as Command>::Output, <C as Command>::Error>> + Send>>;
-pub type Requests = Vec<(Request, Vec<Endpoint>)>;
-pub type Responder = oneshot::Sender<Vec<Vec<Response>>>;
-pub type Callback = Sender<(Requests, Responder)>;
-pub type Store = Arc<Mutex<HashMap<String, String>>>;
+//  #[derive(Default)]
+//  pub struct State(HashMap<TypeId, Box<dyn std::any::Any + Send>>);
+//  impl State {
+//      
+//  }
 
+
+type Handler<'a> = Box<dyn FnOnce(Vec<(Request, Vec<Endpoint>)>) -> Pin<Box<dyn Future<Output = Result<Vec<Vec<Response>>, Error>> + Send + 'a>> + Send + 'a>;
+type Commands<Output> = Arc<Mutex<BTreeMap<Id, Box<dyn MultiRequest<Output>>>>>;
+type InProgress<Output> = Arc<Mutex<BTreeMap<Id, (Pin<Box<Running<Output>>>, Requests, Responder)>>>;
+type Requests = Vec<(Request, Vec<Endpoint>)>;
+type Responder = oneshot::Sender<Result<Vec<Vec<Response>>, Error>>;
+type Callback = Sender<(Requests, Responder)>;
+type Store = Arc<TokioMutex<HashMap<TypeId, Box<dyn std::any::Any + Send>>>>;
+type PBFut<Output> = Pin<Box<dyn Future<Output = Output> + Send>>;
+
+
+#[derive(Clone)]
 pub struct Context {
     callback: Callback,
     store: Store,
 }
 
-
 impl Context {
-    fn new(callback: Callback) -> Self {
-        Context {
-            callback,
-            store: Store::default() 
-        }
-    }
-    fn clone(&mut self) -> Self {
-        Context{
-            callback: self.callback.clone(),
-            store: self.store.clone()
-        }
+    async fn send(&mut self, requests: Vec<(Request, Vec<Endpoint>)>) -> Result<Vec<Vec<Response>>, Error> {
+        let (tx, rx) = oneshot::channel();
+        self.callback.send((requests, tx)).await.unwrap();
+        rx.await.unwrap()
     }
 
-    pub fn store(&mut self) -> MutexGuard<'_, HashMap<String, String>> {self.store.lock().unwrap()}
+    //pub async fn store(&mut self) -> TokioMutexGuard<'_, State> {self.store.lock().await}
 
-    //call many other multi-requests and air requests in parrellel
+    pub async fn try_get<A: AnySend>(&self) -> Option<&A> {
+        let store = self.store.lock().await;
+        store.get(&TypeId::of::<A>()).map(|a| *a.downcast_ref().unwrap())
+    }
 
-    pub async fn request<M: MultiRequest>(&mut self, mut input: M) -> Result<M::Output, M::Error> {
-        todo!()
-      //let (tx, rx) = tokio::sync::oneshot::channel();
-      //self.tx.send(tx).await;
-      //println!("GOT RESULT: {:?}", rx.await);
-      //input.run(self).await
+    pub async fn get_mut_or_default<A: AnySend + Default>(&mut self) -> &mut A {
+        let store = self.store.lock().await;
+        store.entry(TypeId::of::<A>()).or_insert_with(|| Box::new(A::default())).downcast_mut().unwrap()
+    }
+
+    pub async fn run<Output: Send, M: MultiRequest<Output>>(&mut self, input: M) -> Output {
+        Box::new(input).run(self.clone()).await
     }
 }
 
-
-
-use std::task::Waker;
-use tokio::sync::mpsc;
-
+#[derive(Default)]
 pub struct Compiler {
-    store: Store,
     purser: Purser,
-    resolver: OrangeResolver,
-    commands: BTreeMap<Id, Box<dyn AnyCommand>>,
-    running: BTreeMap<Id, (Pin<Box<RunningCmd<Box<dyn AnyCommand>>>>, Requests, Responder)>,
+    commands: Commands<Box<dyn AnySend>>,
+    running: InProgress<Box<dyn AnySend>>,
+    store: Store,
 }
 
 impl Compiler {
     pub fn new() -> Self {
-        Compiler {
-            store: Store::default(),
+        Compiler{
             purser: Purser::new(),
-            resolver: OrangeResolver,
-            commands: BTreeMap::default(),
-            running: BTreeMap::default()
+            commands: Commands::default(),
+            running: InProgress::default(),
+            store: Store::default(),
         }
     }
-
-    pub fn add_task(&mut self, id: Id, task: Box<dyn AnyCommand>) {
-        self.commands.insert(id, task);
+    pub async fn tick(&mut self) -> BTreeMap<Id, CommandResult> {
+        let store = self.store.clone();
+        CompilerTick::<Box<dyn AnySend>>::new(
+            self.commands.clone(), self.running.clone(), self.store.clone(),
+            Box::new(|requests: Requests| {
+                Box::pin(async {
+                    let mut store = store.lock().await;
+                    let resolver = store.get_mut_or_default();
+                    self.purser.send_batch(resolver, requests).await
+                })
+            })
+        ).run().await.into_iter().map(|(id, r)| (id, CommandResult(r))).collect()
     }
 
-    pub fn tick(&mut self) -> impl Future<Output = BTreeMap<Id, CommandResult>>  {
-        CompilerTick(self)
+    pub fn is_empty(&self) -> bool {
+        self.commands.lock().unwrap().is_empty() && self.running.lock().unwrap().is_empty()
+    }
+
+    pub fn add_task(&mut self, id: Id, task: impl Command) {
+        self.commands.lock().unwrap().insert(id, Box::new(Box::new(task) as Box<dyn AnyCommand>));
     }
 }
 
-pub struct CompilerTick<'a>(&'a mut Compiler);
-impl<'a> Future for CompilerTick<'a> {
-    type Output = BTreeMap<Id, CommandResult>;
-    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        let compiler = &mut self.0;
+pub struct CompilerTick<'a, Output>{
+    commands: Commands<Output>,
+    running: InProgress<Output>,
+    store: Store,
+    handler: Option<Handler<'a>>,
+}
+impl<'a, Output: Send + 'static> CompilerTick<'a, Output> {
+    pub fn new(
+        commands: Commands<Output>,
+        running: InProgress<Output>,
+        store: Store,
+        handler: Handler<'a> 
+    ) -> Self {
+        CompilerTick{commands, running, store, handler: Some(handler)}
+    }
+
+    pub async fn run(mut self) -> BTreeMap<Id, Output> {
         let mut results = BTreeMap::default();
-        let commands = std::mem::take(&mut compiler.commands);
-        let store = compiler.store.clone();
-        compiler.running.extend(commands.into_iter().flat_map(|(id, c)| {
-            let (callback, mut rx) = mpsc::channel(1);
-            let context = Context{store: store.clone(), callback};
-            let mut future = pin!(RunningCmd(Some(Box::pin(c.run(context))), Some(rx)));
-            match loop {
-                if let Poll::Ready(result) = future.as_mut().poll(cx) {break result;}
-            } {
-                CommandRes::Ready(result) => {results.insert(id, CommandResult(serde_json::to_string(&result).unwrap())); None},
-                CommandRes::Requesting(future, requests, responder) => Some((id, (future, requests, responder)))
+        let commands = std::mem::take(&mut *self.commands.lock().unwrap());
+        let store = self.store.clone();
+        for (id, c) in commands {
+            match Running::new(c, &store).await {
+                RunningResult::Ready(result) => {results.insert(id, result);},
+                RunningResult::Requesting(future, requests, responder) => {self.running.lock().unwrap().insert(id, (future, requests, responder));}
             }
-        }));
-
-        let running = std::mem::take(&mut compiler.running);
-        let (running, batch): (BTreeMap<_, _>, Vec<_>) = running.into_iter().map(|(id, (future, requests, responder))| {
-            ((id, (future, responder)), requests) 
-        }).unzip();
-        let mut request = Box::pin(compiler.purser.send_batch(&mut compiler.resolver, batch.into_iter().flatten().collect()));
-        let responses = loop {
-            if let Poll::Ready(result) = request.as_mut().poll(cx) {break result;}
-        };
-        compiler.running = running.into_iter().zip(responses).flat_map(|((id, (mut future, responder)), responses)| {
-            responder.send(responses).unwrap();
-            match loop {
-                if let Poll::Ready(result) = future.as_mut().poll(cx) {break result;}
-            } {
-                CommandRes::Ready(result) => {results.insert(id, CommandResult(serde_json::to_string(&result).unwrap())); None},
-                CommandRes::Requesting(future, requests, responder) => Some((id, (future, requests, responder)))
+        }
+        let running = std::mem::take(&mut *self.running.lock().unwrap());
+        let (running, batch): (BTreeMap<_, _>, Vec<_>) = running.into_iter().map(
+            |(id, (future, requests, responder))| ((id, (future, responder)), requests) 
+        ).unzip();
+        let counts: Vec<_> = batch.iter().map(|b| b.len()).collect();
+        let mut responses: Result<VecDeque<Vec<Response>>, Error> = (self.handler.take().unwrap())(batch.into_iter().flatten().collect()).await.map(|r| r.into());
+        for ((id, (future, responder)), count) in running.into_iter().zip(counts) {
+            responder.send(match &mut responses {
+                Ok(responses) => {
+                    let mut r = Vec::new();
+                    for _ in 0..count {
+                        r.push(responses.pop_front().unwrap());
+                    }
+                    Ok(r)
+                },
+                Err(e) => Err(e.clone())
+            }).unwrap();
+            match future.await {
+                RunningResult::Ready(result) => {results.insert(id, result);},
+                RunningResult::Requesting(future, requests, responder) => {self.running.lock().unwrap().insert(id, (future, requests, responder));}
             }
-        }).collect();
-        Poll::Ready(results)
+        }
+        results
     }
 }
-
-pub enum CommandRes<C: Command> {
-    Ready(Result<C::Output, C::Error>),
-    Requesting(Pin<Box<RunningCmd<C>>>, Requests, Responder)
+pub enum RunningResult<Output> {
+    Ready(Output),
+    Requesting(Pin<Box<Running<Output>>>, Requests, Responder)
 }
 
-pub struct RunningCmd<C: Command>(Option<CommandFuture<C>>, Option<Receiver<(Requests, Responder)>>);
-impl<C: Command + Unpin> Future for RunningCmd<C> {
-    type Output = CommandRes<C>;
+pub struct Running<Output>(Option<PBFut<Output>>, Option<Receiver<(Requests, Responder)>>);
+impl<Output: Send + 'static> Running<Output> {
+    pub fn new(m: Box<dyn MultiRequest<Output>>, store: &Store) -> Self {
+        let (callback, rx) = mpsc::channel(1);
+        let context = Context{store: store.clone(), callback};
+        Running(Some(Box::pin(m.run(context))), Some(rx))
+    }
+}
+impl<Output: 'static> Future for Running<Output> {
+    type Output = RunningResult<Output>;
     fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        let mut future = self.0.take().unwrap();
-        let mut rx = self.1.take().unwrap();
-        loop {
-            match future.as_mut().poll(cx) {
-                Poll::Ready(r) => {break Poll::Ready(CommandRes::Ready(r));},
-                Poll::Pending => {
-                    if let Ok(tx) = rx.try_recv() {
-                        break Poll::Ready(CommandRes::Requesting(Box::pin(RunningCmd(Some(future), Some(rx))), tx.0, tx.1));
-                    }
-                }
+        match self.0.as_mut().unwrap().as_mut().poll(cx) {
+            Poll::Ready(r) => Poll::Ready(RunningResult::Ready(r)),
+            Poll::Pending => {
+                if let Ok(tx) = self.1.as_mut().unwrap().try_recv() {
+                    Poll::Ready(RunningResult::Requesting(Box::pin(Running(self.0.take(), self.1.take())), tx.0, tx.1))
+                } else {Poll::Pending}
             }
         }
     }
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct Test2(String);
-impl Command for Test2 {
-    type Error = Error;
-    type Output = bool;
-    async fn run(self, mut ctx: Context) -> Result<Self::Output, Self::Error> {
-        println!("1.1");
-        Ok(false)
+pub struct RunMany<Output> {
+    order: Vec<Id>,
+    commands: Commands<Output>,
+    running: InProgress<Output>,
+    context: Context,
+}
+impl<Output: Send + 'static> RunMany<Output> {
+    pub fn new(commands: Vec<Box<dyn MultiRequest<Output>>>, context: Context) -> Self {
+        let (order, commands) = commands.into_iter().map(|c| {let id = Id::random(); (id, (id, c))}).unzip();
+        RunMany{
+            order,
+            commands: Arc::new(Mutex::new(commands)),
+            running: InProgress::default(),
+            context,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.commands.lock().unwrap().is_empty() && self.running.lock().unwrap().is_empty()
+    }
+
+    fn tick(&mut self) -> CompilerTick<'static, Output> {
+        let c = self.context.clone();
+        CompilerTick::<Output>::new(self.commands.clone(), self.running.clone(), self.context.store.clone(), 
+            Box::new(|req: Requests| {
+                Box::pin(Box::new(req).run(c))
+            })
+        )
+    }
+
+    async fn run(mut self) -> Vec<Output> {
+        let mut results = BTreeMap::new();
+        while !self.is_empty() {
+            results.extend(self.tick().run().await);
+        }
+        self.order.into_iter().map(|i| results.remove(&i).unwrap()).collect()
     }
 }
 
+pub trait MultiRequest<Output: Send>: Send {
+    fn run(self: Box<Self>, ctx: Context) -> PBFut<Output>;
+}
 
-pub struct RegisteredCommand(
-    fn() -> u64,
-    fn(&mut dyn erased_serde::Deserializer) -> Result<Box<dyn AnyCommand>, erased_serde::Error>
-);
-inventory::collect!(RegisteredCommand);
+impl<C: Command> MultiRequest<Vec<C::Output>> for Vec<C> {
+    fn run(self: Box<Self>, ctx: Context) -> PBFut<Vec<C::Output>> {
+        Box::pin(RunMany::new(self.into_iter().map(|c| Box::new(c) as Box<dyn MultiRequest<C::Output>>).collect(), ctx).run())
+    }
+}
 
-#[macro_export]
-macro_rules! register_command {
-    ($cmd:ty) => {
-        inventory::submit!(RegisteredCommand(|| {
-            let mut hasher = DefaultHasher::new();
-            TypeId::of::<$cmd>().hash(&mut hasher);
-            hasher.finish()
-        }, 
+impl<C: Command> MultiRequest<C::Output> for C {
+    fn run(self: Box<Self>, ctx: Context) -> PBFut<C::Output> {
+        Box::pin(Command::run(*self, ctx))
+    }
+}
 
-        |de: &mut dyn erased_serde::Deserializer|
-            Ok(Box::new(erased_serde::deserialize::<$cmd>(de)?) as Box<dyn AnyCommand>)
-        ));        
+impl<Output: AnySend> MultiRequest<Box<dyn AnySend>> for Box<dyn MultiRequest<Output>> {
+    fn run(self: Box<Self>, ctx: Context) -> PBFut<Box<dyn AnySend>> {
+        Box::pin(async move {
+            Box::new((*self).run(ctx).await) as Box<dyn AnySend>
+        })
+    }
+}
+
+impl<I: ServiceRequest + AnySend> MultiRequest<Result<I::Response, Error>> for (I, Endpoint) {
+    fn run(self: Box<Self>, mut ctx: Context) -> PBFut<Result<I::Response, Error>> {
+        Box::pin(async move {
+            ctx.send(vec![(self.0.into(), vec![self.1])]).await.and_then(|mut r| r.remove(0).remove(0).service::<I>())
+        })
+    }
+}
+
+impl<I: ServiceRequest + AnySend> MultiRequest<Result<Vec<I::Response>, Error>> for (I, Vec<Endpoint>) {
+    fn run(self: Box<Self>, mut ctx: Context) -> PBFut<Result<Vec<I::Response>, Error>> {
+        Box::pin(async move {
+            ctx.send(vec![(self.0.into(), self.1)]).await.and_then(|mut r| r.remove(0).into_iter().map(|r| r.service::<I>()).collect())
+        })
+    }
+}
+
+impl<I: ServiceRequest + AnySend> MultiRequest<Result<Vec<Vec<I::Response>>, Error>> for Vec<(I, Vec<Endpoint>)> {
+    fn run(self: Box<Self>, mut ctx: Context) -> PBFut<Result<Vec<Vec<I::Response>>, Error>> {
+        Box::pin(async move {
+            ctx.send(self.into_iter().map(|(r, e)| (r.into(), e)).collect()).await.and_then(|r| r.into_iter().map(|r| r.into_iter().map(|r| r.service::<I>()).collect()).collect())
+        })
+    }
+}
+
+macro_rules! impl_result_tuple {
+    (
+        ($t_head:ident, $( $t:ident ),+);
+        ($tt_head:ident, $($tt:ident),+);
+        ($i_head:tt, $( $i:tt ),+)
+    ) => {
+        impl<
+            E: AnyError,
+            $t_head: AnySend, $( $t: AnySend ),+,
+            $tt_head: MultiRequest<Result<$t_head, E>> + 'static, $( $tt: MultiRequest<Result<$t, E>> + 'static ),+
+        > MultiRequest<Result<($t_head, $( $t ),+), E>> for ($tt_head, $( $tt ),+) {
+            fn run(self: Box<Self>, ctx: Context) -> PBFut<Result<($t_head, $( $t ),+), E>> {
+                Box::pin(async move {
+                    let mut results = RunMany::new(vec![
+                        $( self.$i.any() ),+, self.$i_head.any()
+                    ], ctx).run().await;
+                    Ok((
+                        results.remove(0).cast::<Result<$t_head, E>>()?,
+                        $( {results.remove(0).cast::<Result<$t, E>>()?} ),+
+                    ))
+                })
+            }
+        }
+        impl_result_tuple!(($($t),+); ($($tt),+); ($($i),+));
     };
+
+    (
+        ($t:ident);
+        ($tt:ident);
+        ($i:tt)
+    ) => {}
+}
+impl_result_tuple!((T0, T1, T2, T3, T4, T5, T6, T7); (M0, M1, M2, M3, M4, M5, M6, M7); (7, 6, 5, 4, 3, 2, 1, 0));
+
+macro_rules! impl_tuple {
+    (
+        ($t_head:ident, $( $t:ident ),+);
+        ($tt_head:ident, $($tt:ident),+);
+        ($i_head:tt, $( $i:tt ),+)
+    ) => {
+        impl<
+            $t_head: AnySend, $( $t: AnySend ),+,
+            $tt_head: MultiRequest<$t_head> + 'static, $( $tt: MultiRequest<$t> + 'static ),+
+        > MultiRequest<($t_head, $( $t ),+)> for ($tt_head, $( $tt ),+) {
+            fn run(self: Box<Self>, ctx: Context) -> PBFut<($t_head, $( $t ),+)> {
+                Box::pin(async move {
+                    let mut results = RunMany::new(vec![
+                        $( self.$i.any() ),+, self.$i_head.any()
+                    ], ctx).run().await;
+                    (
+                        results.remove(0).cast::<$t_head>(),
+                        $( results.remove(0).cast::<$t>() ),+
+                    )
+                })
+            }
+        }
+        impl_tuple!(($($t),+); ($($tt),+); ($($i),+));
+    };
+
+    (
+        ($t:ident);
+        ($tt:ident);
+        ($i:tt)
+    ) => {}
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct Test(String);
-crate::register_command!(Test);
-impl Command for Test {
-    type Error = Error;
-    type Output = bool;
-    async fn run(self, mut ctx: Context) -> Result<Self::Output, Self::Error> {
-        println!("started");
-        ctx.store().insert("Hello".to_string(), "Goodbye".to_string());        
-        println!("1");
-        tokio::time::sleep(tokio::time::Duration::from_nanos(1)).await;
-        //let test: (bool, bool) = ctx.request((Test2("He".to_string()), Test2("Hello".to_string()))).await?;
-        //let test = Test2("Hello".to_string()).run(ctx).await?;
-        println!("2");
-        ctx.store().insert("Hello".to_string(), "Requested".to_string());
-        println!("3");
-        Ok(false)
-    }
-}
-
-pub trait MultiRequest<E = ()> {
-    type Error: AnyError + Serialize;
-    type Output: AnySend + Serialize;
-
-}
-
-impl<C: Command> MultiRequest for C {
-    type Error = C::Error;
-    type Output = C::Output;
-
-}
-
-impl MultiRequest for (Request, Vec<Endpoint>) {
-    type Error = Error;
-    type Output = Vec<Response>;
-
-  //fn run(self, ctx: &mut Context) -> Result<Self::Output, Self::Error> {
-  //}
-}
-
-impl<E: AnyError + Serialize, M0: MultiRequest<Error = E>, M1: MultiRequest<Error = E>> MultiRequest<bool> for (M0, M1) {
-    type Error = E;
-    type Output = (M0::Output, M1::Output);
-}
-
-impl<M0: MultiRequest, M1: MultiRequest> MultiRequest for (M0, M1) {
-    type Error = Error;
-    type Output = (Result<M0::Output, M0::Error>, Result<M1::Output, M1::Error>);
-}
+impl_tuple!((T0, T1, T2, T3, T4, T5, T6, T7); (M0, M1, M2, M3, M4, M5, M6, M7); (7, 6, 5, 4, 3, 2, 1, 0));

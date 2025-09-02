@@ -93,7 +93,7 @@ impl std::fmt::Debug for Endpoint {
     }
 }
 
-#[derive(Debug)]
+#[derive(Default, Debug)]
 pub struct OrangeResolver;
 impl OrangeResolver {
     pub async fn sign(&mut self, secret: &OrangeSecret, payload: &[u8]) -> Result<OrangeSignature, Error> {

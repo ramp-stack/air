@@ -4,10 +4,10 @@ mod tcp;
 use tcp::Client as Client;
 
 mod chandler;
-pub use chandler::{Chandler, Service, Request, Response};
+pub use chandler::{Chandler, Service, Request, Response, ServiceRequest};
 
 mod purser;
-pub use purser::{Purser, Status, Error, Compiler, Command, AnyCommand, CommandResult, Context};
+pub use purser::{Purser, Error, Compiler, Command, AnyCommand, CommandResult, Context};
 
 #[derive(Debug)]
 pub enum ClientError {
