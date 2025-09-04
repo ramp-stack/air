@@ -1,6 +1,6 @@
 pub mod orange_name;
 pub mod server;
-//pub mod storage;
+pub mod storage;
 
 use easy_secp256k1::Hashable;
 

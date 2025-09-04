@@ -117,11 +117,29 @@ impl Command for Box<dyn AnyCommand> {
     }
 }
 
-//  #[derive(Default)]
-//  pub struct State(HashMap<TypeId, Box<dyn std::any::Any + Send>>);
-//  impl State {
-//      
-//  }
+#[derive(Default)]
+pub struct State(HashMap<TypeId, Box<dyn std::any::Any + Send>>);
+impl State {
+    pub fn set<A: AnySend>(&mut self, set: A) {
+        self.0.insert(TypeId::of::<A>(), Box::new(set));
+    }
+
+    pub fn get<A: AnySend>(&self) -> &A {
+        self.0.get(&TypeId::of::<A>()).unwrap().downcast_ref().unwrap()
+    }
+
+    pub fn try_get<A: AnySend>(&self) -> Option<&A> {
+        self.0.get(&TypeId::of::<A>()).map(|a| *a.downcast_ref().unwrap())
+    }
+
+    pub fn try_get_mut<A: AnySend>(&mut self) -> Option<&mut A> {
+        self.0.get_mut(&TypeId::of::<A>()).map(|a| a.downcast_mut().unwrap())
+    }
+
+    pub fn get_mut_or_default<A: AnySend + Default>(&mut self) -> &mut A {
+        self.0.entry(TypeId::of::<A>()).or_insert_with(|| Box::new(A::default())).downcast_mut().unwrap()
+    }
+}
 
 
 type Handler<'a> = Box<dyn FnOnce(Vec<(Request, Vec<Endpoint>)>) -> Pin<Box<dyn Future<Output = Result<Vec<Vec<Response>>, Error>> + Send + 'a>> + Send + 'a>;
@@ -130,9 +148,8 @@ type InProgress<Output> = Arc<Mutex<BTreeMap<Id, (Pin<Box<Running<Output>>>, Req
 type Requests = Vec<(Request, Vec<Endpoint>)>;
 type Responder = oneshot::Sender<Result<Vec<Vec<Response>>, Error>>;
 type Callback = Sender<(Requests, Responder)>;
-type Store = Arc<TokioMutex<HashMap<TypeId, Box<dyn std::any::Any + Send>>>>;
+type Store = Arc<TokioMutex<State>>;
 type PBFut<Output> = Pin<Box<dyn Future<Output = Output> + Send>>;
-
 
 #[derive(Clone)]
 pub struct Context {
@@ -147,16 +164,19 @@ impl Context {
         rx.await.unwrap()
     }
 
-    //pub async fn store(&mut self) -> TokioMutexGuard<'_, State> {self.store.lock().await}
-
-    pub async fn try_get<A: AnySend>(&self) -> Option<&A> {
-        let store = self.store.lock().await;
-        store.get(&TypeId::of::<A>()).map(|a| *a.downcast_ref().unwrap())
+    pub async fn store(&mut self) -> TokioMutexGuard<'_, State> {
+        self.store.lock().await
     }
 
-    pub async fn get_mut_or_default<A: AnySend + Default>(&mut self) -> &mut A {
-        let store = self.store.lock().await;
-        store.entry(TypeId::of::<A>()).or_insert_with(|| Box::new(A::default())).downcast_mut().unwrap()
+    pub async fn try_get_mut<A: AnySend>(&mut self) -> Option<tokio::sync::MappedMutexGuard<'_, A>> {
+        let mut guard = self.store.lock().await;
+        if guard.try_get_mut::<A>().is_some() {
+            Some(TokioMutexGuard::map(guard, |store| store.try_get_mut().unwrap()))
+        } else {None}
+    }
+
+    pub async fn get_mut_or_default<A: AnySend + Default>(&mut self) -> tokio::sync::MappedMutexGuard<'_, A> {
+        TokioMutexGuard::map(self.store.lock().await, |store| store.get_mut_or_default())
     }
 
     pub async fn run<Output: Send, M: MultiRequest<Output>>(&mut self, input: M) -> Output {
@@ -181,6 +201,11 @@ impl Compiler {
             store: Store::default(),
         }
     }
+
+    pub async fn store(&mut self) -> TokioMutexGuard<'_, State> {
+        self.store.lock().await
+    }
+
     pub async fn tick(&mut self) -> BTreeMap<Id, CommandResult> {
         let store = self.store.clone();
         CompilerTick::<Box<dyn AnySend>>::new(
@@ -268,6 +293,7 @@ impl<Output: Send + 'static> Running<Output> {
         Running(Some(Box::pin(m.run(context))), Some(rx))
     }
 }
+
 impl<Output: 'static> Future for Running<Output> {
     type Output = RunningResult<Output>;
     fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {

@@ -2,8 +2,8 @@ use secp256k1::{SecretKey, PublicKey};
 use easy_secp256k1::EasySecretKey;
 use serde::{Serialize, Deserialize};
 
-use super::{Request, Response, PrivateItem, NAME, PublicItem, Filter};
-use crate::server::{Request as ChandlerRequest, Response as ChandlerResponse, Error, Context, Command};
+use super::{Request, PrivateItem, PublicItem, Filter};
+use crate::server::{Error, Context, Command};
 use crate::{Id, DateTime};
 
 use crate::orange_name::{self, OrangeResolver, OrangeSecret, OrangeName, Signed as DidSigned, Endpoint};
@@ -25,6 +25,21 @@ use crate::orange_name::{self, OrangeResolver, OrangeSecret, OrangeName, Signed 
 //      }
 //  }
 
+
+#[derive(Serialize, Deserialize)]
+pub struct CreatePrivate(Request, Endpoint);
+impl CreatePrivate {
+    pub fn new(sdiscover: &SecretKey, delete: Option<PublicKey>, header: Vec<u8>, payload: Vec<u8>, endpoint: Endpoint) -> Self {
+        CreatePrivate(Request::create_private(sdiscover, delete, header, payload), endpoint)
+    }
+}
+impl Command for CreatePrivate {
+    type Output = Result<Option<DateTime>, Error>;
+
+    async fn run(self, mut ctx: Context) -> Self::Output {
+        ctx.run((self.0, self.1)).await?.create_private()
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct ReadPrivate(Request, PublicKey, Endpoint);
@@ -107,7 +122,7 @@ impl Command for ReadDM {
 
     async fn run(self, mut ctx: Context) -> Self::Output {
         let items = ctx.run((self.0, self.2)).await?.read_dm()?;
-        let resolver = ctx.get_mut_or_default::<OrangeResolver>().await;
+        let mut resolver = ctx.get_mut_or_default::<OrangeResolver>().await;
         let key = resolver.secret_keys(&self.1, Some("easy_access_com"), None).await?.first()
             .ok_or(orange_name::Error::Resolution("Could not find easy_access_com key".to_string()))?.1;
         let items = items.into_iter().flat_map(|item| {
@@ -116,7 +131,7 @@ impl Command for ReadDM {
 
         let mut results = Vec::new();
         for signed in items {
-            match signed.verify(resolver, None).await {
+            match signed.verify(&mut resolver, None).await {
                 Err(e) if e.is_critical() => {return Err(e.into());},
                 Err(_) => {},
                 Ok(name) => {results.push((name, signed.into_inner()));}
@@ -153,10 +168,10 @@ impl Command for ReadPublic {
 
     async fn run(self, mut ctx: Context) -> Self::Output {
         let items = ctx.run((self.0, self.2)).await?.read_public()?;
-        let resolver = ctx.get_mut_or_default::<OrangeResolver>().await;
+        let mut resolver = ctx.get_mut_or_default::<OrangeResolver>().await;
         let mut results = Vec::new();
         for (id, signed, date) in items {
-            let name = signed.verify(resolver, Some(date)).await.map_err(Error::mr)?;
+            let name = signed.verify(&mut resolver, Some(date)).await.map_err(Error::mr)?;
             if self.1.filter(&id, &name, signed.as_ref(), &date) {
                 results.push((id, name, signed.into_inner(), date));
             }
