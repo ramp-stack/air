@@ -9,8 +9,6 @@ use serde::{Serialize, Deserialize};
 use url::Url;
 use crate::DateTime;
 
-use active_rusqlite::SerdeJsonToFromStr;
-
 const ORANGEME_NAME: &str = "orange_name:03190689e2ecf319d31d34af8f5bb42dcc5b88d9cc482671b076285ce3a58ae318";
 const ORANGEME_URI: &str = "air.orange.me:5702";
 //const ORANGEME_URI: &str = "localhost:5702";
@@ -72,7 +70,7 @@ pub enum OrangeSignature {
     Temporary(Signature)
 }
 
-#[derive(SerdeJsonToFromStr, Serialize, Deserialize, PartialEq, Clone, Debug, Eq)]
+#[derive(Serialize, Deserialize, PartialEq, Clone, Debug, Eq)]
 pub enum OrangeSecret {
     Temporary(SecretKey)
 }

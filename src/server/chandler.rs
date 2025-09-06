@@ -22,18 +22,15 @@ pub trait ServiceRequest: Into<Request> + Serialize + for<'a> Deserialize<'a> {
 trait ErasedService {
     fn name(&self) -> String;
     //fn catalog(&self) -> String;
-    fn process<'a>(&'a mut self, resolver: &'a mut OrangeResolver, request: String) -> Pin<Box<dyn Future<Output = String> + 'a>>;
+    fn process<'a>(&'a mut self, resolver: &'a mut OrangeResolver, request: String) -> Pin<Box<dyn Future<Output = Result<String, String>> + 'a>>;
 }
 
 impl<R: ServiceRequest, Self_: Service<Request = R> + Send> ErasedService for Self_ {
     fn name(&self) -> String {Service::name(self)}
     //fn catalog(&self) -> String {Service::catalog(self)}
-    fn process<'a>(&'a mut self, resolver: &'a mut OrangeResolver, request: String) -> Pin<Box<dyn Future<Output = String> + 'a>> {
+    fn process<'a>(&'a mut self, resolver: &'a mut OrangeResolver, request: String) -> Pin<Box<dyn Future<Output = Result<String, String>> + 'a>> {
         Box::pin(async move {
-            serde_json::to_string(&match serde_json::from_str(&request) {
-                Ok(request) => Ok(Service::process(self, resolver, request).await),
-                Err(e) => Err(e.to_string())
-            }).unwrap()
+            Ok(serde_json::to_string(&Service::process(self, resolver, serde_json::from_str(&request).map_err(|e| format!("Could not parse request: {e}"))?).await).unwrap())
         })
     }
 }
@@ -57,13 +54,13 @@ impl Request {
 pub enum Response {
     Batch(Vec<Box<Response>>),
     OutOfService(String),
-    Service(String),
+    Service(Result<String, String>),
     //Catalog(BTreeMap<String, String>),
 }
 impl Response {
     pub fn service<R: ServiceRequest>(&self) -> Result<R::Response, Error> {
         match self {
-            Response::Service(response) => serde_json::from_str(response).map_err(Error::mr),
+            Response::Service(response) => serde_json::from_str(response.as_ref().map_err(Error::mr)?).map_err(Error::mr),
             e => Err(Error::mr(e))
         }
     }
@@ -117,11 +114,10 @@ impl Chandler {
     //Vec<Vec<Request>> Each Vec<Request> is a batch that must be executed in order(Payment failure to
     //one stops the batch)
     pub async fn handle(&mut self, request: &[u8]) -> Vec<u8> {
-        if let Ok(payload) = self.dir.easy_decrypt(request) {
-            if let Ok((requester, request)) = serde_json::from_slice::<(PublicKey, Request)>(&payload) {
-                let response = self.handle_request(request).await;
-                return requester.easy_encrypt(serde_json::to_vec(&response).unwrap()).unwrap();
-            }
+        if let Ok(payload) = self.dir.easy_decrypt(request) 
+        && let Ok((requester, request)) = serde_json::from_slice::<(PublicKey, Request)>(&payload) {
+            let response = self.handle_request(request).await;
+            return requester.easy_encrypt(serde_json::to_vec(&response).unwrap()).unwrap();
         }
         Vec::new()
     }

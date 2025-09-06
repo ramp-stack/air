@@ -54,17 +54,20 @@ impl Purser {
         let com = resolver.key(&recipient.0, Some("easy_access_com"), None).await?;
         let payload = com.easy_encrypt(serde_json::to_vec(&(one_time_key.easy_public_key(), &request)).unwrap()).unwrap();
         let response = self.client.send(recipient.1.as_str(), &payload).await?;
-        serde_json::from_slice::<Result<Response, String>>(&one_time_key.easy_decrypt(&response).map_err(Error::mr)?).map_err(Error::mr)?.map_err(Error::mr)
+        serde_json::from_slice::<Response>(&one_time_key.easy_decrypt(&response).map_err(Error::mr)?).map_err(Error::mr)
     }
 
     pub async fn send_batch(&mut self, resolver: &mut OrangeResolver, requests: Vec<(Request, Vec<Endpoint>)>) -> Result<Vec<Vec<Response>>, Error> {
+        //println!("requests: {:?}", requests);
         let mut batches: BTreeMap<&Endpoint, Vec<Request>> = BTreeMap::new();
         requests.iter().for_each(|(r, es)| es.iter().for_each(|e| batches.entry(e).or_default().push(r.clone())));
         let mut results: BTreeMap<Endpoint, Vec<Response>> = BTreeMap::new();
         for (recipient, batch) in batches {
             results.insert(recipient.clone(), self.send(resolver, recipient, Request::batch(batch)).await?.batch()?);
         }
-        Ok(requests.into_iter().rev().map(|(_, es)| es.into_iter().map(|e| results.get_mut(&e).unwrap().pop().unwrap()).collect()).collect())
+        let res = Ok(requests.into_iter().rev().map(|(_, es)| es.into_iter().map(|e| results.get_mut(&e).unwrap().pop().unwrap()).collect()).collect());
+        //println!("res: {:?}", res);
+        res
     }
 }
 
@@ -184,6 +187,7 @@ impl Context {
     }
 }
 
+//TODO split out into sperate project
 #[derive(Default)]
 pub struct Compiler {
     purser: Purser,
@@ -462,3 +466,22 @@ macro_rules! impl_tuple {
 }
 
 impl_tuple!((T0, T1, T2, T3, T4, T5, T6, T7); (M0, M1, M2, M3, M4, M5, M6, M7); (7, 6, 5, 4, 3, 2, 1, 0));
+
+//  pub struct MajorityResponse<C>(Vec<C>);
+//  impl<C: Command<Output: PartialEq>> Command for MajorityResponse<C> {
+//      type Output = Option<C::Output>;
+
+//      async fn run(self, mut ctx: Context) -> Self::Output {
+//          let req = (self.0.len() / 2) + 1;
+//          let responses: Vec<C::Output> = ctx.run(self.0).await;
+//          let (count, winner) = responses.into_iter().fold((0, None), |mut acc, p| {
+//              if acc.0 == 0 {acc.1 = Some(p);}
+//              else if acc.1 == Some(p) {acc.0 += 1;}
+//              else {acc.0 -= 1;}
+//              acc
+//          });
+//          if count >= req {Some(winner.unwrap())} else {None}
+//      }
+//  }
+
+

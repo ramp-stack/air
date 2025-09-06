@@ -12,7 +12,7 @@ use crate::{DateTime, Id, now};
 mod service;
 pub use service::Service;
 
-mod requests;
+pub mod requests;
 //pub use requests::{Client, Processed};
 
 pub mod records;
@@ -55,9 +55,9 @@ impl Filter {
     }
 
     pub fn filter(&self, oid: &Id, oauthor: &OrangeName, oitem: &PublicItem, odatetime: &DateTime) -> bool {
-        if let Some(id) = &self.id {if id != oid {return false;}}
-        if let Some(author) = &self.author {if author != oauthor {return false;}}
-        if let Some(protocol) = &self.protocol {if protocol != &oitem.protocol {return false;}}
+        if let Some(id) = &self.id && id != oid {return false;}
+        if let Some(author) = &self.author && author != oauthor {return false;}
+        if let Some(protocol) = &self.protocol && protocol != &oitem.protocol {return false;}
         if let Some((op, datetime)) = &self.datetime {
             match op {
                 Op::LS if odatetime >= datetime => {return false;},
