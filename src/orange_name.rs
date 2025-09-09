@@ -36,14 +36,12 @@ impl std::fmt::Display for Error {
 pub enum ResolutionError {
     UnsupportedMethod(String),
     SerdeJson(serde_json::Error),
-    EasySecp256k1(easy_secp256k1::Error),
     Secp256k1(secp256k1::Error),
     Hex(hex::FromHexError),
 }
 impl std::error::Error for ResolutionError {}
 impl std::fmt::Display for ResolutionError {fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {write!(f, "{:?}", self)}}
 impl From<serde_json::Error> for ResolutionError {fn from(error: serde_json::Error) -> Self {ResolutionError::SerdeJson(error)}}
-impl From<easy_secp256k1::Error> for ResolutionError {fn from(error: easy_secp256k1::Error) -> Self {ResolutionError::EasySecp256k1(error)}}
 impl From<secp256k1::Error> for ResolutionError {fn from(error: secp256k1::Error) -> Self {ResolutionError::Secp256k1(error)}}
 impl From<hex::FromHexError> for ResolutionError {fn from(error: hex::FromHexError) -> Self {ResolutionError::Hex(error)}}
 
