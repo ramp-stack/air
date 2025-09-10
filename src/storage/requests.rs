@@ -1,31 +1,12 @@
 use secp256k1::{SecretKey, PublicKey};
-use easy_secp256k1::EasySecretKey;
+use easy_secp256k1::{EasySecretKey, EasyPublicKey};
 use serde::{Serialize, Deserialize};
 
 use super::{Request, PrivateItem, PublicItem, Filter};
 use crate::server::{Error, Context, Command};
-use crate::{Id, DateTime};
+use crate::{Id, DateTime, now};
 
-use crate::orange_name::{self, OrangeResolver, OrangeSecret, OrangeName, Signed as DidSigned, Endpoint};
-
-macro_rules! async_passthrough {
-    ($name:ident, $snake_name:ident, ($($param_names:tt)+): ($($params:tt)+) @ ($($output:tt)+)) => {
-        #[derive(Serialize, Deserialize)]
-        pub struct $name(Request, Endpoint);
-        impl $name {
-            pub async fn new($($params)+, endpoint: Endpoint) -> Result<Self, Error> {
-                Ok($name(Request::$snake_name($($param_names)+).await?, endpoint))
-            }
-        }
-        impl Command for $name {
-            type Output = $($output)+;
-
-            async fn run(self, mut ctx: Context) -> Self::Output {
-                ctx.run((self.0, self.1)).await?.$snake_name()
-            }
-        }
-    };
-}
+use orange_name::{self, OrangeResolver, OrangeSecret, OrangeName, Signed as DidSigned, Endpoint};
 
 #[derive(Serialize, Deserialize)]
 pub struct CreatePrivate(Request, Endpoint);
@@ -96,57 +77,85 @@ impl Command for DeletePrivate {
     }
 }
 
-async_passthrough!(
-    CreateDM, create_dm,
-    (resolver, secret, recipient, payload): 
-    (resolver: &mut OrangeResolver, secret: &OrangeSecret, recipient: OrangeName, payload: Vec<u8>) @
-    (Result<(), Error>)
-);
+#[derive(Serialize, Deserialize)]
+pub struct CreateDM{
+    secret: OrangeSecret, recipient: OrangeName, payload: Vec<u8>, endpoint: Endpoint
+}
+impl CreateDM {
+    pub fn new(secret: OrangeSecret, recipient: OrangeName, payload: Vec<u8>, endpoint: Endpoint) -> Self {
+        CreateDM{secret, recipient, payload, endpoint}
+    }
+}
+impl Command for CreateDM {
+    type Output = Result<(), Error>;
+
+    async fn run(self, mut ctx: Context) -> Self::Output {
+        let mut resolver = ctx.get_mut_or_default::<OrangeResolver>().await;
+        let com = resolver.key(&self.recipient, Some("easy_access_com"), None).await?;
+        let signed = DidSigned::new(&mut resolver, &self.secret, self.payload).await?;
+        drop(resolver);
+        ctx.run((Request::create_dm(
+            self.recipient, com.easy_encrypt(serde_json::to_vec(&signed).unwrap()).unwrap()
+        ), self.endpoint)).await?.create_dm()
+    }
+}
 
 #[derive(Serialize, Deserialize)]
-pub struct ReadDM(Request, OrangeSecret, Endpoint);
+pub struct ReadDM(OrangeSecret, DateTime, Endpoint);
 impl ReadDM {
-    pub async fn new(resolver: &mut OrangeResolver, secret: &OrangeSecret, since: DateTime, endpoint: Endpoint) -> Result<Self, Error> {
-        Ok(ReadDM(Request::read_dm(resolver, secret, since).await?, secret.clone(), endpoint))
+    pub fn new(secret: OrangeSecret, since: DateTime, endpoint: Endpoint) -> Self {
+        ReadDM(secret, since, endpoint)
     }
 }
 impl Command for ReadDM {
     type Output = Result<Vec<(OrangeName, Vec<u8>)>, Error>;
 
     async fn run(self, mut ctx: Context) -> Self::Output {
-        let items = ctx.run((self.0, self.2)).await?.read_dm()?;
         let mut resolver = ctx.get_mut_or_default::<OrangeResolver>().await;
-        let key = resolver.secret_keys(&self.1, Some("easy_access_com"), None).await?.first()
-            .ok_or(orange_name::Error::Resolution("Could not find easy_access_com key".to_string()))?.1;
+        let signed = DidSigned::new(&mut resolver, &self.0, (now(), self.1)).await?;
+        drop(resolver);
+        let items = ctx.run((Request::ReadDM(signed), self.2)).await?.read_dm()?;
+
+        let mut resolver = ctx.get_mut_or_default::<OrangeResolver>().await;
+        let key = resolver.secret_key(&self.0, Some("easy_access_com"), None).await?;
         let items = items.into_iter().flat_map(|item| {
             serde_json::from_slice::<DidSigned<Vec<u8>>>(&key.easy_decrypt(&item).ok()?).ok()
         }).collect::<Vec<_>>();
 
         let mut results = Vec::new();
         for signed in items {
-            match signed.verify(&mut resolver, None).await {
-                Err(e) if e.is_critical() => {return Err(e.into());},
-                Err(_) => {},
-                Ok(name) => {results.push((name, signed.into_inner()));}
+            if signed.verify(&mut resolver, None).await.is_ok() {
+                results.push((signed.signer().clone(), signed.into_inner()));
             }
         }
         Ok(results)
     }
 }
 
-async_passthrough!(
-    CreatePublic, create_public,
-    (resolver, secret, item): 
-    (resolver: &mut OrangeResolver, secret: &OrangeSecret, item: PublicItem) @
-    (Result<Id, Error>)
-);
+#[derive(Serialize, Deserialize)]
+pub struct CreatePublic(OrangeSecret, PublicItem, Endpoint);
+impl CreatePublic {
+    pub fn new(secret: OrangeSecret, item: PublicItem, endpoint: Endpoint) -> Self {
+        CreatePublic(secret, item, endpoint)
+    }
+}
+impl Command for CreatePublic {
+    type Output = Result<Id, Error>;
+
+    async fn run(self, mut ctx: Context) -> Self::Output {
+        let mut resolver = ctx.get_mut_or_default::<OrangeResolver>().await;
+        let signed = DidSigned::new(&mut resolver, &self.0, self.1).await?;
+        drop(resolver);
+        ctx.run((Request::CreatePublic(signed), self.2)).await?.create_public()
+    }
+}
 
 
 #[derive(Serialize, Deserialize)]
 pub struct ReadPublic(Request, Filter, Endpoint);
 impl ReadPublic {
     pub fn new(filter: Filter, endpoint: Endpoint) -> Self {
-        ReadPublic(Request::read_public(filter.clone()), filter, endpoint)
+        ReadPublic(Request::ReadPublic(filter.clone()), filter, endpoint)
     }
 }
 impl Command for ReadPublic {
@@ -166,16 +175,39 @@ impl Command for ReadPublic {
     }
 }
 
-async_passthrough!(
-    UpdatePublic, update_public,
-    (resolver, secret, id, item): 
-    (resolver: &mut OrangeResolver, secret: &OrangeSecret, id: Id, item: PublicItem) @
-    (Result<(), Error>)
-);
+#[derive(Serialize, Deserialize)]
+pub struct UpdatePublic(OrangeSecret, Id, PublicItem, Endpoint);
+impl UpdatePublic {
+    pub fn new(secret: OrangeSecret, id: Id, item: PublicItem, endpoint: Endpoint) -> Self {
+        UpdatePublic(secret, id, item, endpoint)
+    }
+}
+impl Command for UpdatePublic {
+    type Output = Result<(), Error>;
 
-async_passthrough!(
-    DeletePublic, delete_public,
-    (resolver, secret, id): 
-    (resolver: &mut OrangeResolver, secret: &OrangeSecret, id: Id) @
-    (Result<(), Error>)
-);
+    async fn run(self, mut ctx: Context) -> Self::Output {
+        let mut resolver = ctx.get_mut_or_default::<OrangeResolver>().await;
+        let signed = DidSigned::new(&mut resolver, &self.0, self.2).await?;
+        let signed = DidSigned::new(&mut resolver, &self.0, (self.1, signed)).await?;
+        drop(resolver);
+        ctx.run((Request::UpdatePublic(signed), self.3)).await?.update_public()
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DeletePublic(OrangeSecret, Id, Endpoint);
+impl DeletePublic {
+    pub fn new(secret: OrangeSecret, id: Id, endpoint: Endpoint) -> Self {
+        DeletePublic(secret, id, endpoint)
+    }
+}
+impl Command for DeletePublic {
+    type Output = Result<(), Error>;
+
+    async fn run(self, mut ctx: Context) -> Self::Output {
+        let mut resolver = ctx.get_mut_or_default::<OrangeResolver>().await;
+        let signed = DidSigned::new(&mut resolver, &self.0, self.1).await?;
+        drop(resolver);
+        ctx.run((Request::DeletePublic(signed), self.2)).await?.delete_public()
+    }
+}

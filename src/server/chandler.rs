@@ -5,8 +5,9 @@ use serde::{Serialize, Deserialize};
 use std::pin::Pin;
 use std::fmt::Debug;
 
-use crate::orange_name::OrangeResolver;
 use super::Error;
+
+use orange_name::OrangeResolver;
 
 pub trait Service: Send {
     type Request: ServiceRequest;
@@ -17,6 +18,10 @@ pub trait Service: Send {
 
 pub trait ServiceRequest: Into<Request> + Serialize + for<'a> Deserialize<'a> {
     type Response: Serialize + for<'a> Deserialize<'a> + Send;
+
+    fn from_chandler(response: Response) -> Result<Self::Response, Error> {
+        response.service::<Self>()
+    }
 }
 
 trait ErasedService {

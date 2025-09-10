@@ -4,7 +4,6 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use crate::server::Service as ServiceTrait;
-use crate::orange_name::{OrangeResolver, OrangeName, Signed as DidSigned, Error};
 use crate::{DateTime, Id, now};
 
 use super::{NAME, Catalog, Request, Response, PublicItem, Op, PrivateItem};
@@ -12,6 +11,7 @@ use super::{NAME, Catalog, Request, Response, PublicItem, Op, PrivateItem};
 use serde::{Serialize, Deserialize};
 use easy_secp256k1::Signed as KeySigned;
 use secp256k1::PublicKey;
+use orange_name::{OrangeResolver, OrangeName, Signed as DidSigned, Error};
 
 use active_rusqlite::*;
 
@@ -56,7 +56,12 @@ impl ServiceTrait for Service {
         let result = match request {
             Request::CreatePrivate(signed) => {
                 match signed.verify() {
-                    Ok(discover) if discover == signed.as_ref().discover => {
+                    Err(e) => Response::InvalidSignature(e.to_string()),
+                    Ok(discover) if discover != signed.as_ref().discover =>
+                        Response::InvalidRequest("Discover key mismatch between Signature and Payload".to_string()),
+                    Ok(_) if signed.as_ref().header.as_ref().len() > 1000 =>
+                        Response::InvalidRequest("Header was too large limit is 1kb".to_string()),
+                    Ok(discover) => {
                         Response::CreatePrivate(PrivateTable::read_sub::<A<DateTime>>(
                             &self.0, &[&discover.to_string(), "timestamp"]
                         ).unwrap().map(|d| d.0).or_else(|| {
@@ -64,8 +69,6 @@ impl ServiceTrait for Service {
                             None
                         }))
                     },
-                    Ok(_) => Response::InvalidRequest("Discover key mismatch between Signature and Payload".to_string()),
-                    Err(e) => Response::InvalidSignature(e.to_string())
                 }
             },
             Request::ReadPrivateHeader(signed) => {

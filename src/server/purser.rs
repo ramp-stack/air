@@ -9,11 +9,12 @@ use std::task::Poll;
 use std::pin::Pin;
 use std::any::TypeId;
 use tokio::sync::mpsc;
-use crate::orange_name::{self, OrangeResolver, Endpoint};
 use crate::Id;
 
 use super::chandler::{Request, Response, ServiceRequest};
 use super::{Client, ClientError};
+
+use orange_name::{self, OrangeResolver, Endpoint};
 
 use std::sync::{Arc, Mutex};
 use tokio::sync::{Mutex as TokioMutex, MutexGuard as TokioMutexGuard};
@@ -24,14 +25,11 @@ use tokio::sync::oneshot;
 pub enum Error {
     MaliciousResponse(String),
     ConnectionFailed(String),
-    CriticalOrange(String)
+    OrangeName(String)
 }
 impl std::error::Error for Error {}
 impl Error {pub(crate) fn mr(e: impl Debug) -> Self {Error::MaliciousResponse(format!("{e:?}"))}}
-impl From<orange_name::Error> for Error {fn from(error: orange_name::Error) -> Self {match error{
-    orange_name::Error::Critical(error) => {Error::CriticalOrange(error)}
-    resolution => Error::ConnectionFailed(format!("{resolution:?}")),
-}}}
+impl From<orange_name::Error> for Error {fn from(e: orange_name::Error) -> Self {Error::OrangeName(format!("{e:?}"))}}
 impl From<ClientError> for Error {fn from(error: ClientError) -> Self {match error {
     ClientError::MaliciousResponse(response) => Error::MaliciousResponse(response),
     ClientError::ConnectionFailed(error) => Error::ConnectionFailed(error)
@@ -58,16 +56,13 @@ impl Purser {
     }
 
     pub async fn send_batch(&mut self, resolver: &mut OrangeResolver, requests: Vec<(Request, Vec<Endpoint>)>) -> Result<Vec<Vec<Response>>, Error> {
-        //println!("requests: {:?}", requests);
         let mut batches: BTreeMap<&Endpoint, Vec<Request>> = BTreeMap::new();
         requests.iter().for_each(|(r, es)| es.iter().for_each(|e| batches.entry(e).or_default().push(r.clone())));
         let mut results: BTreeMap<Endpoint, Vec<Response>> = BTreeMap::new();
         for (recipient, batch) in batches {
             results.insert(recipient.clone(), self.send(resolver, recipient, Request::batch(batch)).await?.batch()?);
         }
-        let res = Ok(requests.into_iter().rev().map(|(_, es)| es.into_iter().map(|e| results.get_mut(&e).unwrap().pop().unwrap()).collect()).collect());
-        //println!("res: {:?}", res);
-        res
+        Ok(requests.into_iter().rev().map(|(_, es)| es.into_iter().map(|e| results.get_mut(&e).unwrap().pop().unwrap()).collect()).collect())
     }
 }
 
@@ -378,7 +373,7 @@ impl<Output: AnySend> MultiRequest<Box<dyn AnySend>> for Box<dyn MultiRequest<Ou
 impl<I: ServiceRequest + AnySend> MultiRequest<Result<I::Response, Error>> for (I, Endpoint) {
     fn run(self: Box<Self>, mut ctx: Context) -> PBFut<Result<I::Response, Error>> {
         Box::pin(async move {
-            ctx.send(vec![(self.0.into(), vec![self.1])]).await.and_then(|mut r| r.remove(0).remove(0).service::<I>())
+            ctx.send(vec![(self.0.into(), vec![self.1])]).await.and_then(|mut r| I::from_chandler(r.remove(0).remove(0)))
         })
     }
 }
@@ -386,7 +381,7 @@ impl<I: ServiceRequest + AnySend> MultiRequest<Result<I::Response, Error>> for (
 impl<I: ServiceRequest + AnySend> MultiRequest<Result<Vec<I::Response>, Error>> for (I, Vec<Endpoint>) {
     fn run(self: Box<Self>, mut ctx: Context) -> PBFut<Result<Vec<I::Response>, Error>> {
         Box::pin(async move {
-            ctx.send(vec![(self.0.into(), self.1)]).await.and_then(|mut r| r.remove(0).into_iter().map(|r| r.service::<I>()).collect())
+            ctx.send(vec![(self.0.into(), self.1)]).await.and_then(|mut r| r.remove(0).into_iter().map(|r| I::from_chandler(r)).collect())
         })
     }
 }
@@ -394,7 +389,7 @@ impl<I: ServiceRequest + AnySend> MultiRequest<Result<Vec<I::Response>, Error>> 
 impl<I: ServiceRequest + AnySend> MultiRequest<Result<Vec<Vec<I::Response>>, Error>> for Vec<(I, Vec<Endpoint>)> {
     fn run(self: Box<Self>, mut ctx: Context) -> PBFut<Result<Vec<Vec<I::Response>>, Error>> {
         Box::pin(async move {
-            ctx.send(self.into_iter().map(|(r, e)| (r.into(), e)).collect()).await.and_then(|r| r.into_iter().map(|r| r.into_iter().map(|r| r.service::<I>()).collect()).collect())
+            ctx.send(self.into_iter().map(|(r, e)| (r.into(), e)).collect()).await.and_then(|r| r.into_iter().map(|r| r.into_iter().map(|r| I::from_chandler(r)).collect()).collect())
         })
     }
 }

@@ -1,4 +1,3 @@
-pub mod orange_name;
 pub mod server;
 pub mod storage;
 

@@ -11,8 +11,6 @@ use crate::DateTime;
 
 const ORANGEME_NAME: &str = "orange_name:03190689e2ecf319d31d34af8f5bb42dcc5b88d9cc482671b076285ce3a58ae318";
 const ORANGEME_URI: &str = "air.orange.me:5702";
-//const ORANGEME_URI: &str = "localhost:5702";
-
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Hash)]
 pub enum Error {
