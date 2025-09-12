@@ -61,24 +61,7 @@ pub struct Permission(Actor, Action);
 //Discover Key will be a shared secret too where the author choose a unqiue one based on his path as
 //usual(Unless the Discover Key is Secret always???)
 
-let room = vec![
-    Permission(Actor::User(bob), Action::Read),
-    Permission(Actor::Author, Action::Read),
-    Permission(Actor::Author, Action::CreateChild("messages", Some(messages))),
-    Permission(Actor::Author, Action::DeleteChild("messages/regex#(0-9)*")),
-    Permission(Actor::Anyone, Action::ReadChild("messages")),
-];
 
-let messages = vec![
-    Permission(Actor::Anyone, Action::CreateChild("regex#(0-9)*", Some(message))),
-    Permission(Actor::Anyone, Action::ReadChild("regex#(0-9)*")),
-]
-
-let message = vec![
-    Permission(Actor::Author, Action::Delete),
-    Permission(Actor::User(bob), Action::Read),//This means that bob can read this message but only
-    //if he knows the discover key can he find it and to verify anything else he needs the header
-]
 
 //TODO: Given a vec of permission and a path provide me the permissions for the record
 //Maybe provide an author key for derivation and do the and/or in the resolver

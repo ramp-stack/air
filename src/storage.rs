@@ -10,9 +10,10 @@ use crate::{DateTime, Id};
 
 use orange_name::{OrangeName, Signed as DidSigned};
 
-//mod inner_records;
+mod inner_records;
+mod permissions;
 
-mod channels;
+//mod channels;
 
 mod service;
 pub use service::Service;
@@ -129,6 +130,7 @@ impl From<Request> for ChandlerRequest {
 }
 
 pub type Item<I> = Option<(DateTime, Option<KeySigned<I>>)>;
+pub type Header = KeySigned<Vec<u8>>;
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Default, Clone, Debug, Hash)]
@@ -137,7 +139,7 @@ pub enum Response {
     InvalidSignature(String),
     InvalidDelete(Option<PublicKey>),
     ReadPrivate(Item<PrivateItem>),
-    ReadPrivateHeader(Item<Vec<u8>>),
+    ReadPrivateHeader(Option<(DateTime, Header)>),
     CreatePrivate(Option<DateTime>),
     CreatedPublic(Id),
     ReadPublic(Vec<(Id, DidSigned<PublicItem>, DateTime)>),
@@ -152,7 +154,7 @@ impl Response {
         r => Err(Error::mr(r))
     }}
 
-    pub fn read_private_header(self) -> Result<Item<Vec<u8>>, Error> {match self {
+    pub fn read_private_header(self) -> Result<Option<(DateTime, Header)>, Error> {match self {
         Self::ReadPrivateHeader(result) => Ok(result),
         r => Err(Error::mr(r))
     }}

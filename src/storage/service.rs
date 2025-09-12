@@ -24,14 +24,14 @@ pub struct PrivateEntry{
     delete: A<Option<PublicKey>>,
     timestamp: A<DateTime>,
     item: A<Option<Item>>,
-    header: A<Option<Header>>
+    header: A<Header>
 }
 impl From<KeySigned<PrivateItem>> for PrivateEntry {
     fn from(item: KeySigned<PrivateItem>) -> Self {
         PrivateEntry{
             delete: A(item.as_ref().delete),
             timestamp: A(now()),
-            header: A(Some(item.as_ref().header.clone())),
+            header: A(item.as_ref().header.clone()),
             item: A(Some(item)),
         }
     }
@@ -77,7 +77,7 @@ impl ServiceTrait for Service {
                         let timestamp = PrivateTable::read_sub::<A<DateTime>>(
                             &self.0, &[&discover.to_string(), "timestamp"]
                         ).unwrap().map(|a| a.0);
-                        let header = PrivateTable::read_sub::<A<Option<Header>>>(
+                        let header = PrivateTable::read_sub::<A<Header>>(
                             &self.0, &[&discover.to_string(), "header"]
                         ).unwrap().map(|a| a.0);
                         Response::ReadPrivateHeader(timestamp.map(|t| (t, header.unwrap())))
@@ -109,9 +109,6 @@ impl ServiceTrait for Service {
                         Some(Some(key)) if key == delete => {
                             PrivateTable::create_sub::<A<Option<Item>>>(
                                 &self.0, &[&discover.to_string(), "item"], &A(None)
-                            ).unwrap();
-                            PrivateTable::create_sub::<A<Option<Header>>>(
-                                &self.0, &[&discover.to_string(), "header"], &A(None)
                             ).unwrap();
                             Response::Empty
                         },

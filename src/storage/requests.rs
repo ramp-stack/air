@@ -51,9 +51,9 @@ impl Command for ReadPrivateHeader {
     type Output = Result<Option<(DateTime, Option<Vec<u8>>)>, Error>;
 
     async fn run(self, mut ctx: Context) -> Self::Output {
-        ctx.run((self.0, self.2)).await?.read_private_header().map(|r| r.map(|(d, r)| (d, r.and_then(|signed| (
-            *signed.signer() == self.1 && signed.verify().is_ok()
-        ).then_some(signed.into_inner())))))
+        ctx.run((self.0, self.2)).await?.read_private_header().map(|r| r.map(|(date,  signed)|
+            (date, (*signed.signer() == self.1 && signed.verify().is_ok()).then_some(signed.into_inner()))
+        ))
     }
 }
 

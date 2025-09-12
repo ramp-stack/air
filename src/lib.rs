@@ -6,7 +6,7 @@ use easy_secp256k1::Hashable;
 pub type DateTime = chrono::DateTime::<chrono::Utc>;
 pub fn now() -> DateTime {chrono::Utc::now()}
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Copy)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Copy)]
 #[derive(serde_with::SerializeDisplay)]
 #[derive(serde_with::DeserializeFromStr)]
 pub struct Id([u8; 32]);
@@ -25,9 +25,16 @@ impl std::fmt::Display for Id {
         write!(f, "{}", hex::encode(self.0))
     }
 }
+impl std::fmt::Debug for Id {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", hex::encode(self.0))
+    }
+}
 impl std::str::FromStr for Id {
     type Err = hex::FromHexError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(Id(hex::decode(s)?.try_into().map_err(|_| hex::FromHexError::InvalidStringLength)?))
     }
 }
+
+
