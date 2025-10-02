@@ -31,49 +31,14 @@ impl ReadPrivate {
     }
 }
 impl Command for ReadPrivate {
-    type Output = Result<Option<(DateTime, Option<PrivateItem>)>, Error>;
+    type Output = Result<Option<(DateTime, PrivateItem)>, Error>;
 
     async fn run(self, mut ctx: Context) -> Self::Output {
-        ctx.run((self.0, self.2)).await?.read_private().map(|r| r.map(|(d, r)| (d, r.and_then(|signed| (
-            *signed.signer() == self.1 && signed.verify().is_ok() && signed.as_ref().discover == self.1 
-        ).then_some(signed.into_inner())))))
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct ReadPrivateHeader(Request, PublicKey, Endpoint);
-impl ReadPrivateHeader {
-    pub fn new(sec_discover: &SecretKey, endpoint: Endpoint) -> Self {
-        ReadPrivateHeader(Request::read_private_header(sec_discover), sec_discover.easy_public_key(), endpoint)
-    }
-}
-impl Command for ReadPrivateHeader {
-    type Output = Result<Option<(DateTime, Option<Vec<u8>>)>, Error>;
-
-    async fn run(self, mut ctx: Context) -> Self::Output {
-        ctx.run((self.0, self.2)).await?.read_private_header().map(|r| r.map(|(date,  signed)|
-            (date, (*signed.signer() == self.1 && signed.verify().is_ok()).then_some(signed.into_inner()))
-        ))
-    }
-}
-
-
-#[derive(Serialize, Deserialize)]
-pub struct DeletePrivate(Request, PublicKey, Endpoint);
-impl DeletePrivate {
-    pub fn new(discover: PublicKey, delete: &SecretKey, endpoint: Endpoint) -> Self {
-        DeletePrivate(Request::delete_private(discover, delete), delete.easy_public_key(), endpoint)
-    }
-}
-impl Command for DeletePrivate {
-    type Output = Result<Option<Option<PublicKey>>, Error>;
-
-    async fn run(self, mut ctx: Context) -> Self::Output {
-        match ctx.run((self.0, self.2)).await?.delete_private()? {
-            Some(key) if key != Some(self.1) => Ok(Some(key)),
-            None => Ok(None),
-            r => Err(Error::mr(r))
-        }
+        ctx.run((self.0, self.2)).await?.read_private().and_then(|r| r.map(|(d, signed)| {
+            signed.verify().map_err(Error::mr)?;
+            (*signed.signer() == self.1 && signed.as_ref().discover == self.1).then_some(()).ok_or(Error::mr("Different keys"))?;
+            Ok((d, signed.into_inner()))
+        }).transpose())
     }
 }
 

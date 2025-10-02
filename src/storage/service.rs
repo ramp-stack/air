@@ -1,38 +1,30 @@
-use rusqlite::{OptionalExtension, Connection, params};
+use rusqlite::Connection;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::str::FromStr;
 
 use crate::server::Service as ServiceTrait;
-use crate::{DateTime, Id, now};
+use crate::{DateTime, now};
 
-use super::{NAME, Catalog, Request, Response, PublicItem, Op, PrivateItem};
+use super::{Catalog, Request, Response, PrivateItem};
 
 use serde::{Serialize, Deserialize};
-use easy_secp256k1::Signed as KeySigned;
-use secp256k1::PublicKey;
-use orange_name::{OrangeResolver, OrangeName, Signed as DidSigned, Error};
+use orange_name::{Resolver, Secret, secp256k1::{PublicKey, Signed as KeySigned}, Id};
 
 use active_rusqlite::*;
-
-type Header = KeySigned<Vec<u8>>;
-type Item = KeySigned<PrivateItem>;
 
 #[derive(Serialize, Deserialize, ActiveRecord)]
 #[active_record(children)]
 pub struct PrivateEntry{
-    delete: A<Option<PublicKey>>,
     timestamp: A<DateTime>,
-    item: A<Option<Item>>,
-    header: A<Header>
+    hash: A<Id>,
+    item: A<KeySigned<PrivateItem>>,
 }
 impl From<KeySigned<PrivateItem>> for PrivateEntry {
     fn from(item: KeySigned<PrivateItem>) -> Self {
         PrivateEntry{
-            delete: A(item.as_ref().delete),
             timestamp: A(now()),
-            header: A(item.as_ref().header.clone()),
-            item: A(Some(item)),
+            hash: A(Id::hash(&item)),
+            item: A(item),
         }
     }
 }
@@ -44,23 +36,22 @@ impl Service {
     pub async fn new(
         path: Option<PathBuf>,
     ) -> Result<Self, rusqlite::Error> {
-        Ok(Service(Connection::open(path.unwrap_or(PathBuf::from(NAME)))?))
+        Ok(Service(Connection::open(path.unwrap_or(PathBuf::from(Self::NAME)))?))
     }
 }
 impl ServiceTrait for Service {
+    const NAME: &str = "Storage";
     type Request = Request;
-    fn name(&self) -> String {NAME.to_string()}
     fn catalog(&self) -> String {serde_json::to_string(&Catalog{}).unwrap()}
-    async fn process(&mut self, resolver: &mut OrangeResolver, request: Request) -> Response {
+    async fn process(&mut self, _resolver: &mut Resolver, _secret: &Secret, request: Request) -> Response {
         let time = std::time::Instant::now();
+        let read_private = matches!(request, Request::ReadPrivate(_));
         let result = match request {
             Request::CreatePrivate(signed) => {
                 match signed.verify() {
                     Err(e) => Response::InvalidSignature(e.to_string()),
                     Ok(discover) if discover != signed.as_ref().discover =>
                         Response::InvalidRequest("Discover key mismatch between Signature and Payload".to_string()),
-                    Ok(_) if signed.as_ref().header.as_ref().len() > 1000 =>
-                        Response::InvalidRequest("Header was too large limit is 1kb".to_string()),
                     Ok(discover) => {
                         Response::CreatePrivate(PrivateTable::read_sub::<A<DateTime>>(
                             &self.0, &[&discover.to_string(), "timestamp"]
@@ -71,53 +62,27 @@ impl ServiceTrait for Service {
                     },
                 }
             },
-            Request::ReadPrivateHeader(signed) => {
+            Request::ReadPrivate(signed) | Request::ReadPrivateHash(signed) => {
                 match signed.verify() {
                     Ok(discover) => {
                         let timestamp = PrivateTable::read_sub::<A<DateTime>>(
                             &self.0, &[&discover.to_string(), "timestamp"]
-                        ).unwrap().map(|a| a.0);
-                        let header = PrivateTable::read_sub::<A<Header>>(
-                            &self.0, &[&discover.to_string(), "header"]
-                        ).unwrap().map(|a| a.0);
-                        Response::ReadPrivateHeader(timestamp.map(|t| (t, header.unwrap())))
-                    },
-                    Err(e) => Response::InvalidSignature(e.to_string())
-                }
-            },
-            Request::ReadPrivate(signed) => {
-                match signed.verify() {
-                    Ok(discover) => {
-                        let timestamp = PrivateTable::read_sub::<A<DateTime>>(
-                            &self.0, &[&discover.to_string(), "timestamp"]
-                        ).unwrap().map(|a| a.0);
-                        let item = PrivateTable::read_sub::<A<Option<Item>>>(
-                            &self.0, &[&discover.to_string(), "item"]
-                        ).unwrap().map(|a| a.0);
-                        Response::ReadPrivate(timestamp.map(|t| (t, item.unwrap())))
-                    },
-                    Err(e) => Response::InvalidSignature(e.to_string())
-                }
-            },
-            Request::DeletePrivate(signed) => {
-                let discover = signed.as_ref();
-                match signed.verify() {
-                    Ok(delete) => match PrivateTable::read_sub::<A<Option<PublicKey>>>(
-                            &self.0, &[&discover.to_string(), "delete"]
-                        ).unwrap().map(|a| a.0) {
-                        None => Response::Empty,
-                        Some(Some(key)) if key == delete => {
-                            PrivateTable::create_sub::<A<Option<Item>>>(
-                                &self.0, &[&discover.to_string(), "item"], &A(None)
+                        ).unwrap();
+                        let hash = PrivateTable::read_sub::<A<Id>>(
+                            &self.0, &[&discover.to_string(), "hash"]
+                        ).unwrap();
+                        if read_private {
+                            let item = PrivateTable::read_sub::<A<KeySigned<PrivateItem>>>(
+                                &self.0, &[&discover.to_string(), "item"]
                             ).unwrap();
-                            Response::Empty
-                        },
-                        Some(key) => Response::InvalidDelete(key)
+                            Response::ReadPrivate(timestamp.map(|t| (t.0, hash.unwrap().0, item.unwrap().0)))
+                        } else {
+                            Response::ReadPrivateHash(timestamp.map(|t| (t.0, hash.unwrap().0)))
+                        }
                     },
                     Err(e) => Response::InvalidSignature(e.to_string())
                 }
             },
-            _ => todo!()
           //Request::CreatePublic(signed) => {
           //    match signed.verify(resolver, None).await {
           //        Ok(signer) => {
@@ -228,7 +193,7 @@ impl ServiceTrait for Service {
           //}
         };
         println!("completed: {:?}", time.elapsed().as_millis());
-        result
+        result 
     }
 }
 
@@ -273,7 +238,7 @@ impl ServiceTrait for Service {
 //      type Request = Request;
 //      fn name(&self) -> String {NAME.to_string()}
 //      fn catalog(&self) -> String {serde_json::to_string(&Catalog{}).unwrap()}
-//      async fn process(&mut self, resolver: &mut OrangeResolver, request: Request) -> Response {
+//      async fn process(&mut self, resolver: &mut Resolver, request: Request) -> Response {
 //          let time = std::time::Instant::now();
 //          let result = match request {
 //              Request::CreatePrivate(signed) => {

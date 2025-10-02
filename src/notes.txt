@@ -1,70 +1,74 @@
 
-//Records are currently Identifyable by its header Id because the header contains the keys used to
-//locate it on any air server and the header data is where all the tags are located
-//
-//
-//If I used name paths /rooma/messages/message21 could point to different records at any path level
-//Unless I can prove that /rooma/messages corrosponds with /abc/efg without any data but my master key
-//
-//Given my master key and /rooma/messages/message21 locate the same record no matter the state
-//
-//1. Discover every record under / until one has "rooma" in the header data will not work because
-//   the original can be deleted an a different record can be created at another index with the
-//   same name
-//2. Discovery order is unimportant 
-//
-//Derive a series of bytes by adding 256 to each one 
-//Reservig 0-255 for special characters
-//0 is used to deleminate pathes
-//
-//
-//
-//Record Headers that are pointers contain the pointed header inside the header data of the first
-//record This means you can not change the record it points to without changing the record id
-//
-//
-// /abc/0 can point to anything
-// /abc/efg references one particular record but from /abc/efg I cannot get the efg header
-//
-// I would have to grind /abc/... until I read a record that was /abc/efg
-//
-// If I knew the protocol, and the header data and the index I could reconstruct the header locally
-// If and Only If I was the one who generated the keys for /abc/efg
-// If /abc is a pointer and /0 -> xyz which contains abc 
-//o
-//
-//
-//
-//
-//
-//
-//
-//
-//
-//
-//
-//1. /abc/efg/xyz points to an exact record on any air server
-//2. xyz is the important part but /abc and /efg are also each exact records
-//3. If /abc is not mine but rather a pointer its fine since it contains the data that it points to
-//
-//4. If some one sends me a room with hash lmh and I put it under /abc then it follows that
-//   /abc/lmh/xyz are the same two records as  /lmh/xyz
-//
-//5. It also follows that xyz is under a particular index of lmh "0"
-//
-//6. Given lmh discover/read child keys and "0" I can generate for myself the discover/read key of xyz
-//7. But without the other keys provided by the author or the header data and protocol I can't get xyz itself
-//8. And I cannot prove that lmh/0 => xyz always and with xyz cannot confirm that lmh/0 is pointing
-//   to the right record
-//
-//
-//   In short without xyz being known lmh/0 which produces xyz must be proved to have the right
-//   discove child keys so that lmh/0/0 can point to efg without me needing to know xyz If I have
-//   to know xyz then "lmh/0/0 cannot point to a single record"
-//
-//   lmh/0 always points to the same single record
-//   lmh/0/0 does not because lmh/0 does not determain the discover child key
-//
-//   Pointers are not the problem because anyone who can dertermine the discover child key
-//   arbitrarilly is creating data that is neccessary to valdate the records position on an air
-//   server
+File {
+	key: bob/root_0,
+	child_key: (bob/0 + bobs secret)
+	payload: Header {
+		name: "Rooms",
+		child_key: None,
+		protocol: Protocol {
+			children: (vec![bobs_air_server], vec![room.id()]),//Children are discovered on bobs_air_server and all children allow
+			permissions: vec![
+				Permission(Actor::User(bob), Action::Create),
+				Permission(Actor::User(bob), Action::Read),
+			],
+			groups: BTreeMap::default()
+		}
+	}
+}// ehc
+
+File {
+	key: bob/0/0,
+	child_key: key_abc(pub)
+	payload: Header {
+		name: "0",
+		child_key: key_abc(sec),//Anyone can read children,
+		protocol: Protocol {
+			children: (vec![bobs_air_server, alices_air_server, charlie_air_server], vec![messages.id()]),
+			permissions: vec![
+				Permission(Actor::User(bob), Action::Create),
+				Permission(Actor::User(bob), Action::Read),
+			],
+			groups: BTreeMap::default()
+		}
+	}
+}
+
+
+
+PM, M
+
+PM/0 = Pa0
+
+PC = Pa0 + PM
+
+C = M/0 + M
+
+Pb0 = PC/0
+
+PD = Pb0 + PC
+
+D = C/0 + C
+
+C - D = C - (C + C/0) = C/0
+
+PC - PD = PC/0
+
+
+
+
+D:
+N
+A+N = AN
+
+
+D+A = DA
+D+B = DB
+D+C = DC
+
+DA + DB
+
+
+
+Assume D is trusted:
+
+

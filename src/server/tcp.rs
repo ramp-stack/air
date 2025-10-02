@@ -1,7 +1,7 @@
 use std::net::{TcpListener, TcpStream, Shutdown};
 use std::io::{Write, Read};
 use std::time::Duration;
-use super::{Chandler, ClientError};
+use super::{Chandler, Error};
 
 pub struct Server;
 impl Server {
@@ -21,7 +21,7 @@ impl Server {
 #[derive(Default)]
 pub struct Client;
 impl Client {
-    pub async fn send(&mut self, url: &str, request: &[u8]) -> Result<Vec<u8>, ClientError> {
+    pub async fn send(&mut self, url: &str, request: &[u8]) -> Result<Vec<u8>, Error> {
         let mut stream = TcpStream::connect(url)?;
         stream.write_all(request)?;
         stream.shutdown(Shutdown::Write)?;
@@ -30,7 +30,12 @@ impl Client {
         Ok(response)
     }
 }
-
-impl From<std::io::Error> for ClientError {
-    fn from(e: std::io::Error) -> Self {ClientError::ConnectionFailed(format!("{e:?}"))}
+//TODO: rewrite client so that when we get a connection refused error we ping google and if google
+//connects we blame the air server otherwise return a disconnected error
+//
+//TCP should have no ConnectionFailed error like we migh have in a tor network or more complex
+//system where the client side could be at fault while still being connected to the internet
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {Error::ConnectionFailed(format!("{e:?}"))}
 }
+

@@ -4,20 +4,29 @@ mod tcp;
 use tcp::Client as Client;
 
 mod chandler;
-pub use chandler::{Chandler, Service, Request, Response, ServiceRequest};
+pub use chandler::{Chandler, Service, Request, Response, ServiceRequest, RawRequest};
 
-mod purser;
-pub use purser::{Purser, Error, Compiler, Command, AnyCommand, CommandResult, Context};
+mod commands;
 
-#[derive(Debug)]
-pub enum ClientError {
-    ///This error is caused by a malicious response from the server
+pub mod purser;
+pub use purser::{Purser, Compiler, Command, AnyCommand, Context, Request as PurserRequest};
+pub use crate::map_request_enum;
+
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Error {
+    ///This error is caused by a malicious or no response from the server
     MaliciousResponse(String),
-    ///Caused by some local circumstances that need to be corrected
-    ConnectionFailed(String)
+    ///Caused by the client for some reason such as not being configured properly
+    ConnectionFailed(String),
+    ///We are disconnected from the internet
+    Disconnected
 }
-impl std::error::Error for ClientError {}
-impl std::fmt::Display for ClientError {
+impl Error {
+    pub(crate) fn mr(e: impl std::fmt::Debug) -> Self {Error::MaliciousResponse(format!("{e:?}"))}
+}
+impl std::error::Error for Error {}
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{self:?}")
     }
