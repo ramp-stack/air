@@ -15,13 +15,13 @@ pub trait Service: Send {
     fn process(&mut self, resolver: &mut Resolver, secret: &Secret, request: Self::Request) -> impl Future<Output = <Self::Request as ServiceRequest>::Response>;
 }
 
-pub trait ServiceRequest: Serialize + for<'a> Deserialize<'a> {
-    type Response: Serialize + for<'a> Deserialize<'a> + Send;
+pub trait ServiceRequest: Serialize + for<'a> Deserialize<'a> + Debug {
+    type Response: Serialize + for<'a> Deserialize<'a> + Send + Debug;
     type Service: Service;
 }
 
-pub trait RawRequest {
-    type Response: Send;
+pub trait RawRequest: Debug {
+    type Response: Send + Debug;
     fn into(self) -> Request;
     fn from(response: Response) -> Result<Self::Response, Error>;
 }
@@ -132,7 +132,7 @@ impl Chandler {
 
     //TODO: Add Payment System
     pub async fn handle(&mut self, request: &[u8]) -> Vec<u8> {
-        if let Ok(payload) = self.dir.decrypt(&crate::now(), &[], request) 
+        if let Ok(payload) = self.dir.decrypt(None, &[], request) 
         && let Ok((requester, request)) = serde_json::from_slice::<(PublicKey, Request)>(&payload) {
             let response = self.handle_request(request).await;
             let response = Signed::new(&self.dir, &[], response).unwrap();

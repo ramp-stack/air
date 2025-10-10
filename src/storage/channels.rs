@@ -1,138 +1,175 @@
+use orange_name::{Name, secp256k1::{SecretKey, Signed as KeySigned, PublicKey}, Id, Secret};
 
+use crate::server::{Error as PurserError, Command, Context, PurserRequest};
 
-pub struct Cache(BTreeMap<PathBuf, CachedChannel>);
+use std::hash::{Hasher, Hash};
+use std::time::Duration;
+use std::path::PathBuf;
+use std::fmt::Debug;
 
-pub struct CachedChannel {
-    latest_index: u32,
-    latest_timestamp: DateTime,
-    children: BTreeSet<String>
-}
+use crate::{DateTime, now};
 
+use serde::{Serialize, Deserialize};
+
+use super::{PrivateItem, ReadPrivateItem, CreateReadPrivateItem};
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Channel{
-    path: PathBuf,
-    payload: Option<Vec<u8>>,
-    endpoints: Vec<Endpoint>,
-    update: Vec<OrangeName>,
-    delete_children: Vec<OrangeName>,
+    index: usize,
+    date: DateTime,
+    key: SecretKey,
+    servers: Vec<Name>
 }
 
-impl Channel {
-    pub fn create() -> {}
-    pub fn read(); 
-    pub fn update(); 
-    pub fn delete(); 
+#[derive(Debug, PartialEq)]
+pub enum Error<V> {
+    PurserError(PurserError),
+    Validation(V)
+}
+impl<V: Debug> std::error::Error for Error<V> {}
+impl<V: Debug> std::fmt::Display for Error<V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {write!(f, "{self:?}")}
+}
+impl<V> From<V> for Error<V> {fn from(e: V) -> Self {Self::Validation(e)}}
+
+pub enum State {
+    Read(usize),
+    Create(Vec<u8>),
+    Stop
 }
 
-//1. Air servers need to keep track of delete time and only allow deleteing of payload
-//2. Include Endpoints in the header data
-//3. Include name in header data and validate header data name by looking in the previouse records
-//   only
-//4. Build a permission resolver that handles verification and resolution of permissions/headers
-//   (Should eliminate all key handling from now on)
-//5. 
-
-pub enum Actor {
-    Author,//Owner
-    Group(String, Vec<OrangeName>),
-    User(OrangeName),
-    Anyone,
-
-    And(Actor, Actor),
-    Or(Actor, Actor),
+pub struct Traverse<R, E>{
+    state: State,
+    channel: Channel,
+    validate: Box<dyn FnMut(Vec<Option<PrivateItem>>) -> Result<(Vec<R>, Option<State>), E> + Send>,
+    results: Vec<R>
 }
 
-pub enum Action {
-    Delete,
-    Read, //Discover and Read Self
-    CreateChild(String, vec![Permission]), //Create a child with the given name (path and regex accepted) Needs Discover and Read children
-    ReadChild(String), //Read a child with the given name (path and regex accepted)
-    DeleteChild(String), //Delete a child with the given name (path and regex accepted)
+impl Traverse<Option<PrivateItem>, ()> {
+    pub fn new(channel: Channel, state: State) -> Self {
+        Traverse{state, channel, validate: Box::new(|items| Ok((items, None))), results: vec![]}
+    }
+}
+impl<R: Send + 'static, E: Send + 'static> Traverse<R, E> {
+    pub fn new_with_validation(channel: Channel, state: State, validate: impl FnMut(Vec<Option<PrivateItem>>) -> Result<(Vec<R>, Option<State>), E> + Send + 'static) -> Self {
+        Traverse{state, channel, validate: Box::new(validate), results: vec![]}
+    }
+}
+impl<R: Send + 'static, E: Send + 'static> Command<PurserRequest> for Traverse<R, E> {
+    type Output = Result<(Channel, Vec<R>), Error<E>>;
+
+    async fn run(mut self, mut ctx: Context) -> Self::Output {
+        let mut gap = false;
+        let result = loop {
+            let responses = match &self.state {
+                State::Read(count) => {
+                    let requests = (self.channel.index..(self.channel.index+count)).map(|i| {
+                        let key = self.channel.key.derive(&[i]);
+                        ReadPrivateItem(
+                            key, self.channel.servers.clone()
+                        )
+                    }).collect::<Vec<_>>();
+                    ctx.run(requests).await.into_iter()
+                        .collect::<Result<Vec<_>, PurserError>>()
+                        .map_err(|e| Error::PurserError(e))?.into_iter()
+                        .filter_map(|r| {
+                        gap = r.is_none();
+                        (!gap).then(|| {
+                            self.channel.index += 1;
+                            r.unwrap().filter(|p| {
+                            let f = (self.channel.date - p.datetime).num_minutes().abs() > 1 || 
+                                self.channel.date < p.datetime;
+                            if f {self.channel.date = p.datetime;}
+                            f
+                        })})
+                    }).collect::<Vec<_>>()
+                },
+                State::Create(payload) => {
+                    let key = self.channel.key.derive(&[self.channel.index]);
+                    let response = ctx.run(CreateReadPrivateItem(
+                        key,
+                        PrivateItem::new(key, now(), payload.clone()),
+                        self.channel.servers.clone()
+                    )).await.map_err(|e| Error::PurserError(e))?;
+                    self.channel.index += 1;
+                    gap = response.is_none();
+                    if gap {break self.results}
+                    vec![response.unwrap()]
+                },
+                State::Stop => break self.results
+            };
+            let (results, new_state) = (self.validate)(responses)?;
+            self.results.extend(results);
+            if gap {break self.results}
+            self.state = new_state.unwrap_or(self.state);
+        };
+        Ok((self.channel, result))
+    }
 }
 
-pub struct Permission(Actor, Action);
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::server::{Compiler, PurserRequest, Purser};
 
-//When Permissioning a user or group of users to read or create they also need the ability to
-//discover.
-//
-//Bob needs the whole header to know if he has access to something
-//
-//To Create or Delete you need Read Permissions of the header to verify that it exists or find it
-//
-//Discover Key will be a shared secret too where the author choose a unqiue one based on his path as
-//usual(Unless the Discover Key is Secret always???)
+    async fn run<T: Send + 'static, C: Command<PurserRequest, Output = T>>(cmd: C) -> T {
+        let mut compiler = Compiler::new(Purser::new());
+        compiler.add_task(0, cmd);
+        compiler.run().await.remove(&0).unwrap()
+    }
 
+    #[tokio::test]
+    async fn create_read() {
+        let channel = Channel{
+            index: 0,
+            date: DateTime::UNIX_EPOCH,
+            key: SecretKey::new(),
+            servers: vec![Name::orange_me()],
+        };
+        let payload = b"hello".to_vec();
+        let (mut channel, result) = run(Traverse::new(channel, State::Create(payload.clone()))).await.unwrap();
+        assert_eq!(result, vec![]);
+        assert_eq!(channel.index, 1);
+        channel.index = 0; 
 
+        let (channel, mut r) = run(Traverse::new_with_validation(channel, State::Read(4), |mut items: Vec<Option<PrivateItem>>| {
+            assert_eq!(items.len(), 1);
+            Ok::<_, ()>((vec![items.remove(0).unwrap()], None))
+        })).await.unwrap();
+        assert_eq!(channel.index, 1);
+        let read_item = r.remove(0);
+        assert_eq!(read_item.discover, channel.key.derive(&[0 as usize]).public_key());
+        assert_eq!(read_item.payload, payload);
+    }
 
-//TODO: Given a vec of permission and a path provide me the permissions for the record
-//Maybe provide an author key for derivation and do the and/or in the resolver
+    #[tokio::test]
+    async fn out_of_order() {
+        let channel = Channel{
+            index: 1,
+            date: DateTime::UNIX_EPOCH,
+            key: SecretKey::new(),
+            servers: vec![Name::orange_me()],
+        };
+        let payload = b"bad hello".to_vec();
 
+        let (mut channel, r) = run(Traverse::new(channel, State::Create(payload.clone()))).await.unwrap();
+        assert_eq!(channel.index, 2);
+        assert_eq!(r, vec![]);
 
+        let payload = b"good hello".to_vec();
+        channel.index = 0;
 
-//Create Room {
-//  groups: Vec<Group>
-//}
-
-
-    //Permissions are always on a child because you cannot see your own abilities revoked if you
-    //require your abilities to see the status of them?
-    //
-    //A payload can be deleted but never replaced
-    //
-    //The payload of a record should contain its permissions and initial state
-    //
-    //further records inside of itself will contain payload updates?
-    //
-    //Updates to its permissions are status records
-    //
-    //Deleting a record requires notifing the parent? Or can the parent tell because the payload of
-    //the first record was deleted? Then the delete key can not be updated after the fact
-    //
-    //If the delete can be update after the fact the record of that will have to be in the parent
-    //not the child
-    //
-    //A Vector has additional validation with items required to be in order
-
-//Actor of Location can Action
-//
-//Create, Update, Delete can be done using validation and signatures
-//
-//Nobody actually deletes a payload?
-
-
-1. to delete a channel you actually have to remove its link from its parent
-
-
-
-/abc/efg -> CRecord(Room)
-/abc/efg/0 -> "my room name"
-/abc/efg/1 -> "new room name"
-
-
-When looking for /messages discover every record to find the first record with "messages" in the header data
-When a gab limit of one is reached stop
-When a records timestamp is older than a previous records timestamp ignore
-
-Records that can be deleted need to be checked regularly
-
-
-0 /0 = "messages" valid
-1 /1 = "messages" invalid
-
-later
-
-0 /0 = deleted 
-1 /1 = "messages" valid
-
-/messages -> HeaderData/name = "messages"
-
-
-0 /0 = bob -> "messages" valid
-1 /1 = alice -> "messages" invalid
-2 /2 = bob -> /0 deleted "messages" valid
-3 /3 = charlie -> "messages" valid
-
-
-0 /0 bob -> "messages" valid 
-1 /2 alice -> "rooms" invalid
-2 /1 charlie -> "rooms" valid
-
+        let (mut channel, r) = run(Traverse::new(channel, State::Create(payload.clone()))).await.unwrap();
+        assert_eq!(channel.index, 1);
+        assert_eq!(r, vec![]);
+        
+        channel.index = 0;
+        
+        let (channel, mut r) = run(Traverse::new(channel, State::Read(4))).await.unwrap();
+        assert_eq!(channel.index, 2);
+        let read = r.remove(0).unwrap();
+        assert_eq!(read.discover, channel.key.derive(&[0 as usize]).public_key());
+        assert_eq!(read.payload, payload);
+        assert_eq!(r.remove(0), None);
+    }
+}

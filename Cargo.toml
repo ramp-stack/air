@@ -17,11 +17,11 @@ chrono = { version="0.4.38", features = ["serde"] }
 serde_with = "3.8.1"
 rusqlite = {version="0.34.0", features =["serde_json", "bundled"]}
 secp256k1 = {version = "0.31.1", features = ["global-context", "serde", "alloc", "rand"]}
-tokio = {version = "1.47.1", features = ["sync", "time"]}
-active_rusqlite = {path = "../active/active_rusqlite", features	= ["wrappers"]}
+tokio = {version = "1.47.1", features = ["sync", "time", "macros", "rt"]}
+active_rusqlite = {path = "../active/active_rusqlite"}
 orange_name = {path = "../orange_name"}
-anyanymap = {path="../anyanymap"}
-async_fn_traits = "0.1.1"
+request_compiler = {path = "../request_compiler"}
+anyanymap = "0.1.0" 
 
 [features]
 default = ["tcp"]

@@ -1,207 +1,256 @@
 use serde::{Serialize, Deserialize};
-use orange_name::{Signed as OrangeSigned, Resolver, Secret, Name, secp256k1::{SecretKey, PublicKey}, Id};
+use orange_name::{Secret, Name, secp256k1::{SecretKey, PublicKey, Signed as KeySigned}, Id};
 
 use crate::server::{Error as PurserError, Command, Context, PurserRequest};
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::path::{PathBuf, Path};
 use std::hash::{Hasher, Hash};
 use std::fmt::Debug;
 
 use crate::{DateTime, now};
 
-mod consensus;
+//mod consensus;
 
 #[derive(Debug)]
 pub enum Error {
-    MissingPerms(String),
-    MissingFile(Id),
-    InvalidParent(Id),
-    InvalidFile(String),
-    WrongSecretKey,
+    MissingPerms(PathBuf),
+    MissingFile(PathBuf),
+    InvalidParent(PathBuf),
+    InvalidFile(PathBuf),
 }
 impl std::error::Error for Error {}
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {write!(f, "{self:?}")}
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Hash)]
-pub struct DirectedItem(PublicKey, Vec<u8>);
-
-impl DirectedItem {
-    pub fn new(secret: &Secret, recipient: PublicKey, payload: Vec<u8>) -> Result<Self, orange_name::Error>{
-        let signed = OrangeSigned::new(secret, &[], payload)?;
-        Ok(DirectedItem(recipient, recipient.encrypt(serde_json::to_vec(&signed).unwrap()).unwrap()))
-    }
-
-    pub async fn verify(self, resolver: &mut Resolver, secret: &SecretKey) -> Result<(Name, Vec<u8>), orange_name::Error> {
-        let signed = serde_json::from_slice::<OrangeSigned<Vec<u8>>>(&secret.decrypt(&self.1)?)
-            .map_err(|_| secp256k1::Error::InvalidMessage)?;
-        Ok((signed.signer(), signed.verify(resolver, None, None, None).await?))
-    }
+#[derive(Debug)]
+pub enum RequestError {
+    FileError(Error),
+    PurserError(PurserError)
 }
-
-#[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
-pub struct PublicItem {
-    pub tags: BTreeSet<String>,
-    pub payload: Vec<u8>,
+impl std::error::Error for RequestError {}
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {write!(f, "{self:?}")}
 }
+impl From<Error> for RequestError {fn from(e: Error) -> Self {Self::FileError(e)}}
+impl From<PurserError> for RequestError {fn from(e: PurserError) -> Self {Self::PurserError(e)}}
 
-#[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
-pub enum Op {LS, LE, E, GE, GR}
-
-#[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
-pub struct Filter{
-    pub id: Option<Id>,
-    pub author: Option<Name>,
-    pub tags: Option<BTreeSet<String>>,
-    pub datetime: Option<(Op, DateTime)>
-}
-impl Filter {
-    pub fn new(
-        id: Option<Id>, author: Option<Name>, tags: Option<BTreeSet<String>>, datetime: Option<(Op, DateTime)>
-    ) -> Self {
-        Filter{id, author, tags, datetime}
-    }
-
-    pub fn filter(&self, oid: &Id, oauthor: &Name, oitem: &PublicItem, odatetime: &DateTime) -> bool {
-        if let Some(id) = &self.id && id != oid {return false;}
-        if let Some(author) = &self.author && author != oauthor {return false;}
-        if let Some(tags) = &self.tags && !tags.is_subset(&oitem.tags) {return false;}
-        if let Some((op, datetime)) = &self.datetime {
-            match op {
-                Op::LS if odatetime >= datetime => {return false;},
-                Op::LE if odatetime > datetime => {return false;},
-                Op::E if odatetime != datetime => {return false;},
-                Op::GE if odatetime < datetime => {return false;},
-                Op::GR if odatetime <= datetime => {return false;},
-                _ => {}
-            }
-        }
-        true
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, Hash)]
-pub struct PrivateItem {
-    pub discover: PublicKey,
-    pub payload: Vec<u8>
-}
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub enum Key {Secret(SecretKey), Public(PublicKey)}
-impl Hash for Key {fn hash<H: Hasher>(&self, state: &mut H) {self.public().hash(state);}}
-impl PartialEq for Key {fn eq(&self, other: &Self) -> bool {self.public() == other.public()}}
+impl Hash for Key {fn hash<H: Hasher>(&self, state: &mut H) {self.public_key().hash(state);}}
+impl PartialEq for Key {fn eq(&self, other: &Self) -> bool {self.public_key() == other.public_key()}}
 impl Eq for Key {}
 impl Key {
-    pub fn public(&self) -> PublicKey {match self {
+    pub fn public_key(&self) -> PublicKey {match self {
         Key::Secret(key) => key.public_key(),
         Key::Public(key) => *key
     }}
-    pub fn secret(&self) -> Option<SecretKey> {match self {
+    pub fn secret_key(&self) -> Option<SecretKey> {match self {
         Key::Secret(key) => Some(*key),
         Key::Public(_) => None 
     }}
 }
 
-type FileHeader = (SecretKey, Vec<Name>, Option<Children>);
+pub trait FilePath {
+    fn to_ids(&self) -> Vec<Id>;
+    fn first(&self) -> Option<String>;
+    fn last(&self) -> String;
+}
 
-#[derive(Default)]
-pub struct FileCache(BTreeMap<Id, FileHeader>);
+impl<P: AsRef<Path>> FilePath for P {
+    fn to_ids(&self) -> Vec<Id> {
+        self.as_ref().components().map(|c|
+            Id::hash(&c.as_os_str().to_string_lossy().to_string())
+        ).collect::<Vec<_>>()
+    }
+
+    fn first(&self) -> Option<String> {
+        self.as_ref().components().next().map(|s| s.as_os_str().to_string_lossy().to_string())
+    }
+
+    fn last(&self) -> String {
+        self.as_ref().file_name().map(|n|
+            n.to_string_lossy().to_string()
+        ).unwrap_or("".to_string())
+    }
+}
+
+#[derive(Clone, Hash)]
+#[derive(serde_with::SerializeDisplay)]
+#[derive(serde_with::DeserializeFromStr)]
+pub struct Serialized(String);
+impl std::fmt::Display for Serialized {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+impl std::str::FromStr for Serialized {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Serialized(s.to_string()))
+    }
+}
+
+///The minimum amount of information on a file required to read and verify
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct Pointer {
+    pub id: Id,
+    pub key: Key,
+    pub servers: Vec<Name>
+}
+
+
+//  #[derive(Serialize, Deserialize, Default, Clone, Debug)]
+//  pub struct RecordCache(Option<(PathBuf, RecordTree)>);//last item in pathBuf matches Record Tree Record Name
+//  impl RecordCache {
+//      
+//  }
+//  impl FileNode {
+//      pub fn get<P: AsRef<Path>>(&self, path: P) -> Option<&FileNode> {
+//          if path.as_ref() == PathBuf::new() {Some(self)} else {
+//              self.children.1.get(path.first().unwrap()).and_then(|node| node.get(path))
+//          }
+//      }
+
+//      pub fn get_mut<P: AsRef<Path>>(&mut self, path: P) -> Option<&mut FileNode> {
+//          if path.as_ref() == PathBuf::new() {Some(self)} else {
+//              self.children.1.get_mut(
+//                  path.as_ref().components().next().unwrap().as_os_str().to_string_lossy().as_ref()
+//              ).and_then(|node| node.get_mut(path))
+//          }
+//      }
+//  }
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CachedFile {
+    key: SecretKey,
+    name: String,
+    servers: Vec<Name>,
+    children: Option<Key>,//(key, latest_index, children)
+}
+
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+pub struct FileCache(BTreeMap<Vec<Id>, CachedFile>);
 impl FileCache {
-    pub fn get(&self, file: &Id) -> Option<&FileHeader> {self.0.get(file)}
-    pub fn get_mut(&mut self, file: &Id) -> Option<&mut FileHeader> {self.0.get_mut(file)}
+    pub fn is_empty(&self) -> bool {self.0.is_empty()}
 
-    pub fn cache(&mut self, file: &File) -> Result<(), Error> {
-        self.0.insert(Id::hash(file), (file.key, file.servers.clone(), file.children.clone()));
+    pub fn get<P: AsRef<Path>>(&self, path: P) -> Option<&CachedFile> {
+        self.0.get(&path.to_ids())
+    }
+
+    pub fn get_mut<P: AsRef<Path>>(&mut self, path: P) -> Option<&mut CachedFile> {
+        self.0.get_mut(&path.to_ids())
+    }
+
+    pub fn cache<T>(&mut self, path: PathBuf, file: &File<T>) -> Result<(), CachedFile> {
+        //TODO: Merge with existing cache data
+        self.0.insert(path.to_ids(), CachedFile{
+            key: file.key,
+            name: file.name.clone(),
+            servers: file.servers.clone(),
+            children: file.children,
+        });
         Ok(())
     }
 
-    pub fn get_children(&self, parent: &Id) -> Result<&Children, Error> {
-        self.get(parent).ok_or(Error::MissingFile(*parent))?.2
-            .as_ref().ok_or(Error::InvalidParent(*parent))
-    }
+  //pub fn get_children(&self, parent: &PathBuf) -> Result<&Header, Error> {
+  //    self.get(parent).ok_or(Error::MissingFile(parent.to_vec()))?.1
+  //        .as_ref().ok_or(Error::InvalidParent(parent.to_vec()))
+  //}
 }
 
-#[derive(Serialize, Deserialize, Clone, Hash)]
-pub struct Children(Key, Vec<Name>);
-impl Children {
-    pub fn set_secret(&mut self, key: SecretKey) -> Result<(), Error> {
-        (self.0.public() != key.public_key())
-            .then(|| self.0 = Key::Secret(key))
-            .ok_or(Error::WrongSecretKey)
-    }
 
-    pub fn get_key(&self, index: usize) -> Result<SecretKey, Error> {
-        Ok(self.0.secret().ok_or(Error::MissingPerms("Child Key".to_string()))?.derive(&[index]))
-    }
-}
 
-///File Actions:
-///
-///Discover: Derive index from the Children public key and read from all the servers (choose state
-///based on majority)
-///
-///Read: Read key from all the servers (choose state based on majority)
-///
-///Create: Send the file to each of the servers (Require successful response from majority)
-///
-///Update/Delete: Not Available 
-#[derive(Serialize, Deserialize, Clone, Hash)]
-pub struct File {
+// bob creates file: bob/'/children/cat -> file
+// bob deligates   : bob/cat/'/key -> ^
+//
+//
+// alice gets bobs : alice/'/children/cat -> ^
+// alice deligates : alice/cat/'/key -> ^ 
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct File<Payload> {
     pub key: SecretKey,
+    pub name: String,
     pub servers: Vec<Name>,
-    pub timestamp: DateTime,
-    pub payload: Vec<u8>,
-    pub children: Option<Children>,
+    pub payload: Payload,
+    pub datetime: DateTime,
+    pub children: Option<Key>,
 }
-impl File {
-    pub fn new(cache: &FileCache, parent: &Id, index: usize, payload: Vec<u8>, children: Option<Children>) -> Result<Self, Error> {
-        let pchildren = cache.get_children(parent)?;
+
+impl File<()> {
+    pub fn root(secret: &Secret, servers: Vec<Name>) -> Result<File<()>, orange_name::Error> {
+        let files = secret.get_hardend(None, &[], "files")?;
         Ok(File{
-            key: pchildren.get_key(index)?,
-            servers: pchildren.1.clone(),
-            timestamp: now(),
-            payload,
-            children
+            key: files.derive(&["key"]),
+            name: "".to_string(),
+            servers: servers.clone(),
+            payload: (),
+            datetime: DateTime::UNIX_EPOCH,
+            children: Some(Key::Secret(files.derive(&["children"])))
         })
     }
 }
 
-pub use consensus::CreateFile;
-
-#[derive(Serialize, Deserialize)]
-pub struct ReadFile(SecretKey, Name, Vec<Name>, Id);
-impl ReadFile {
-    pub fn new(cache: &FileCache, file: &Id) -> Result<Self, Error> {
-        let (key, servers, _) = cache.get(file).ok_or(Error::MissingFile(*file))?;
-        let mut servers = servers.clone();
-        let first_server = servers.pop().ok_or(Error::InvalidFile("No Servers".to_string()))?;
-        Ok(ReadFile(*key, first_server, servers, *file))
-    }
-}
-impl Command<PurserRequest> for ReadFile {
-    type Output = Result<Option<File>, PurserError>;
-
-    async fn run(self, ctx: Context) -> Self::Output {
-        consensus::ReadFile(self.0, self.1, self.2, Some(self.3)).run(ctx).await
+impl<T: Serialize + Hash> Hash for File<T> {
+    fn hash<H: Hasher>(&self, hasher: &mut H) {
+        self.key.hash(hasher);
+        self.servers.hash(hasher);
+        //Reserializing has no effect on already serialized files
+        Serialized(serde_json::to_string(&self.payload).unwrap()).hash(hasher);
+        self.datetime.hash(hasher);
+        self.children.hash(hasher);
     }
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct DiscoverFile(SecretKey, Name, Vec<Name>);
-impl DiscoverFile {
-    pub fn new(cache: &FileCache, parent: &Id, index: usize) -> Result<Self, Error> {
-        let children = cache.get_children(parent)?;
-        let mut servers = children.1.clone();
-        let key = children.get_key(index)?;
-        let first_server = servers.pop().ok_or(Error::InvalidFile("No Servers".to_string()))?;
-        Ok(DiscoverFile(key, first_server, servers))
+impl<T: Serialize + for<'a> Deserialize<'a> + Hash + 'static> File<T> {
+    pub fn new(
+        secret: &Secret, mut path: PathBuf, index: usize, servers: Vec<Name>, payload: T, children: bool
+    ) -> Result<Self, Error> {
+        let files_key = secret.get_hardend(None, &path.to_ids(), "files")
+            .or(Err(Error::MissingPerms(path.clone())))?;
+        Ok(File{
+            key: files_key.derive(&["key"]).derive(&[index]),
+            name: path.last(),
+            servers,
+            payload,
+            datetime: now(),
+            children: children.then_some(Key::Secret(files_key.derive(&["children"])))
+        })
+    }
+
+    pub fn pointer(&self) -> Pointer {Pointer{
+        id: self.id(),
+        key: Key::Secret(self.key),
+        servers: self.servers.clone(),
+    }}
+
+    pub fn id(&self) -> Id {Id::hash(self)}
+
+    pub fn serialize_payload(self) -> Result<File<Serialized>, serde_json::Error> {
+        Ok(File{
+            key: self.key,
+            name: self.name,
+            servers: self.servers,
+            //Reserializing has no effect on already serialized files
+            payload: Serialized(serde_json::to_string(&self.payload)?),
+            datetime: self.datetime,
+            children: self.children
+        })
     }
 }
-impl Command<PurserRequest> for DiscoverFile {
-    type Output = Result<Option<File>, PurserError>;
 
-    async fn run(self, ctx: Context) -> Self::Output {
-        consensus::ReadFile(self.0, self.1, self.2, None).run(ctx).await
+impl File<Serialized> {
+    pub fn deserialize_payload<T: Serialize + for<'a> Deserialize<'a>>(self) -> Result<File<T>, serde_json::Error> {
+        Ok(File{
+            key: self.key,
+            name: self.name,
+            servers: self.servers,
+            payload: serde_json::from_str(&self.payload.0)?,
+            datetime: self.datetime,
+            children: self.children
+        })
     }
 }

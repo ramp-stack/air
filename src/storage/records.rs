@@ -1,909 +1,267 @@
-use easy_secp256k1::{EasySecretKey, EasyPublicKey};
-use secp256k1::{SecretKey, PublicKey};
+use std::path::{PathBuf, Path};
 use serde::{Serialize, Deserialize};
+use orange_name::{Name, Id, Signed, Resolver, Secret};
 use std::collections::BTreeMap;
 use std::hash::{Hasher, Hash};
-use std::ops::{DerefMut, Deref};
-use std::cmp::Ordering;
-use std::fmt::Debug;
+use crate::server::{PurserRequest as Request, Context, Command, Error as PurserError};
 
-use crate::{DateTime, Id};
-use orange_name::{self, OrangeResolver, OrangeSecret, OrangeName, Endpoint};
-use crate::server::{Request, Response, Command, Context};
-use super::PrivateItem;
+use super::files::{Error as FileError, File, RequestError, DiscoverFile, Pointer};
 
-use active_rusqlite::*;
+mod consensus;
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum ValidationError {
-    ///Action presence mismatched with protocol
-    ActionMismatch(String),
-    ///Action requires this secret key and it was not present
-    MissingPerms(String),
-    ///When combining permissions two different keys for the same action were found
-    DifferentKeys(String),
-    Deserialization(String),
-    Decryption(String),
-    MissingRecord(String),
-    InvalidProtocol(Id),
-    InvalidParent(String),
-}
-impl std::error::Error for ValidationError {}
-impl std::fmt::Display for ValidationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {write!(f, "{self:?}")}
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Debug)]
 pub enum Error {
-    MaliciousResponse(String),
-    ConnectionFailed(String),
-    Validation(ValidationError),
-    SerdeJson(String),
-    Secp256k1(String),
-    OrangeName(String),
-    ///In order to run this command the Cache must be loaded into the Store
-    MissingCache
+    MissingPerms(PathBuf),
+    MissingRecord(PathBuf),
+    InvalidPath(PathBuf),
+    FileError(FileError),
+    PurserError(PurserError),
 }
-//impl Error {pub(crate) fn mr(e: impl Debug) -> Self {Error::MaliciousResponse(format!("{e:?}"))}}
-impl From<serde_json::Error> for Error {fn from(e: serde_json::Error) -> Error {Error::SerdeJson(format!("{e:?}"))}}
-impl From<secp256k1::Error> for Error {fn from(e: secp256k1::Error) -> Error {Error::Secp256k1(format!("{e:?}"))}}
-//  impl from<orange_name::error> for error {fn from(error: orange_name::error) -> self {match error{
-//      orange_name::error::critical(error) => {error::criticalorange(error)}
-//      resolution => Error::ConnectionFailed(format!("{resolution:?}")),
-//  }}}
-impl From<crate::server::Error> for Error {fn from(e: crate::server::Error) -> Error {match e {
-    crate::server::Error::MaliciousResponse(response) => Error::MaliciousResponse(response),
-    crate::server::Error::ConnectionFailed(error) => Error::ConnectionFailed(error),
-    crate::server::Error::OrangeName(error) => Error::OrangeName(error),
-}}}
-impl From<ValidationError> for Error {fn from(e: ValidationError) -> Self {Error::Validation(e)}}
 impl std::error::Error for Error {}
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {write!(f, "{self:?}")}
 }
+impl From<PurserError> for Error {fn from(e: PurserError) -> Error {Error::PurserError(e)}}
+impl From<FileError> for Error {fn from(e: FileError) -> Error {Error::FileError(e)}}
+impl From<RequestError> for Error {fn from(e: RequestError) -> Error {match e {
+    RequestError::FileError(e) => Error::FileError(e),
+    RequestError::PurserError(e) => Error::PurserError(e),
+}}}
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
-pub struct WSecretKey(pub SecretKey);
-impl Deref for WSecretKey {type Target = SecretKey; fn deref(&self) -> &Self::Target {&self.0}}
-impl DerefMut for WSecretKey {fn deref_mut(&mut self) -> &mut Self::Target {&mut self.0}}
-impl Hash for WSecretKey {fn hash<H: Hasher>(&self, state: &mut H) {state.write(&self.secret_bytes())}}
-impl From<SecretKey> for WSecretKey {fn from(key: SecretKey) -> WSecretKey {WSecretKey(key)}}
-impl Ord for WSecretKey {fn cmp(&self, other: &Self) -> Ordering {self.secret_bytes().cmp(&other.secret_bytes())}}
-impl PartialOrd for WSecretKey {fn partial_cmp(&self, other: &Self) -> Option<Ordering> {Some(self.cmp(other))}}
-impl std::fmt::Debug for WSecretKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:.10} D> {:.10}", hex::encode(self.secret_bytes()), self.easy_public_key().to_string())
-    }
+
+//Records have a path system, more than an id system since a record can exist in two different
+//paths and will be expected to be interacted with a different signature based on the path from
+//root
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Permission(Actor, Action);
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Children(Vec<Name>, Vec<Id>);
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Actor {
+    Author(usize),
+    Anyone(usize),
+    Group(usize, String),
+    Name(Name),
+    All(Vec<Actor>),
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialOrd, Ord)]
-pub enum Key {Secret(WSecretKey), Public(PublicKey)}
-impl Hash for Key {fn hash<H: Hasher>(&self, state: &mut H) {self.public().hash(state);}}
-impl PartialEq for Key {fn eq(&self, other: &Self) -> bool {self.public() == other.public()}}
-impl Eq for Key {}
-impl Key {
-    pub fn public(&self) -> PublicKey {match self {
-        Key::Secret(key) => key.easy_public_key(),
-        Key::Public(key) => *key
-    }}
-    pub fn secret(&self) -> Option<WSecretKey> {match self {
-        Key::Secret(key) => Some(*key),
-        Key::Public(_) => None 
-    }}
-    pub fn set(self, secret: bool) -> Result<Self, ValidationError> {Ok(match secret {
-        true => Key::Secret(self.secret().ok_or(ValidationError::MissingPerms("Secret".to_string()))?),
-        false => self.to_public()
-    })}
-    pub fn max(self, other: Self) -> Result<Self, ValidationError> {
-        match self != other {
-            true => Err(ValidationError::DifferentKeys("?".to_string())),
-            false => Ok(match &self {
-                Key::Secret(_) => self,
-                Key::Public(_) => match other {
-                    Key::Secret(_) => other,
-                    Key::Public(_) => self
-                }
-            })
-        }
-    }
-    pub fn to_public(self) -> Self {Key::Public(self.public())}
-}
-
-pub type RecordPath = Vec<Id>;
-pub trait RecordPathExt {
-    fn parent(&self) -> Option<Self> where Self: Sized;
-    fn last(&self) -> Id;
-    fn join(&self, id: Id) -> Self where Self: Sized;
-    fn to_string(&self) -> String;
-}
-impl RecordPathExt for RecordPath {
-    fn parent(&self) -> Option<Self> {
-        self.split_last().map(|t| t.1.to_vec())
-    }
-    fn last(&self) -> Id {<[Id]>::last(self).copied().unwrap_or(Id::MIN)}
-    fn join(&self, id: Id) -> Self {[self.clone(), vec![id]].concat()}
-
-    fn to_string(&self) -> String {
-        format!("/{}", self.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("/"))
-    }
-}
-
-//  #[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
-//  #[derive(serde_with::SerializeDisplay)]
-//  #[derive(serde_with::DeserializeFromStr)]
-//  pub struct RecordPath(Vec<Id>);
-//  impl RecordPath {
-//      pub fn root() -> Self {RecordPath(vec![])}
-//      pub fn parent(&self) -> Option<Self> {
-//          self.0.split_last().map(|t| RecordPath(t.1.to_vec()))
-//      }
-//      pub fn last(&self) -> Id {self.0.last().copied().unwrap_or(Id::MIN)}
-//      pub fn is_root(&self) -> bool {self.0.is_empty()}
-//      pub fn join(&self, id: Id) -> Self {RecordPath([self.0.clone(), vec![id]].concat())}
-//  }
-//  impl Deref for RecordPath {type Target = Vec<Id>;fn deref(&self) -> &Self::Target {&self.0}}
-//  impl std::fmt::Display for RecordPath {
-//      fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-//          write!(f, "/{}", self.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("/"))
-//      }
-//  }
-//  impl std::str::FromStr for RecordPath {
-//      type Err = hex::FromHexError;
-//      fn from_str(s: &str) -> Result<Self, Self::Err> {
-//          Ok(RecordPath(s.split("/").collect::<Vec<_>>().into_iter().flat_map(|id|
-//              (!id.is_empty()).then(|| Id::from_str(id))
-//          ).collect::<Result<Vec<Id>, hex::FromHexError>>()?))
-//      }
-//  }
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Action {Create, Update, Delete, Read}
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct PathedKey(RecordPath, SecretKey);
-impl AsRef<SecretKey> for PathedKey {fn as_ref(&self) -> &SecretKey {&self.1}}
-impl PathedKey {
-    pub fn new(path: RecordPath, key: SecretKey) -> Self {PathedKey(path, key)}
-    pub fn path(&self) -> &RecordPath {&self.0}
-    fn derive(&self, path: &RecordPath) -> Result<Self, ValidationError> {
-        match path.to_string().strip_prefix(&self.0.to_string()) {
-            Some(stripped) => Ok(PathedKey(path.clone(), self.1.easy_derive(&stripped.bytes().map(|b| b as u32).collect::<Vec<_>>()).unwrap())),
-            None => Err(ValidationError::MissingPerms(path.to_string()))
+pub struct Protocol(PathBuf, Id, String, Children, Vec<Permission>, BTreeMap<String, Vec<Name>>);
+impl Protocol {
+    pub fn id(&self) -> Id {self.1}
+    pub fn name(&self) -> &str {&self.2}
+    pub fn new(name: &str, children: Children, permissions: Vec<Permission>, groups: BTreeMap<String, Vec<Name>>) -> Self {
+        let name = name.to_string();
+        let id = Id::hash(&(&name, &children, &permissions, &groups));
+        Protocol(PathBuf::from(id.to_string()), id, name, children, permissions, groups)
+    }
+
+    pub fn root(servers: Vec<Name>) -> Self {
+        Protocol::new("root", Children(servers.clone(), vec![]), vec![
+            Permission(Actor::Anyone(0), Action::Create),
+            Permission(Actor::Author(0), Action::Read),//Author auto attest to the content
+            Permission(Actor::Author(0), Action::Update),
+            Permission(Actor::Author(0), Action::Delete),
+        ], BTreeMap::default())
+    }
+
+    fn protocol_folder(servers: Vec<Name>, protocol_id: Id) -> Self {
+        Protocol::new("protocol_folder", Children(servers, vec![protocol_id]), vec![
+            Permission(Actor::Author(1), Action::Create),
+            Permission(Actor::Author(0), Action::Read),//Author auto attest to the content
+            Permission(Actor::Author(0), Action::Update),
+            Permission(Actor::Author(0), Action::Delete),
+        ], BTreeMap::default())
+    }
+}
+impl Hash for Protocol {fn hash<H: Hasher>(&self, state: &mut H) {
+    self.2.hash(state); self.3.hash(state); self.4.hash(state); self.5.hash(state);
+}}
+impl std::fmt::Display for Protocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {write!(f, "{}", self.1)}
+}
+impl AsRef<Path> for Protocol {fn as_ref(&self) -> &Path {&self.0}}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Record {//Header
+    name: String,
+    author: Name,
+    protocol: Protocol,
+    payload_file: Option<Pointer, Option<Vec<(Name, Vec<u8>)>>>,
+    //If this record has a payload here is the pointer, If the pointer is public because reads are
+    //restricted to not anyone then an optional list of encrypted keys for the payload which should
+    //match the pointers public key are provided, No guarentees that the encrypted payloads are not
+    //garbage assuming they are all 64+64 in length (+16 for auth tag?)
+}
+
+impl Record {
+    pub fn root(author: Name, servers: Vec<Name>) -> Self {
+        Record{
+            name: String::new(),
+            author,
+            protocol: Protocol::root(servers),
+            payload_file: None
         }
     }
-    fn index(&self, index: u32) -> Result<SecretKey, Error> {
-        Ok(self.1.easy_derive(&[u8::MAX as u32 + index])?)
+
+  //pub fn protocol_folder(author: Name, servers: Vec<Name>, protocol_id: Id) -> Self {
+  //    Record{
+  //        name: protocol_id.to_string(),
+  //        author,
+  //        protocol: Protocol::protocol_folder(servers, protocol_id),
+  //        payload_file: None
+  //    }
+  //}
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct RecordTree {
+    file: Id,
+    record: Record,
+    children: (usize, BTreeMap<String, RecordTree>),//(latest_index, children)
+}
+
+impl RecordTree {
+    pub fn get<P: AsRef<Path>>(&self, path: P) -> Option<&RecordTree> {
+        if path.as_ref() == PathBuf::new() {Some(self)} else {
+            self.children.1.get(
+                path.as_ref().components().next().unwrap().as_os_str().to_string_lossy().as_ref()
+            ).and_then(|node| node.get(path))
+        }
+    }
+
+    pub fn get_mut<P: AsRef<Path>>(&mut self, path: P) -> Option<&mut RecordTree> {
+        if path.as_ref() == PathBuf::new() {Some(self)} else {
+            self.children.1.get_mut(
+                path.as_ref().components().next().unwrap().as_os_str().to_string_lossy().as_ref()
+            ).and_then(|node| node.get_mut(path))
+        }
     }
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug, Default, Hash)]
-pub struct Permissions {
-    pub children: Option<(bool, bool)>,
-    pub delete: Option<bool>,
-    pub keys: BTreeMap<String, bool>,
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+pub struct RecordCache(Option<(PathBuf, RecordTree)>);//last item in pathBuf matches Record Tree Record Name
+impl RecordCache {
+    pub fn is_empty(&self) -> bool {self.0.is_none()}
+    pub fn new(path: PathBuf, file: Id, record: Record) -> Self {
+        RecordCache(Some((path, RecordTree{file, record, children: (0, BTreeMap::new())}))) 
+    }
+    pub fn get<P: AsRef<Path>>(&self, path: P) -> Option<&RecordTree> {
+        self.0.as_ref().and_then(|(prefix, node)|
+            path.as_ref().strip_prefix(prefix).ok().and_then(|path| node.get(path))
+        )
+    }
+
+    pub fn get_mut<P: AsRef<Path>>(&mut self, path: P) -> Option<&mut RecordTree> {
+        self.0.as_mut().and_then(|(prefix, node)|
+            path.as_ref().strip_prefix(prefix).ok().and_then(|path| node.get_mut(path))
+        )
+    }
 }
-impl Permissions {
-    pub const fn new(children: Option<(bool, bool)>, delete: Option<bool>, keys: BTreeMap<String, bool>) -> Self {
-        Permissions{children, delete, keys}
+
+//In order to know the current status of any record we need to read the current state of the parent
+//channel
+
+///For Discovering/Reading the current state of all this records children
+pub struct DiscoverRecordChildren(PathBuf);
+impl Command<Request> for DiscoverRecordChildren {
+    type Output = Result<(), Error>;
+    async fn run(self, mut ctx: Context) -> Self::Output {
+        let mut state = ctx.store().await;
+        let cache = state.get::<RecordCache>().unwrap();
+        let parent = cache.get(&self.0).ok_or(Error::MissingRecord(self.0.clone()))?;
+        let parent_file = parent.file;
+        let mut latest_index = parent.children.0;
+        drop(state);
+        while let Some(file) = ctx.run(DiscoverFile(parent_file, latest_index)).await? {
+            if let Some(file) = file.and_then(|file| file.deserialize_payload::<Signed<FileAction>>().ok()) {
+                let mut state = ctx.store().await;
+                let resolver = state.get_mut_or_default::<Resolver>();
+                let signer = file.payload.signer();
+                if let Ok(file) = file.payload.verify(
+                    resolver, None, Some(&file.timestamp), Some(&consensus::path_to_ids(&self.0))
+                ).await {
+                    panic!("valid record file found: {:?}", file);
+                }
+              //let mut cache = store.get_mut::<RecordCache>().unwrap();
+              //let mut parent = cache.get_mut(&self.0).unwrap();
+              //parent.children.1.get(
+
+            }
+            latest_index += 1;
+        }
+        let mut cache = ctx.get_mut::<RecordCache>().await.unwrap();
+        let mut parent = cache.get_mut(&self.0).unwrap();
+        parent.children.0 = latest_index;
+        
+        //Start from the child index and read new files untill end
+        //
+        //Process files validate and update RecordTree Info
+        Ok(())
     }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct KeySet {
-    pub discover: WSecretKey,//Always parent childern.0/index
-    pub read: WSecretKey,//Always parent children.1/index
-    pub children: Option<(Key, Key)>,
-    pub delete: Option<Key>,
-    pub others: BTreeMap<String, Key>
-}
-impl KeySet {
-    pub fn max(mut self, other: Self) -> Result<Self, ValidationError> {
-        let mut others = other.others.into_iter().map(|(n, k)|
-            Ok((n.clone(), self.others.remove(&n).map(|k2| k.max(k2)).transpose()?.unwrap_or(k)))
-        ).collect::<Result<BTreeMap<_, _>, ValidationError>>()?;
-        others.extend(self.others);
-        Ok(KeySet{
-            discover: self.discover,
-            read: self.read,
-            delete: self.delete.map(|d| other.delete.map(|d2| d.max(d2)).unwrap_or(Ok(d))).transpose()?.or(other.delete),
-            children: self.children.map(|(d, r)| other.children.map(|(d2, r2)| Ok((d.max(d2)?, r.max(r2)?))).unwrap_or(Ok((d, r)))).transpose()?.or(other.children),
-            others
-        })
-    }
-
-    pub fn set(self, perms: &Permissions) -> Result<Self, ValidationError> {
-        Ok(KeySet{
-            discover: self.discover,
-            read: self.read,
-            delete: match (self.delete, perms.delete) {
-                (Some(d), Some(p)) => Some(d.set(p)?),
-                (None, None) => None,
-                _ => {return Err(ValidationError::ActionMismatch("Delete".to_string()));}
-            },
-            children: perms.children.map(|pc| {
-                let children = self.children.ok_or(ValidationError::ActionMismatch("Children".to_string()))?;
-                Ok((children.0.set(pc.0)?, children.1.set(pc.1)?))
-            }).transpose()?,
-            others: self.others.into_iter().map(|(n, k)| Ok((n.clone(), perms.keys.get(&n).map(|s| k.set(*s)).transpose()?.unwrap_or(k)))).collect::<Result<BTreeMap<_,_>, ValidationError>>()?
-        })
-    }
+enum FileAction {
+    Create(Record),
+    Update(Record, bool),//Name, Payload, Keep Children
+    Delete(String)
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug, Default, Hash)]
-pub struct Children {
-    pub allowed_protocols: Vec<Id>,
-    /// Can anyone with access to this protocol discover all children?
-    pub anyone_discover: bool,
-    /// Can anyone with access to this protocol read all children?
-    pub anyone_read: bool,
-    /// Can anyone with access to this protocol create pointers to children?
-    pub allow_pointers: bool,
-}
-impl Children {
-    pub const fn new(allowed_protocols: Vec<Id>, anyone_discover: bool, anyone_read: bool, allow_pointers: bool) -> Self {
-        Children{allowed_protocols, anyone_discover, anyone_read, allow_pointers}
-    }
-}
- 
-#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug, Default, Hash)]
-pub struct Protocol {
-    pub name: String, 
-    pub children: Option<Children>,
-    ///Some if delete is possible, true if delete must be secret
-    pub delete: Option<(KeyGen, bool)>,
-    ///Additional Keys, true if it must be secret
-    pub others: BTreeMap<String, (KeyGen, bool)>,
-    ///Allow extra keys not listed above
-    pub allow_extra_keys: bool
-}
-impl Protocol {
-    pub fn new(name: &str, children: Option<Children>, delete: Option<(KeyGen, bool)>, others: BTreeMap<String, (KeyGen, bool)>, allow_extra_keys: bool) -> Self {
-        Protocol{name: name.to_string(), children, delete, others, allow_extra_keys}
-    }
-    pub fn id(&self) -> Id {Id::hash(&self)}
-    fn validate(&self, keyset: &KeySet) -> Result<(), ValidationError> {
-        if self.children.is_some() != self.children.is_some() {return Err(ValidationError::ActionMismatch("Children".to_string()));}
-        self.children.as_ref().map(|cv| {
-            let children = keyset.children.ok_or(ValidationError::ActionMismatch("Children".to_string()))?;
-            if cv.anyone_discover && children.0.secret().is_none() {return Err(ValidationError::ActionMismatch("DiscoverChild".to_string()));}
-            if cv.anyone_read && children.1.secret().is_none() {return Err(ValidationError::ActionMismatch("ReadChild".to_string()));}
-            Ok(())
-        }).transpose()?;
-        self.delete.as_ref().map(|(_, d)| {
-            let key_delete = keyset.delete.ok_or(ValidationError::ActionMismatch("Delete".to_string()))?;
-            if *d && key_delete.secret().is_none() {return Err(ValidationError::MissingPerms("Delete".to_string()));}
-            Ok(())
-        }).transpose()?;
-        if !self.allow_extra_keys && (keyset.others.keys().collect::<Vec<_>>() != self.others.keys().collect::<Vec<_>>()) {
-            return Err(ValidationError::ActionMismatch("Extra Keys".to_string()));
-        }
-        for (n, (_, secret)) in &self.others {
-            let ok = keyset.others.get(n).ok_or(ValidationError::ActionMismatch(format!("Missing Key {n}")))?;
-            if *secret && ok.secret().is_none() {return Err(ValidationError::MissingPerms(n.to_string()));}                
-        }
-        Ok(())
-    }
-    fn is_child(&self, id: &Id) -> bool {
-        self.children.as_ref().map(|c|
-            c.allowed_protocols.contains(id) || 
-            c.allowed_protocols.is_empty() ||
-            (c.allow_pointers && *id == Pointer::id())
-        ).unwrap_or_default()
-    }
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum RecordAction {
+    Create(PathBuf, Protocol, Option<Vec<u8>>),
+    Update(PathBuf, Protocol, Option<Vec<u8>>, bool),
+    Delete(PathBuf)
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug, Hash)]
-pub struct Header(KeySet, Protocol, Vec<u8>);
-impl Header {
-    pub fn keys(&self) -> &KeySet {&self.0}
-    pub fn protocol_id(&self) -> Id {self.1.id()}
-    pub fn id(&self) -> Id {Id::hash(&self)}
-    pub fn data(&self) -> &[u8] {&self.2}
+///For Create/Update/Delete Child Actions on the Parent
 
-    fn validate(&self) -> Result<(), ValidationError> {self.1.validate(&self.0)}
-    fn validate_child(&self, child: &Self) -> Result<(), ValidationError> {
-        if self.1.is_child(&child.1.id()) {return Ok(());}
-        Err(ValidationError::InvalidProtocol(child.1.id()))
-    }
-
-    pub fn max(self, other: Self) -> Result<Self, ValidationError> {
-        Ok(Header(self.0.max(other.0)?, self.1, self.2)) 
-    }
-
-    fn set(mut self, perms: &Permissions) -> Result<Self, ValidationError> {
-        self.0 = self.0.set(perms)?;
-        self.validate()?;
-        Ok(self)
-    }
-
-    fn de_enc(header: Vec<u8>, read: SecretKey) -> Result<Header, ValidationError> {
-        let header: Header = serde_json::from_slice(
-            &read.easy_decrypt(&header).map_err(|e| ValidationError::Decryption(e.to_string()))?
-        ).map_err(|e| ValidationError::Deserialization(e.to_string()))?;
-        if *header.0.read != read {return Err(ValidationError::DifferentKeys("Read".to_string()));}
-        header.validate()?;
-        Ok(header)
-    }
-
-    fn derive(cache: &Cache, parent: &RecordPath, protocol: Protocol, header_data: Vec<u8>, index: u32) -> Result<Header, Error> {
-        let protocol_id = protocol.id();
-        let mkey = cache.get_root().derive(parent)?.index(index)?;
-        let discover_child = mkey.easy_derive(&[0])?;
-        let read_child = mkey.easy_derive(&[1])?;
-        let record_key = mkey.easy_derive(&[2])?;
-        let delete = protocol.delete.as_ref().map(|(d, _)| d.get(&record_key)).transpose()?;
-        let others = protocol.others.iter().map(|(n, (k, _))| Ok((n.to_string(), k.get(&record_key)?))).collect::<Result<BTreeMap<String, Key>, secp256k1::Error>>()?;
-        let parent_h = cache.get(parent).ok_or(ValidationError::MissingRecord(parent.to_string()))?;
-        if !parent_h.1.is_child(&protocol_id) {return Err(ValidationError::InvalidProtocol(protocol_id).into());}
-        let children = parent_h.0.children.ok_or(ValidationError::InvalidParent(parent.to_string()))?;
-        let discover = children.0.secret().ok_or(ValidationError::MissingPerms("DiscoverChild".to_string()))?.easy_derive(&[index])?;
-        let read = children.1.secret().ok_or(ValidationError::MissingPerms("ReadChild".to_string()))?.easy_derive(&[index])?;
-        let header = Header(
-            KeySet{
-                discover: WSecretKey(discover),
-                read: WSecretKey(read),
-                children: protocol.children.as_ref().map(|_| (
-                    Key::Secret(discover_child.into()),
-                    Key::Secret(read_child.into())
-                )),
-                delete,
-                others,
-            },
-            protocol,
-            header_data
-        );
-        header.validate()?;
-        Ok(header)
-    }
-
-    fn root(root: &PathedKey) -> Result<Header, Error> {
-        Ok(Header(
-            KeySet {
-                discover: root.as_ref().easy_derive(&[2])?.into(),
-                read: root.as_ref().easy_derive(&[3])?.into(),
-                children: Some((
-                    Key::Secret(root.as_ref().easy_derive(&[0])?.into()),
-                    Key::Secret(root.as_ref().easy_derive(&[1])?.into())
-                )),
-                delete: None,
-                others: BTreeMap::default()
-            }, 
-            Protocol::new("ROOT", Some(Children::new(vec![], true, true, true)), None, BTreeMap::default(), false),
-            vec![]
-        ))
-    }
-}
-
-#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug, Hash)]
-pub struct Record {
-    pub header: Header,
-    pub payload: Vec<u8>
-}
-impl Record {
-    fn from_item(item: PrivateItem, read: SecretKey) -> Result<Record, ValidationError> {
-        let record: Record = serde_json::from_slice(
-            &read.easy_decrypt(&item.payload).map_err(|e| ValidationError::Decryption(e.to_string()))?
-        ).map_err(|e| ValidationError::Deserialization(e.to_string()))?;
-        if record.header.0.discover.easy_public_key() != item.discover {return Err(ValidationError::DifferentKeys("Discover".to_string()));}
-        if *record.header.0.read != read {return Err(ValidationError::DifferentKeys("Read".to_string()));}
-        if record.header.0.delete.map(|d| d.public()) != item.delete {return Err(ValidationError::DifferentKeys("ItemDelete".to_string()));}
-        record.header.validate()?;
-        Ok(record)
-    }
-}
-
-pub type Keys = BTreeMap<String, KeyGen>;
-
-#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug, Hash)]
-pub enum KeyGen {
-    Static(Key),
-    Derive(u32),
-}
-impl KeyGen {
-    fn get(&self, key: &SecretKey) -> Result<Key, secp256k1::Error> {
-        Ok(match self {
-            KeyGen::Static(key) => *key,
-            KeyGen::Derive(i) => Key::Secret(key.easy_derive(&[*i])?.into())
-        })
-    }
-}
-
-#[derive(Clone, Debug)]
-struct Pointer;
-impl Pointer {
-    fn get_protocol() -> Protocol {Protocol::new(
-        "Pointer", None, None, BTreeMap::new(), false
-    )}
-    fn id() -> Id {Self::get_protocol().id()}
-}
-
-//TODO: Split the records between the cryptograhy and primitive types and the requests
-
-
-//TODO: The cache will be a simple trait so that the ActiveRecords can be implemented on the
-//version used by the command compilers
-
-#[derive(ActiveRecord, Serialize, Deserialize, Clone)]
-pub struct Cache(
-    PathedKey,
-    #[active_record(child)]
-    BTreeMap<Id, Stateless<A<Header>>>,
-);
-
-//ROOT is imaginary and so if the pathed key points to a protocol folder creating records
-//under root that really fall under a protocol folder won't cause issues unless someone with the
-//protocol folder attempts to discover the children which don't conform to the parent.
-//
-//Only use not Root keys after establishing trust that they will only use this to store valid data
-//Or else the data will be lost to anyone with higher permission
-impl Cache {
-    pub fn new(root: PathedKey) -> Self {
-        let header = Header::root(&root).unwrap();
-        let header_id = Id::MIN;
-        Cache(root, BTreeMap::from([(header_id, Stateless(A(header)))]))
-    }
-
-    fn get(&self, path: &RecordPath) -> Option<&Header> {
-        self.1.get(&path.last()).map(|h| &***h)
-    }
-
-    fn cache(&mut self, header: Header) {
-        match self.1.get_mut(&header.id()) {
-            Some(h) => {
-                ***h = Header::clone(h).max(header).unwrap();
-            },
-            None => {self.1.insert(header.id(), Stateless(A(header)));}
-        }
-    }
-
-    fn get_root(&self) -> &PathedKey {&self.0}
-}
-impl std::fmt::Debug for Cache {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_map().entries(self.1.iter().map(|(id, h)| (id.to_string(), format!("{h:?}")))).finish()
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct Discover{parent: RecordPath, index: u32, endpoint: Endpoint}
-impl Discover {
-    pub fn new(parent: &RecordPath, index: u32, endpoint: Endpoint) -> Self {
-        Discover{parent: parent.clone(), index, endpoint}
-    }
-}
-impl Command for Discover {
-    type Output = Result<Option<(DateTime, Option<RecordPath>)>, Error>;
-
-    async fn run(self, mut ctx: Context) -> Self::Output {
-        let parent_header = ctx.try_get_mut::<Cache>().await.ok_or(Error::MissingCache)?
-            .get(&self.parent).ok_or(ValidationError::MissingRecord(self.parent.to_string()))?
-            .clone();
-        let children = parent_header.0.children.and_then(|(d, r)| d.secret().map(|d| (d, r))).ok_or(ValidationError::InvalidParent(self.parent.to_string()))?;
-        let discover = children.0.easy_derive(&[self.index])?;
-        let read = children.1.secret().map(|r| r.easy_derive(&[self.index]).unwrap());
-        let request = ctx.run(super::requests::ReadPrivateHeader::new(&discover, self.endpoint)).await?;
-        let mut cache = ctx.try_get_mut::<Cache>().await.ok_or(Error::MissingCache)?;
-        Ok(match (read, request) {
-            (_, None) => None,
-            (None, Some((date, _))) | (_, Some((date, None))) => Some((date, None)),
-            (Some(read), Some((date, Some(header)))) => Some((date, Header::de_enc(header, read).ok().and_then(|header| {
-                parent_header.validate_child(&header).ok()?;
-                let header = if header.protocol_id() == Pointer::id() {
-                    serde_json::from_slice::<Header>(&header.2).ok().and_then(|h| 
-                        parent_header.validate_child(&h).is_ok().then_some(h)
-                    ).filter(|h| h.protocol_id() != Pointer::id())?
-                } else {
-                    let protocol = &header.1;
-                    let my_header = Header::derive(&cache, &self.parent, protocol.clone(), header.2.clone(), self.index).ok()?;
-                    if my_header.id() == header.id() {my_header} else {header}
-                };
-
-                let id = header.id();
-                cache.cache(header);
-                Some(self.parent.join(id))
-            })))
-        })
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct Create{
-    parent: RecordPath,
-    protocol: Protocol,
-    header_data: Vec<u8>,
-    index: u32,
-    perms: Permissions,
-    payload: Vec<u8>,
-    endpoint: Endpoint
-}
-impl Create {
-    pub fn new(parent: RecordPath, protocol: Protocol, header_data: Vec<u8>, index: u32, perms: Permissions, payload: Vec<u8>, endpoint: Endpoint) -> Self {
-        Create{parent, protocol, header_data, index, perms, payload, endpoint}
-    }
-}
-impl Command for Create {
-    type Output = Result<(RecordPath, Option<DateTime>), Error>;
-
-    async fn run(self, mut ctx: Context) -> Self::Output {
-        let o_header = Header::derive(
-            &*ctx.try_get_mut::<Cache>().await.ok_or(Error::MissingCache)?,
-            &self.parent, self.protocol, self.header_data, self.index
-        )?;
-        let header = o_header.clone().set(&self.perms)?;
-        let record = Record{header, payload: self.payload};
-        let discover = &record.header.0.discover;
-        let delete = record.header.0.delete.map(|d| d.public());
-        let payload = record.header.0.read.easy_public_key().easy_encrypt(serde_json::to_vec(&record)?)?;
-        let enc_header = record.header.0.read.easy_public_key().easy_encrypt(serde_json::to_vec(&record.header)?)?;
-        let path = self.parent.join(record.header.id());
-        let date = ctx.run(super::requests::CreatePrivate::new(discover, delete, enc_header, payload, self.endpoint)).await?;
-        ctx.try_get_mut::<Cache>().await.ok_or(Error::MissingCache)?.cache(o_header);
-        Ok((path.clone(), date))
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct Read{
-    path: RecordPath,
-    endpoint: Endpoint
-}
-impl Read {
-    pub fn new(path: RecordPath, endpoint: Endpoint) -> Self {
-        Read{path, endpoint}
-    }
-}
-impl Command for Read {
-    type Output = Result<Option<(DateTime, Option<Record>)>, Error>;
-
-    async fn run(self, mut ctx: Context) -> Self::Output {
-        let header = ctx.try_get_mut::<Cache>().await.ok_or(Error::MissingCache)?
-            .get(&self.path).ok_or(ValidationError::MissingRecord(self.path.to_string()))?.clone();
-        Ok(ctx.run(super::requests::ReadPrivate::new(&header.0.discover, self.endpoint)).await?.map(|(date, item)|
-            (date, item.and_then(|item| Record::from_item(item, *header.0.read).ok()).filter(|r| r.header == header))
-        ))
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct Delete{
-    path: RecordPath,
-    endpoint: Endpoint
-}
-impl Delete {
-    pub fn new(path: RecordPath, endpoint: Endpoint) -> Self {
-        Delete{path, endpoint}
-    }
-}
-impl Command for Delete {
-    type Output = Result<bool, Error>;
-
-    async fn run(self, mut ctx: Context) -> Self::Output {
-        let header = ctx.try_get_mut::<Cache>().await.ok_or(Error::MissingCache)?
-            .get(&self.path).ok_or(ValidationError::MissingRecord(self.path.to_string()))?.clone();
-        let discover = header.0.discover.easy_public_key();
-        let delete = header.0.delete.and_then(|d| d.secret()).ok_or(ValidationError::MissingPerms("Delete".to_string()))?;
-        Ok(ctx.run(super::requests::DeletePrivate::new(discover, &delete, self.endpoint)).await?.is_none())
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct Share{
-    secret: OrangeSecret,
-    recipient: OrangeName,
-    perms: Permissions,
-    path: RecordPath,
-    endpoint: Endpoint
-}
-impl Share {
-    pub fn new(secret: OrangeSecret, recipient: OrangeName, perms: Permissions, path: RecordPath, endpoint: Endpoint) -> Self {
-        Share{secret, recipient, perms, path, endpoint}
-    }
-}
-impl Command for Share {
+pub struct CreateChild(pub RecordAction);
+impl Command<Request> for CreateChild {
     type Output = Result<(), Error>;
-
     async fn run(self, mut ctx: Context) -> Self::Output {
-        let header = ctx.try_get_mut::<Cache>().await.ok_or(Error::MissingCache)?
-            .get(&self.path).ok_or(ValidationError::MissingRecord(self.path.to_string()))?
-            .0.clone().set(&self.perms)?;
-        Ok(ctx.run(super::requests::CreateDM::new(self.secret, self.recipient, serde_json::to_vec(&header)?, self.endpoint)).await?)
-    }
-}
+        match self.0 {
+            RecordAction::Create(mut path, protocol, payload) => {
+                let mut state = ctx.store().await;
+                let secret = state.get::<Secret>().unwrap();
+                let record_name = path.file_name()
+                    .ok_or(Error::InvalidPath(path.clone()))?
+                    .to_string_lossy().to_string();
+                let ids = consensus::path_to_ids(path);
+                path.pop();
+                let parent_path = path;
+                let mut cache = state.get_mut::<RecordCache>().unwrap();
+                let mut parent = cache.get_mut(&parent_path)
+                    .ok_or(Error::MissingRecord(parent_path.clone()))?;
+                let channel = secret.get_hardend(None, &ids)?.derive(&["records", "payload"]);
+              //if let Some(payload) = payload {
+              //    let file = File{
+              //        //derived from secret in a predictable way /path/hardend/records/payload
+              //        key: secret.derive(path),
+              //    }
+              //}
+              //let record = Record{
+              //    name: record_name,
+              //    author: secret.name(),
+              //    protocol,
+              //    payload: Some(pointer)
+              //};
+                todo!()
 
-#[derive(Serialize, Deserialize)]
-pub struct Receive{
-    secret: OrangeSecret,
-    since: DateTime,
-    endpoint: Endpoint
-}
-impl Receive {
-    pub fn new(secret: OrangeSecret, since: DateTime, endpoint: Endpoint) -> Self {
-        Receive{secret, since, endpoint}
-    }
-}
-impl Command for Receive {
-    type Output = Result<Vec<(OrangeName, RecordPath)>, Error>;
-
-    async fn run(self, mut ctx: Context) -> Self::Output {
-        let sent = ctx.run(super::requests::ReadDM::new(self.secret, self.since, self.endpoint)).await?;
-        let mut cache = ctx.try_get_mut::<Cache>().await.ok_or(Error::MissingCache)?;
-        Ok(sent.into_iter().flat_map(|(s, p)| {
-            let header = serde_json::from_slice::<Header>(&p).ok()?;
-            header.validate().ok()?;
-            let id = Id::hash(&header);
-            let parent = vec![Pointer::id()];
-            let path = parent.join(id);
-            cache.cache(header);
-            Some((s, path))
-        }).collect())//TODO: Include who sent the record /fff/bob
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct CreatePointer{
-    parent: RecordPath,
-    record: RecordPath,
-    index: u32,
-    perms: Permissions,
-    endpoint: Endpoint
-}
-impl CreatePointer {
-    pub fn new(parent: RecordPath, record: RecordPath, index: u32, perms: Permissions, endpoint: Endpoint) -> Self {
-        CreatePointer{parent, record, index, perms, endpoint}
-    }
-}
-impl Command for CreatePointer {
-    type Output = Result<(RecordPath, Option<DateTime>), Error>;
-
-    async fn run(self, mut ctx: Context) -> Self::Output {
-        let cache = ctx.try_get_mut::<Cache>().await.ok_or(Error::MissingCache)?;
-        let record_header = cache 
-            .get(&self.record).ok_or(ValidationError::MissingRecord(self.record.to_string()))?.clone();
-        let o_header = Header::derive(
-            &cache, &self.parent, Pointer::get_protocol(), serde_json::to_vec(&record_header)?, self.index
-        )?;
-        drop(cache);
-
-        let header = o_header.clone().set(&self.perms)?;
-        let record = Record{header, payload: vec![]};
-        let discover = &record.header.0.discover;
-        let delete = record.header.0.delete.map(|d| d.public());
-        let payload = record.header.0.read.easy_public_key().easy_encrypt(serde_json::to_vec(&record)?)?;
-        let enc_header = record.header.0.read.easy_public_key().easy_encrypt(serde_json::to_vec(&record.header)?)?;
-        let path = self.parent.join(record.header.id());
-        let date = ctx.run(super::requests::CreatePrivate::new(discover, delete, enc_header, payload, self.endpoint)).await?;
-        ctx.try_get_mut::<Cache>().await.ok_or(Error::MissingCache)?.cache(o_header);
-        Ok((path.clone(), date))
+            },
+            _ => todo!()
+        }
     }
 }
 
 
-//      pub fn create_pointer(cache: &mut Cache, parent: &RecordPath, record: &RecordPath, index: u32) -> Result<Self, Error> {
-//          let record_header = cache.get(record).ok_or(ValidationError::MissingRecord(record.to_string()))?.clone();
-//          let header = Header::derive(cache, parent, Pointer::get_protocol(), serde_json::to_vec(&record_header)?, index)?;
-//          let record = Record{header: header.clone(), payload: vec![]};
-//          let discover = &record.header.0.discover;
-//          let delete = record.header.0.delete.map(|d| d.public());
-//          let payload = record.header.0.read.easy_public_key().easy_encrypt(serde_json::to_vec(&record)?)?;
-//          let enc_header = record.header.0.read.easy_public_key().easy_encrypt(serde_json::to_vec(&record.header)?)?;
-//          Ok(Client(super::Client::create_private(discover, delete, enc_header, payload), MidState::Create(parent.join(Id::hash(&header)), record_header)))
-//      }
 
-
-//  #[derive(Debug)]
-//  enum MidState {
-//      Discover(Option<SecretKey>, Header, RecordPath, u32),
-//      Create(RecordPath, Header),
-//      Read(SecretKey, Id),
-//      Delete,
-//      Share,
-//      Receive,
-//  }
-
-//  #[allow(clippy::large_enum_variant)]
-//  #[derive(PartialEq)]
-//  pub enum Processed {
-//      Discover(Option<(DateTime, Option<RecordPath>)>),
-//      Create(RecordPath, Option<DateTime>),
-//      Read(Option<(DateTime, Option<Record>)>),
-//      Delete(bool),
-//      Receive(),
-//      Empty
-//  }
-
-//  pub struct Client(super::Client, MidState);
-//  impl Client {
-//      pub fn discover(cache: &mut Cache, parent: &RecordPath, index: u32) -> Result<Self, Error> { 
-//          let header = cache.get(parent).ok_or(ValidationError::MissingRecord(parent.to_string()))?;
-//          let children = header.0.children.and_then(|(d, r)| d.secret().map(|d| (d, r))).ok_or(ValidationError::InvalidParent(parent.to_string()))?;
-//          let discover = children.0.easy_derive(&[index])?;
-//          let read = children.1.secret().map(|r| r.easy_derive(&[index]).unwrap());
-//          Ok(Client(super::Client::read_private_header(&discover), MidState::Discover(read, header.clone(), parent.clone(), index)))
-//      }
-
-//      pub fn create(cache: &mut Cache, parent: &RecordPath, protocol: Protocol, header_data: Vec<u8>, index: u32, perms: &Permissions, payload: Vec<u8>) -> Result<Self, Error> {
-//          let o_header = Header::derive(cache, parent, protocol, header_data, index)?;
-//          let header = o_header.clone().set(perms)?;
-//          let record = Record{header, payload};
-//          let discover = &record.header.0.discover;
-//          let delete = record.header.0.delete.map(|d| d.public());
-//          let payload = record.header.0.read.easy_public_key().easy_encrypt(serde_json::to_vec(&record)?)?;
-//          let enc_header = record.header.0.read.easy_public_key().easy_encrypt(serde_json::to_vec(&record.header)?)?;
-//          let path = parent.join(record.header.id());
-//          Ok(Client(super::Client::create_private(discover, delete, enc_header, payload), MidState::Create(path, o_header)))
-//      }
-
-//      pub fn read(cache: &mut Cache, path: &RecordPath) -> Result<Self, Error> {
-//          let header = cache.get(path).ok_or(ValidationError::MissingRecord(path.to_string()))?;
-//          Ok(Client(super::Client::read_private(&header.0.discover), MidState::Read(*header.0.read, Id::hash(&header))))
-//      }
-
-//      pub fn delete(cache: &mut Cache, path: &RecordPath) -> Result<Self, Error> {
-//          let header = cache.get(path).ok_or(ValidationError::MissingRecord(path.to_string()))?;
-//          let discover = header.0.discover.easy_public_key();
-//          let delete = header.0.delete.and_then(|d| d.secret()).ok_or(ValidationError::MissingPerms("Delete".to_string()))?;
-//          Ok(Client(super::Client::delete_private(discover, &delete), MidState::Delete))
-//      }
-
-//      
-
-//      pub fn build_request(&self) -> Request {self.0.build_request()}
-
-//      pub async fn process_responses(&self, cache: &mut Cache, resolver: &mut OrangeResolver, responses: Vec<Response>) -> Result<Option<Processed>, Error> {
-//          let req = (responses.len() / 2) + 1;//Divide by two round down add one
-//          let mut processed = Vec::new();
-//          for response in responses {
-//              processed.push(self.process_response(cache, resolver, response).await?);
-//          }
-
-//          let (count, winner) = processed.into_iter().fold((0, None), |mut acc, p| {
-//              if acc.0 == 0 {acc.1 = Some(p);}
-//              else if acc.1 == Some(p) {acc.0 += 1;}
-//              else {acc.0 -= 1;}
-//              acc
-//          });
-//          Ok(if count >= req {Some(winner.unwrap())} else {None})
-//      }
-
-//      pub async fn process_response(&self, cache: &mut Cache, resolver: &mut OrangeResolver, response: Response) -> Result<Processed, Error> {
-//          Ok(match (&self.1, self.0.process_response(resolver, response).await?) {
-//              (MidState::Discover(_,_,_,_), super::Processed::PrivateHeader(None)) => Processed::Discover(None),
-//              (MidState::Discover(None, _, _, _), super::Processed::PrivateHeader(Some((date, _)))) => {
-//                  Processed::Discover(Some((date, None)))
-//              },
-//              (
-//                  MidState::Discover(Some(read), parent_header, parent, index),
-//                  super::Processed::PrivateHeader(Some((date, Some(header))))
-//              ) => {
-//                  Processed::Discover(Some((date, Header::de_enc(header, *read).ok().and_then(|header| {
-//                      parent_header.validate_child(&header).ok()?;
-//                      let header = if header.protocol_id() == Pointer::id() {
-//                          serde_json::from_slice::<Header>(&header.2).ok().and_then(|h| 
-//                              parent_header.validate_child(&h).is_ok().then_some(h)
-//                          ).filter(|h| h.protocol_id() != Pointer::id())?
-//                      } else {
-//                          let protocol = &header.1;
-//                          let my_header = Header::derive(cache, parent, protocol.clone(), header.2.clone(), *index).ok()?;
-//                          if my_header.id() == header.id() {my_header} else {header}
-//                      };
-
-//                      let id = header.id();
-//                      cache.cache(header);
-//                      Some(parent.join(id))
-//                  }))))
-//              },
-//              (MidState::Create(path, o_header), super::Processed::PrivateCreate(date)) => {
-//                  cache.cache(o_header.clone());
-//                  Processed::Create(path.clone(), date)
-//              },
-//              (MidState::Read(read, id), super::Processed::PrivateItem(item)) => Processed::Read(
-//                  item.map(|(date, item)| (date, item.and_then(|item| Record::from_item(item, *read).ok()).filter(|r| Id::hash(&r.header) == *id)))
-//              ),
-//              (MidState::Delete, super::Processed::Empty) => Processed::Delete(true),
-//              (MidState::Delete, super::Processed::DeleteKey(_)) => Processed::Delete(false),
-//              (MidState::Share, super::Processed::Empty) => Processed::Empty,
-//              (MidState::Receive, super::Processed::ReadDM(sent)) => {
-//                  Processed::Receive(sent.into_iter().flat_map(|(s, p)| {
-//                      let header = serde_json::from_slice::<Header>(&p).ok()?;
-//                      header.validate().ok()?;
-//                      let id = Id::hash(&header);
-//                      let parent = RecordPath(vec![Pointer::id()]);
-//                      let path = parent.join(id);
-//                      cache.cache(header);
-//                      Some((s, path))
-//                  }).collect())//TODO: Include who sent the record /fff/bob
-//              },
-//              res => {return Err(Error::mr(res));}
-//          })
-//      }
-//  }
-
-
-//  //Records are currently Identifyable by its header Id because the header contains the keys used to
-//  //locate it on any air server and the header data is where all the tags are located
-//  //
-//  //
-//  //If I used name paths /rooma/messages/message21 could point to different records at any path level
-//  //Unless I can prove that /rooma/messages corrosponds with /abc/efg without any data but my master key
-//  //
-//  //Given my master key and /rooma/messages/message21 locate the same record no matter the state
-//  //
-//  //1. Discover every record under / until one has "rooma" in the header data will not work because
-//  //   the original can be deleted an a different record can be created at another index with the
-//  //   same name
-//  //2. Discovery order is unimportant 
-//  //
-//  //Derive a series of bytes by adding 256 to each one 
-//  //Reservig 0-255 for special characters
-//  //0 is used to deleminate pathes
-//  //
-//  //
-//  //
-//  //Map with deletes disabled is possible because you will always created your index at the next open
-//  //position and unless a previouse record claimed that index you have it
-//  //
-//  //Map with deletes enabled requires looking for VCs from the air server on any records that have
-//  //been corupted and will therefore be skipped claimed indexs are then
-//  //
-//  //
-//  //
-//  //Structures will contain the header id of its children 
-//  //Maps cannot because their children is unknown
-//  //
-//  //BTreeMap => Named Map 
-//  //BTreeSet => Unordered list
-//  //Vec => Ordered List
-//  //
-//  //When working with ordered list air server indexs are not resuable
-//  //
-//  //
-//  //Never let records without a delete key expires okay if its more expensive
-//  //
-
-
-
-
-
-
-
-
-
-
-
-
-
-//  //  pub enum CreatePrivate{
-//  //      New(RecordPath, Protocol, Vec<u8>, u32, Permissions, Vec<u8>, Vec<Endpoint>),
-//  //      Wating(RecordPath, Header)
-//  //  }
-//  //  impl CreatePrivate {
-//  //      pub fn new(
-//  //          parent: RecordPath, protocol: Protocol, header_data: Vec<u8>, index: u32, perms: Permissions, payload: Vec<u8>, endpoints: Vec<Endpoint>
-//  //      ) -> Self {
-//  //          CreatePrivate::New(parent, protocol, header_data, index, perms, payload, endpoints)
-//  //      }
-
-//  //  }
-//  //  impl MultiReqest for CreatePrivate {
-//  //      fn run(&mut self, resolver, secret, state, responses) -> {match *self {
-//  //          Self::New(parent, protocol, header_data, index, perms, payload, endpoints) => Status {
-//  //              let cache: &mut Cache = state.get_mut_or_default();
-//  //              let o_header = Header::derive(cache, parent, protocol, header_data, index)?;
-//  //              let header = o_header.clone().set(perms)?;
-//  //              let record = Record{header, payload};
-//  //              let discover = &record.header.0.discover;
-//  //              let delete = record.header.0.delete.map(|d| d.public());
-//  //              let payload = record.header.0.read.easy_public_key().easy_encrypt(serde_json::to_vec(&record)?)?;
-//  //              let enc_header = record.header.0.read.easy_public_key().easy_encrypt(serde_json::to_vec(&record.header)?)?;
-//  //              let path = parent.join(record.header.id());
-//  //              self = CreatePrivate::Waiting(path, o_header);
-//  //              Status::request(CreatePrivate::new(discover, delete, enc_header, payload, endpoints))
-//  //          },
-//  //          Self::Wating(path, o_header), Some(created) => {
-
-//  //          }
-//  //      }}
-//  //      fn responses(&mut self, responses: Vec<Vec<ChandlerResponse>>) -> {
-
-//  //      }
-//  //  }
-
-
-
+///For reading the optional payload of a record
+pub struct ReadRecord(PathBuf);

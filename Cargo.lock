@@ -5,8 +5,6 @@ version = 4
 [[package]]
 name = "active_base"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27cc026937b7b05e4d972a5f13fe59bf6e2c7d0b7d988dfa20ee4ca1f853cdf4"
 dependencies = [
  "active_proc",
  "serde",
@@ -16,8 +14,6 @@ dependencies = [
 [[package]]
 name = "active_proc"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b0688f4c60461f470e39f89810f4200d403e229622f083751218986a4633c0e"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -66,10 +62,10 @@ version = "0.2.4"
 dependencies = [
  "active_rusqlite",
  "anyanymap",
- "async_fn_traits",
  "chrono",
  "hex",
  "orange_name",
+ "request_compiler",
  "rusqlite",
  "secp256k1",
  "serde",
@@ -103,6 +99,8 @@ dependencies = [
 [[package]]
 name = "anyanymap"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a209e9192f9930912da34d0711fbcfad8a15ec5d5a3373dde1ede135fc3da9c2"
 
 [[package]]
 name = "ark-bls12-381"
@@ -234,15 +232,6 @@ name = "arrayvec"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
-
-[[package]]
-name = "async_fn_traits"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc58d489c5f2d2c5be31b9004cec7af25a70d23df4d8111715eee736234cf217"
-dependencies = [
- "paste",
-]
 
 [[package]]
 name = "autocfg"
@@ -1067,6 +1056,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "request_compiler"
+version = "0.1.1"
+dependencies = [
+ "anyanymap",
+ "tokio",
+]
+
+[[package]]
 name = "rusqlite"
 version = "0.34.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1324,6 +1321,18 @@ dependencies = [
  "mio",
  "pin-project-lite",
  "slab",
+ "tokio-macros",
+]
+
+[[package]]
+name = "tokio-macros"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e06d43f1345a3bcd39f6a56dbb7dcab2ba47e68e8ac134855e7e2bdbaf8cab8"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

@@ -22,7 +22,7 @@ pub struct PrivateEntry{
 impl From<KeySigned<PrivateItem>> for PrivateEntry {
     fn from(item: KeySigned<PrivateItem>) -> Self {
         PrivateEntry{
-            timestamp: A(now()),
+            timestamp: A(item.as_ref().datetime),
             hash: A(Id::hash(&item)),
             item: A(item),
         }
@@ -46,19 +46,44 @@ impl ServiceTrait for Service {
     async fn process(&mut self, _resolver: &mut Resolver, _secret: &Secret, request: Request) -> Response {
         let time = std::time::Instant::now();
         let read_private = matches!(request, Request::ReadPrivate(_));
-        let result = match request {
-            Request::CreatePrivate(signed) => {
+        let result = match &request {
+            Request::CreatePrivate(signed) | Request::CreateReadPrivate(signed) => {
                 match signed.verify() {
                     Err(e) => Response::InvalidSignature(e.to_string()),
                     Ok(discover) if discover != signed.as_ref().discover =>
                         Response::InvalidRequest("Discover key mismatch between Signature and Payload".to_string()),
-                    Ok(discover) => {
-                        Response::CreatePrivate(PrivateTable::read_sub::<A<DateTime>>(
-                            &self.0, &[&discover.to_string(), "timestamp"]
-                        ).unwrap().map(|d| d.0).or_else(|| {
-                            PrivateTable::create_sub(&self.0, &[&discover.to_string()], &PrivateEntry::from(signed)).unwrap();
-                            None
-                        }))
+                    Ok(_) if (now() - signed.as_ref().datetime).num_minutes().abs() > 1 => 
+                        Response::InvalidRequest("Datetime for PrivateItem is not within the minute".to_string()),
+                    Ok(discover) => match request {
+                        Request::CreatePrivate(signed) => Response::CreatePrivate(
+                            PrivateTable::read_sub::<A<DateTime>>(
+                                &self.0, &[&discover.to_string(), "timestamp"]
+                            ).unwrap().map(|d| {
+                                (d.0, PrivateTable::read_sub::<A<Id>>(
+                                    &self.0, &[&discover.to_string(), "hash"]
+                                ).unwrap().unwrap().0)
+                            }).or_else(|| {
+                                PrivateTable::create_sub(
+                                    &self.0, &[&discover.to_string()], &PrivateEntry::from(signed)
+                                ).unwrap();
+                                None
+                            })
+                        ),
+                        Request::CreateReadPrivate(signed) => Response::CreateReadPrivate(
+                            PrivateTable::read_sub::<A<Id>>(
+                                &self.0, &[&discover.to_string(), "hash"]
+                            ).unwrap().map(|d| {
+                                (d.0, PrivateTable::read_sub::<A<KeySigned<PrivateItem>>>(
+                                    &self.0, &[&discover.to_string(), "item"]
+                                ).unwrap().unwrap().0)
+                            }).or_else(|| {
+                                PrivateTable::create_sub(
+                                    &self.0, &[&discover.to_string()], &PrivateEntry::from(signed)
+                                ).unwrap();
+                                None
+                            })
+                        ),
+                        _ => panic!("noop")
                     },
                 }
             },
@@ -75,7 +100,7 @@ impl ServiceTrait for Service {
                             let item = PrivateTable::read_sub::<A<KeySigned<PrivateItem>>>(
                                 &self.0, &[&discover.to_string(), "item"]
                             ).unwrap();
-                            Response::ReadPrivate(timestamp.map(|t| (t.0, hash.unwrap().0, item.unwrap().0)))
+                            Response::ReadPrivate(timestamp.map(|_| (hash.unwrap().0, item.unwrap().0)))
                         } else {
                             Response::ReadPrivateHash(timestamp.map(|t| (t.0, hash.unwrap().0)))
                         }
