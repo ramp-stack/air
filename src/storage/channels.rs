@@ -1,109 +1,173 @@
-use orange_name::{Name, secp256k1::{SecretKey, Signed as KeySigned, PublicKey}, Id, Secret};
+use orange_name::{Name, secp256k1::SecretKey, Id};
 
 use crate::server::{Error as PurserError, Command, Context, PurserRequest};
-
-use std::hash::{Hasher, Hash};
-use std::time::Duration;
-use std::path::PathBuf;
-use std::fmt::Debug;
-
 use crate::{DateTime, now};
+
+use std::collections::BTreeMap;
+use std::fmt::Debug;
 
 use serde::{Serialize, Deserialize};
 
 use super::{PrivateItem, ReadPrivateItem, CreateReadPrivateItem};
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct Channel{
-    index: usize,
-    date: DateTime,
-    key: SecretKey,
-    servers: Vec<Name>
+#[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
+pub struct Channel {
+    pub key: SecretKey,
+    pub servers: Vec<Name>,
 }
 
-#[derive(Debug, PartialEq)]
-pub enum Error<V> {
-    PurserError(PurserError),
-    Validation(V)
+#[derive(Default)]
+pub struct Info {
+    date: DateTime,//Latest Valid Date
+    index: usize,//Latest(regardless of validity)
+    valid: Vec<usize>,
 }
-impl<V: Debug> std::error::Error for Error<V> {}
-impl<V: Debug> std::fmt::Display for Error<V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {write!(f, "{self:?}")}
+impl Info {
+    pub fn validate(&mut self, index: usize, date: DateTime) -> bool {
+        //If valid already contains this index its likely another command ran validate just prior
+        //to this with the same record
+        if !self.valid.contains(&index) && (self.date - date).num_minutes().abs() > 1 || self.date < date {
+            self.date = date;
+            self.valid.push(index);
+            true
+        } else {self.valid.contains(&index)}
+    }
 }
-impl<V> From<V> for Error<V> {fn from(e: V) -> Self {Self::Validation(e)}}
 
-pub enum State {
-    Read(usize),
-    Create(Vec<u8>),
-    Stop
+pub trait Discovery: Fn(usize) -> usize + Send {}
+impl<D: Fn(usize) -> usize + Send> Discovery for D {}
+
+#[derive(Default)]
+pub struct Cache {
+    info: BTreeMap<Id, Info>
 }
 
-pub struct Traverse<R, E>{
-    state: State,
+pub struct Create {
     channel: Channel,
-    validate: Box<dyn FnMut(Vec<Option<PrivateItem>>) -> Result<(Vec<R>, Option<State>), E> + Send>,
-    results: Vec<R>
+    payload: Vec<u8>,
+    target: Option<usize>,//If no target is specified discover until create is possible
+    discovery: Box<dyn Discovery>,
 }
-
-impl Traverse<Option<PrivateItem>, ()> {
-    pub fn new(channel: Channel, state: State) -> Self {
-        Traverse{state, channel, validate: Box::new(|items| Ok((items, None))), results: vec![]}
+impl Create {
+    pub fn new(channel: Channel, payload: Vec<u8>, target: Option<usize>, discovery: impl Discovery + 'static) -> Self {
+        Create{channel, target, payload, discovery: Box::new(discovery)}
     }
 }
-impl<R: Send + 'static, E: Send + 'static> Traverse<R, E> {
-    pub fn new_with_validation(channel: Channel, state: State, validate: impl FnMut(Vec<Option<PrivateItem>>) -> Result<(Vec<R>, Option<State>), E> + Send + 'static) -> Self {
-        Traverse{state, channel, validate: Box::new(validate), results: vec![]}
+impl Command<PurserRequest> for Create {
+    ///None: Successful Create
+    ///Some(None): Unsuccessful Create and Read
+    ///Some(Some(PrivateItem)): Unsuccessful Create but Successful Read
+    type Output = Result<(Vec<PrivateItem>, bool), PurserError>;
+
+    async fn run(self, mut ctx: Context) -> Self::Output {
+        let id = Id::hash(&self.channel);
+
+        let mut results = vec![];
+
+        let len = ctx.get_mut_or_default::<Cache>().await.info.entry(id).or_default().valid.len();
+        if let Some(t) = self.target && t > len {//Not yet reached target so read t-1
+            let (r, target) = ctx.run(
+                Read::new(self.channel.clone(), Some(t-1), self.discovery)
+            ).await?;
+            results.extend(r);
+            if target.is_none() {return Ok((results, false));}
+        }
+
+
+        //Check if target has already been taken(Could have been found out by the Read call)
+        let len = ctx.get_mut_or_default::<Cache>().await.info.entry(id).or_default().valid.len();
+        if let Some(t) = self.target && len > t {return Ok((results, false));}
+                
+        loop {
+            let index = ctx.get_mut_or_default::<Cache>().await.info.entry(id).or_default().index;
+            let key = self.channel.key.derive(&[index]);
+            let date = now();
+            let response = ctx.run(CreateReadPrivateItem(
+                key,
+                PrivateItem::new(key, date, self.payload.clone()),
+                self.channel.servers.clone()
+            )).await?;
+
+            let mut cache = ctx.get_mut_or_default::<Cache>().await;
+            let info = cache.info.entry(id).or_default();
+            info.index += 1;//Increase latest index
+                    
+            match response {
+                Some(Some(item)) => {
+                    info.validate(info.index-1, item.datetime);
+                    results.push(item);
+                },
+                Some(None) => {},
+                None => {
+                    info.validate(info.index-1, date);
+                    return Ok((results, true));
+                }
+            }
+        }
     }
 }
-impl<R: Send + 'static, E: Send + 'static> Command<PurserRequest> for Traverse<R, E> {
-    type Output = Result<(Channel, Vec<R>), Error<E>>;
 
-    async fn run(mut self, mut ctx: Context) -> Self::Output {
-        let mut gap = false;
-        let result = loop {
-            let responses = match &self.state {
-                State::Read(count) => {
-                    let requests = (self.channel.index..(self.channel.index+count)).map(|i| {
-                        let key = self.channel.key.derive(&[i]);
-                        ReadPrivateItem(
-                            key, self.channel.servers.clone()
-                        )
-                    }).collect::<Vec<_>>();
-                    ctx.run(requests).await.into_iter()
-                        .collect::<Result<Vec<_>, PurserError>>()
-                        .map_err(|e| Error::PurserError(e))?.into_iter()
-                        .filter_map(|r| {
-                        gap = r.is_none();
-                        (!gap).then(|| {
-                            self.channel.index += 1;
-                            r.unwrap().filter(|p| {
-                            let f = (self.channel.date - p.datetime).num_minutes().abs() > 1 || 
-                                self.channel.date < p.datetime;
-                            if f {self.channel.date = p.datetime;}
-                            f
-                        })})
-                    }).collect::<Vec<_>>()
-                },
-                State::Create(payload) => {
-                    let key = self.channel.key.derive(&[self.channel.index]);
-                    let response = ctx.run(CreateReadPrivateItem(
-                        key,
-                        PrivateItem::new(key, now(), payload.clone()),
-                        self.channel.servers.clone()
-                    )).await.map_err(|e| Error::PurserError(e))?;
-                    self.channel.index += 1;
-                    gap = response.is_none();
-                    if gap {break self.results}
-                    vec![response.unwrap()]
-                },
-                State::Stop => break self.results
-            };
-            let (results, new_state) = (self.validate)(responses)?;
-            self.results.extend(results);
-            if gap {break self.results}
-            self.state = new_state.unwrap_or(self.state);
-        };
-        Ok((self.channel, result))
+pub struct Read {
+    pub channel: Channel,
+    pub target: Option<usize>,
+    pub discovery: Box<dyn Discovery>,
+}
+impl Read {
+    pub fn new(channel: Channel, target: Option<usize>, discovery: impl Discovery + 'static) -> Self {
+        Read{channel, target, discovery: Box::new(discovery)}
+    }
+}
+impl Command<PurserRequest> for Read {
+    ///Vector of new items, Option index on the new items vec that is your target
+    type Output = Result<(Vec<PrivateItem>, Option<usize>), PurserError>;
+
+    async fn run(self, mut ctx: Context) -> Self::Output {
+        let id = Id::hash(&self.channel);
+
+        if let Some(t) = self.target {
+            let t = ctx.get_mut_or_default::<Cache>().await.info.entry(id).or_default().valid.get(t).copied();
+            if let Some(index) = t {
+                let r = ctx.run(
+                    ReadPrivateItem(self.channel.key.derive(&[index]), self.channel.servers.clone())
+                ).await?;
+                //If we had this index cached then the item exists and is valid
+                return Ok((vec![r.expect("Blame Air Servers").expect("Blame Air Servers")], Some(0)));
+            }
+        }
+
+        let mut results = vec![];
+        let mut count = 1;
+        let mut f_target = None;
+
+        loop {
+            let index = ctx.get_mut_or_default::<Cache>().await.info.entry(id).or_default().index;
+
+            let requests = (index..(index+count)).map(|i| {
+                ReadPrivateItem(self.channel.key.derive(&[i]), self.channel.servers.clone())
+            }).collect::<Vec<_>>();
+            let r = ctx.run(requests).await.into_iter().collect::<Result<Vec<_>, PurserError>>()?;
+
+            let mut cache = ctx.get_mut_or_default::<Cache>().await;
+            let info = cache.info.entry(id).or_default();
+            for r in r {
+                match r {
+                    None => {return Ok((results, f_target));}
+                    Some(taken) => {
+                        info.index += 1;//Increase Channel Index(regardless of validity)
+                        if let Some(item) = taken {
+                            if info.validate(info.index-1, item.datetime) {
+                                results.push(item);
+                                if let Some(t) = self.target && info.valid.len()-1 == t {
+                                    f_target = Some(results.len()-1);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(r) = f_target {return Ok((results, Some(r)))}
+            count = (self.discovery)(count);
+        }
     }
 }
 
@@ -112,64 +176,73 @@ mod test {
     use super::*;
     use crate::server::{Compiler, PurserRequest, Purser};
 
-    async fn run<T: Send + 'static, C: Command<PurserRequest, Output = T>>(cmd: C) -> T {
-        let mut compiler = Compiler::new(Purser::new());
-        compiler.add_task(0, cmd);
-        compiler.run().await.remove(&0).unwrap()
+    async fn run<T: Send + 'static, C: Command<PurserRequest, Output = T>>(cache: Cache, cmd: C) -> (Cache, T) {
+        let mut c = Compiler::new(Purser::new());
+        c.store().await.insert(cache);
+        c.add_task(0, cmd);
+        let (mut s, mut r) = c.run().await;
+        (s.remove::<Cache>().unwrap(), r.remove(&0).unwrap())
     }
 
     #[tokio::test]
     async fn create_read() {
         let channel = Channel{
-            index: 0,
-            date: DateTime::UNIX_EPOCH,
             key: SecretKey::new(),
             servers: vec![Name::orange_me()],
         };
+        let id = Id::hash(&channel);
         let payload = b"hello".to_vec();
-        let (mut channel, result) = run(Traverse::new(channel, State::Create(payload.clone()))).await.unwrap();
-        assert_eq!(result, vec![]);
-        assert_eq!(channel.index, 1);
-        channel.index = 0; 
+        let (cache, r) = run(Cache::default(), Create::new(channel.clone(), payload.clone(), None, |i| i+1)).await;
+        let (r, s) = r.unwrap();
+        assert_eq!(s, true);
+        assert_eq!(r, vec![]);
+        let info = cache.info.get(&id).unwrap();
+        assert_eq!(info.index, 1);
+        assert_eq!(info.valid.len(), 1);
 
-        let (channel, mut r) = run(Traverse::new_with_validation(channel, State::Read(4), |mut items: Vec<Option<PrivateItem>>| {
-            assert_eq!(items.len(), 1);
-            Ok::<_, ()>((vec![items.remove(0).unwrap()], None))
-        })).await.unwrap();
-        assert_eq!(channel.index, 1);
-        let read_item = r.remove(0);
-        assert_eq!(read_item.discover, channel.key.derive(&[0 as usize]).public_key());
-        assert_eq!(read_item.payload, payload);
+        let (cache, r) = run(Cache::default(), Read::new(channel.clone(), Some(4), |i| i+4)).await;
+        let (r, s) = r.unwrap();
+        assert_eq!(s, None);
+        assert_eq!(r.len(), 1);
+        let info = cache.info.get(&id).unwrap();
+        assert_eq!(info.index, 1);
+        assert_eq!(info.valid.len(), 1);
     }
 
     #[tokio::test]
     async fn out_of_order() {
         let channel = Channel{
-            index: 1,
-            date: DateTime::UNIX_EPOCH,
             key: SecretKey::new(),
             servers: vec![Name::orange_me()],
         };
+        let id = Id::hash(&channel);
         let payload = b"bad hello".to_vec();
-
-        let (mut channel, r) = run(Traverse::new(channel, State::Create(payload.clone()))).await.unwrap();
-        assert_eq!(channel.index, 2);
+        let cache = Cache{
+            info: BTreeMap::from([(id, Info{index: 1, date: DateTime::UNIX_EPOCH, valid: vec![]})])
+        };
+        let (cache, r) = run(cache, Create::new(channel.clone(), payload, None, |i| i+1)).await;
+        let (r, s) = r.unwrap();
+        assert_eq!(s, true);
         assert_eq!(r, vec![]);
+        let info = cache.info.get(&id).unwrap();
+        assert_eq!(info.index, 2);
+        assert_eq!(info.valid.len(), 1);
 
         let payload = b"good hello".to_vec();
-        channel.index = 0;
-
-        let (mut channel, r) = run(Traverse::new(channel, State::Create(payload.clone()))).await.unwrap();
-        assert_eq!(channel.index, 1);
+        let (cache, r) = run(Cache::default(), Create::new(channel.clone(), payload.clone(), None, |i| i+1)).await;
+        let (r, s) = r.unwrap();
+        assert_eq!(s, true);
         assert_eq!(r, vec![]);
-        
-        channel.index = 0;
-        
-        let (channel, mut r) = run(Traverse::new(channel, State::Read(4))).await.unwrap();
-        assert_eq!(channel.index, 2);
-        let read = r.remove(0).unwrap();
-        assert_eq!(read.discover, channel.key.derive(&[0 as usize]).public_key());
-        assert_eq!(read.payload, payload);
-        assert_eq!(r.remove(0), None);
+        let info = cache.info.get(&id).unwrap();
+        assert_eq!(info.index, 1);
+        assert_eq!(info.valid.len(), 1);
+
+        let (cache, r) = run(Cache::default(), Read::new(channel.clone(), None, |i| i+1)).await;
+        let (r, s) = r.unwrap();
+        assert_eq!(s, None);
+        assert_eq!(r.len(), 1);
+        let info = cache.info.get(&id).unwrap();
+        assert_eq!(info.index, 2);
+        assert_eq!(info.valid.len(), 1);
     }
 }

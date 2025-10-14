@@ -11,10 +11,10 @@ use orange_name::{secp256k1::{PublicKey, Signed as KeySigned}, Id};
 mod private_item;
 pub use private_item::{PrivateItem, Create as CreatePrivateItem, Read as ReadPrivateItem, CreateRead as CreateReadPrivateItem};
 
-mod channels;
+pub mod channels;
 pub use channels::{Channel};
 
-//  mod files;
+//  pub mod files;
 //  pub use files::{File, FileCache, Key};
 
 //pub mod records;

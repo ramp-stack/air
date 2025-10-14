@@ -1,13 +1,11 @@
-use orange_name::{Name, secp256k1::{SecretKey, Signed as KeySigned, PublicKey}, Id, Secret};
+use orange_name::{Name, secp256k1::{SecretKey, Signed as KeySigned, PublicKey}, Id};
 
 use crate::server::{Error as PurserError, Command, Context, PurserRequest};
 use crate::storage::{CreatePrivate, CreateReadPrivate, ReadPrivate, ReadPrivateHash};
 
-use std::hash::{Hasher, Hash};
-use std::time::Duration;
-use std::path::PathBuf;
+use std::hash::Hash;
 
-use crate::{DateTime, now};
+use crate::{DateTime};
 
 use serde::{Serialize, Deserialize};
 
@@ -108,7 +106,7 @@ async fn read(
     let mut hashes = results.iter().map(|r| r.as_ref().map(|o| o.map(|(i, _)| i)).map_err(|e| e.clone())).collect::<Vec<_>>();
     hashes.push(payload.as_ref().map(|o| o.as_ref().map(|(i, _)| *i)).map_err(|e| e.clone()));
     if let Some(hash) = majority(hashes).ok_or(PurserError::mr("No Majority Response"))?? {
-        let mut servers: Vec<Name> = results.into_iter().filter_map(|i|
+        let servers: Vec<Name> = results.into_iter().filter_map(|i|
             i.ok().flatten().filter(|(h, _)| *h == hash).map(|(_, n)| n)
         ).collect::<Vec<_>>();
 
@@ -139,13 +137,13 @@ mod test {
     async fn run<T: Send + 'static, C: Command<PurserRequest, Output = T>>(cmd: C) -> T {
         let mut compiler = Compiler::new(Purser::new());
         compiler.add_task(0, cmd);
-        compiler.run().await.remove(&0).unwrap()
+        compiler.run().await.1.remove(&0).unwrap()
     }
 
     #[tokio::test]
     async fn test_private_item() {
         let key = SecretKey::new();
-        let datetime = now();
+        let datetime = crate::now();
         let payload = b"hello".to_vec();
         let item = PrivateItem::new(key, datetime, b"hello".to_vec());
         let hash = Id::hash(&item);
