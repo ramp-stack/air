@@ -1,129 +1,191 @@
-use serde::{Serialize, Deserialize};
-
 use std::hash::Hash;
 use std::fmt::Debug;
 
-use crate::server::{ServiceRequest, Error, RawRequest, map_request_enum};
-use crate::{DateTime};
+use crate::names::{now, Signed, secp256k1::{Signed as KeySigned, PublicKey}, Id, Secret, Resolver, Name};
 
-use orange_name::{secp256k1::{PublicKey, Signed as KeySigned}, Id};
+use serde::{Serialize, Deserialize};
+use rusqlite::{Connection, params, OptionalExtension, Error};
 
-mod private_item;
-pub use private_item::{PrivateItem, Create as CreatePrivateItem, Read as ReadPrivateItem, CreateRead as CreateReadPrivateItem};
-
-pub mod channels;
-pub use channels::{Channel};
-
-//  pub mod files;
-//  pub use files::{File, FileCache, Key};
-
-//pub mod records;
-
-mod service;
-pub use service::Service;
-
-#[derive(Serialize, Deserialize, Clone, Debug, Hash)]
-pub struct Catalog {
-    //cost_per_read: u32,
+#[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
+pub struct Metadata {
+    pub timestamp: u64,
+    pub hash: Id,
+    pub len: usize
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Hash)]
+impl Metadata {
+    pub fn new(payload: &[u8]) -> Metadata {
+        Metadata{
+            timestamp: now(),
+            hash: Id::hash(payload),
+            len: payload.len()
+        }
+    }
+}
+
+pub type Receipt = Signed<Metadata>;
+
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 pub enum Request{
-    CreatePrivate(KeySigned<PrivateItem>),
-    CreateReadPrivate(KeySigned<PrivateItem>),
-    ReadPrivate(KeySigned<()>),
-    ReadPrivateHash(KeySigned<()>),
+    Create(KeySigned<Vec<u8>>),
+    Read(PublicKey, bool),
 
-  //CreatePublic(OrangeSigned<PublicItem>),
-  //UpdatePublic(OrangeSigned<(Id, OrangeSigned<PublicItem>)>),
-  //DeletePublic(OrangeSigned<Id>),
-
-  //CreateDirected(Name, Vec<u8>),
-  //ReadDirected(OrangeSigned<(DateTime, DateTime)>)
+    Send(Name, Vec<u8>),
+    Receive(Signed<u64>)
 }
-impl ServiceRequest for Request {type Response = Response; type Service = Service;}
 
-#[derive(Serialize, Deserialize, Clone, Debug, Hash)]
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 pub enum Response {
-    CreatePrivate(Option<(DateTime, Id)>),
-    CreateReadPrivate(Option<(Id, KeySigned<PrivateItem>)>),
-    ReadPrivate(Option<(Id, KeySigned<PrivateItem>)>),
-    ReadPrivateHash(Option<(DateTime, Id)>),
+    Private(Receipt, KeySigned<Vec<u8>>),
+    
+    Inbox(Vec<(Receipt, Vec<u8>)>),
 
+    Receipt(Receipt),
 
     InvalidRequest(String),
     InvalidSignature(String),
-    InvalidDelete(Option<PublicKey>),
-
-  //CreatedPublic(Id),
-  //ReadPublic(Vec<(Id, OrangeSigned<PublicItem>, DateTime)>),
-  //ReadDirected(Vec<Vec<u8>>),
-  //Empty,
 }
 
-//TODO: Create a proc_macro ServiceRequest(Service, Response) that auto generates everything except the enums
-map_request_enum!(Request::CreatePrivate: KeySigned<PrivateItem> => Response: Option<(DateTime, Id)>);
-map_request_enum!(Request::CreateReadPrivate: KeySigned<PrivateItem> => Response: Option<(Id, KeySigned<PrivateItem>)>);
-//TODO: Need to validate that the Id matches a hash of the KeySigned<PrivateItem>
-map_request_enum!(Request::ReadPrivate: KeySigned<()> => Response: Option<(Id, KeySigned<PrivateItem>)>);
-map_request_enum!(Request::ReadPrivateHash: KeySigned<()> => Response: Option<(DateTime, Id)>);
+pub struct Service(pub bool);
+impl Service {
+    pub async fn process(&mut self, connection: &mut Connection, secret: &Secret, request: Request) -> Response {
+        if self.0 {
+            self.0 = false;
+            connection.execute("CREATE TABLE if not exists private(
+                discover TEXT NOT NULL UNIQUE,
+                metadata BLOB NOT NULL,
+                payload BLOB NOT NULL
+            );", []).unwrap();
+            connection.execute("CREATE TABLE if not exists inbox(
+                recipient TEXT NOT NULL,
+                timestamp INT NOT NULL,
+                metadata BLOB NOT NULL,
+                payload BLOB NOT NULL
+            );", []).unwrap();
 
+        }
+        match request {
+            Request::Send(recipient, payload) => {
+                let metadata = Signed::new(secret, Metadata::new(payload.as_ref())).unwrap();
+                connection.execute(
+                    "INSERT INTO inbox(recipient, timestamp, metadata, payload) VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        recipient.to_string(),
+                        metadata.as_ref().timestamp as isize,
+                        serde_json::to_vec(&metadata).unwrap(),
+                        payload,
+                    ],
+                ).unwrap();
+                Response::Receipt(metadata)
+            },
+            Request::Receive(signed) => match signed.verify(&mut Resolver, None, None).await {
+                Ok(recipient) => {
+                    let timestamp = signed.into_inner();
+                    Response::Inbox(connection.prepare(&format!("SELECT metadata, payload FROM inbox WHERE recipient='{recipient}' AND timestamp>='{timestamp}'")).unwrap().query_map(
+                        [], |r| Ok((
+                            serde_json::from_slice(&r.get::<_, Vec<u8>>(0)?).unwrap(),
+                            r.get::<_, Vec<u8>>(1)?,
+                        ))
+                    ).unwrap().collect::<Result<Vec<_>, Error>>().unwrap())
+                },
+                Err(e) => Response::InvalidSignature(e.to_string())
+            },
+            Request::Create(payload) => {
+                let metadata = Signed::new(secret, Metadata::new(payload.as_ref())).unwrap();
+                match payload.verify(None) {
+                    Ok(discover) => {
+                        let result = connection.query_row(
+                            "INSERT INTO private(discover, metadata, payload) VALUES (?1, ?2, ?3) ON CONFLICT DO UPDATE SET discover=discover RETURNING metadata;",
+                            params![
+                                discover.to_string(),
+                                serde_json::to_vec(&metadata).unwrap(),
+                                serde_json::to_vec(&payload).unwrap(),
+                            ],
+                            |row| Ok(serde_json::from_slice::<Receipt>(&row.get::<_, Vec<u8>>(0)?).unwrap())
+                        ).unwrap();
+                        if result == metadata {Response::Receipt(metadata)} else {Response::Receipt(result)}
+                    },
+                    Err(e) => Response::InvalidSignature(e.to_string())
+                }
+            },
+            Request::Read(discover, inc) => {
+                let now = now();
+                match inc {
+                    true => connection.query_row(
+                        &format!("SELECT metadata, payload FROM private WHERE discover='{discover}'"),
+                        [], |r| Ok(Response::Private(
+                            serde_json::from_slice(&r.get::<_, Vec<u8>>(0)?).unwrap(),
+                            serde_json::from_slice(&r.get::<_, Vec<u8>>(1)?).unwrap(),
+                        ))
+                    ).optional().unwrap(),
+                    false => connection.query_row(
+                        &format!("SELECT metadata FROM private WHERE discover='{discover}'"),
+                        [], |r| Ok(Response::Receipt(serde_json::from_slice(&r.get::<_, Vec<u8>>(0)?).unwrap()))
+                    ).optional().unwrap()
+                }.unwrap_or_else(|| Response::Receipt(Signed::new(secret, Metadata{
+                    timestamp: now,
+                    hash: Id::MIN,
+                    len: 0
+                }).unwrap()))
+            }
+        }
+    }
+}
 
-//  #[derive(Serialize, Deserialize, Clone, Debug, Hash)]
-//  pub struct DirectedItem(PublicKey, Vec<u8>);
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::Purser;
+    use crate::names::{Name, secp256k1::{SecretKey}, Resolver};
+    use crate::chandler::Request as ChandlerRequest;
 
-//  impl DirectedItem {
-//      pub fn new(secret: &Secret, recipient: PublicKey, payload: Vec<u8>) -> Result<Self, orange_name::Error>{
-//          let signed = OrangeSigned::new(secret, &[], payload)?;
-//          Ok(DirectedItem(recipient, recipient.encrypt(serde_json::to_vec(&signed).unwrap()).unwrap()))
-//      }
+    async fn run(name: &Name, request: Request) -> Response {
+        Purser.send(&mut Resolver, name, ChandlerRequest::Service(request)).await.unwrap().storage().unwrap()
+    }
 
-//      pub async fn verify(self, resolver: &mut Resolver, secret: &SecretKey) -> Result<(Name, Vec<u8>), orange_name::Error> {
-//          let signed = serde_json::from_slice::<OrangeSigned<Vec<u8>>>(&secret.decrypt(&self.1)?)
-//              .map_err(|_| secp256k1::Error::InvalidMessage)?;
-//          Ok((signed.signer(), signed.verify(resolver, None, None, None).await?))
-//      }
-//  }
+    fn metadata(response: Response) -> Option<(Id, usize)> {
+        match response {
+            Response::Receipt(m) => Some((m.as_ref().hash, m.as_ref().len)),
+            _ => None,
+        }
+    }
 
-//  #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
-//  pub struct PublicItem {
-//      pub tags: BTreeSet<String>,
-//      pub payload: Vec<u8>,
-//  }
+    fn inbox(response: Response) -> Option<Vec<Vec<u8>>> {
+        match response {
+            Response::Inbox(i) => Some(i.into_iter().map(|(_, p)| p).collect()),
+            _ => None,
+        }
+    }
 
-//  #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
-//  pub enum Op {LS, LE, E, GE, GR}
+    fn private(response: Response) -> Option<Vec<u8>> {
+        match response {
+            Response::Private(_, p) => Some(p.into_inner()),
+            _ => None,
+        }
+    }
 
-//  #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
-//  pub struct Filter{
-//      pub id: Option<Id>,
-//      pub author: Option<Name>,
-//      pub tags: Option<BTreeSet<String>>,
-//      pub datetime: Option<(Op, DateTime)>
-//  }
-//  impl Filter {
-//      pub fn new(
-//          id: Option<Id>, author: Option<Name>, tags: Option<BTreeSet<String>>, datetime: Option<(Op, DateTime)>
-//      ) -> Self {
-//          Filter{id, author, tags, datetime}
-//      }
+    #[tokio::test]
+    async fn test_private() {
+        let key = SecretKey::new();
+        let item = KeySigned::new(&key, b"hello".to_vec());
+        let hash = Metadata::new(item.as_ref()).hash;
+        assert_eq!(metadata(run(&Name::orange_me(), Request::Read(key.public_key(), false)).await), Some((Id::MIN, 0)));
+        assert_eq!(metadata(run(&Name::orange_me(), Request::Create(item.clone())).await), Some((hash, 5)));
+        assert_eq!(private(run(&Name::orange_me(), Request::Read(key.public_key(), true)).await), Some(item.clone().into_inner()));
+        assert_eq!(metadata(run(&Name::orange_me(), Request::Read(key.public_key(), false)).await), Some((hash, 5)));
+        assert_eq!(metadata(run(&Name::orange_me(), Request::Create(KeySigned::new(&key, b"goodbye".to_vec()))).await), Some((hash, 5)));
+    }
 
-//      pub fn filter(&self, oid: &Id, oauthor: &Name, oitem: &PublicItem, odatetime: &DateTime) -> bool {
-//          if let Some(id) = &self.id && id != oid {return false;}
-//          if let Some(author) = &self.author && author != oauthor {return false;}
-//          if let Some(tags) = &self.tags && !tags.is_subset(&oitem.tags) {return false;}
-//          if let Some((op, datetime)) = &self.datetime {
-//              match op {
-//                  Op::LS if odatetime >= datetime => {return false;},
-//                  Op::LE if odatetime > datetime => {return false;},
-//                  Op::E if odatetime != datetime => {return false;},
-//                  Op::GE if odatetime < datetime => {return false;},
-//                  Op::GR if odatetime <= datetime => {return false;},
-//                  _ => {}
-//              }
-//          }
-//          true
-//      }
-//  }
-
-
+    #[tokio::test]
+    async fn test_inbox() {
+        let secret = Secret::new();
+        let name = secret.name();
+        let item = b"hello bob".to_vec();
+        let hash = Id::hash(&item);
+        assert_eq!(inbox(run(&Name::orange_me(), Request::Receive(Signed::new(&secret, 0).unwrap())).await), Some(vec![]));
+        assert_eq!(metadata(run(&Name::orange_me(), Request::Send(name, item.clone())).await), Some((hash, 9)));
+        assert_eq!(inbox(run(&Name::orange_me(), Request::Receive(Signed::new(&secret, 0).unwrap())).await), Some(vec![item.clone()]));
+        assert_eq!(metadata(run(&Name::orange_me(), Request::Send(name, item.clone())).await), Some((hash, 9)));
+        assert_eq!(inbox(run(&Name::orange_me(), Request::Receive(Signed::new(&secret, 0).unwrap())).await), Some(vec![item.clone(), item]));
+    }
+}

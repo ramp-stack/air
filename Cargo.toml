@@ -1,6 +1,6 @@
 [package]
 name = "air"
-version = "0.2.4"
+version = "1.0.0"
 edition = "2024"
 authors = ["Caleb Couch <caleb@orange.me>"]
 description = "A.I.R"
@@ -10,19 +10,15 @@ repository = "https://github.com/ramp-stack/air.git"
 
 [dependencies]
 hex = "0.4.3"
-serde = {version = "1.0.202", features=["rc"]}
+serde = {version = "1.0.202", features=["rc", "derive"]}
 serde_json = { version = "1.0.*", features = ["raw_value"] }
 url = { version = "2.5.0", features = ["serde"] }
-chrono = { version="0.4.38", features = ["serde"] }
-serde_with = "3.8.1"
-rusqlite = {version="0.34.0", features =["serde_json", "bundled"]}
-secp256k1 = {version = "0.31.1", features = ["global-context", "serde", "alloc", "rand"]}
-tokio = {version = "1.47.1", features = ["sync", "time", "macros", "rt"]}
-active_rusqlite = {path = "../active/active_rusqlite"}
-orange_name = {path = "../orange_name"}
-request_compiler = {path = "../request_compiler"}
-anyanymap = "0.1.0" 
+serde_with = "3.14.0"
+rusqlite = {version="0.39.0", features =["serde_json", "bundled"]}
+tokio = {version = "1.47.1", features = ["sync", "time", "macros", "rt-multi-thread", "net", "io-util"]}
+log = "0.4.29"
 
-[features]
-default = ["tcp"]
-tcp = []
+chacha20-poly1305 = "0.1.2"
+secp256k1 = { version = "0.31.1", features = ["serde", "global-context", "rand", "hashes", "alloc"] }
+bitcoin_hashes = "0.20.0"
+chrono = "0.4.44"
