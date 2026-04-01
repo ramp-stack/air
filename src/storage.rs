@@ -27,7 +27,7 @@ pub type Receipt = Signed<Metadata>;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 pub enum Request{
-    Create(KeySigned<Vec<u8>>),
+    Create(KeySigned<Vec<u8>>, bool),
     Read(PublicKey, bool),
 
     Send(Name, Vec<u8>),
@@ -37,7 +37,7 @@ pub enum Request{
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 pub enum Response {
     Private(Receipt, KeySigned<Vec<u8>>),
-    
+
     Inbox(Vec<(Receipt, Vec<u8>)>),
 
     Receipt(Receipt),
@@ -46,7 +46,7 @@ pub enum Response {
     InvalidSignature(String),
 }
 
-pub(crate) struct Service(pub bool);
+pub struct Service(pub bool);
 impl Service {
     pub async fn process(&mut self, connection: &mut Connection, secret: &Secret, request: Request) -> Response {
         if self.0 {
@@ -56,6 +56,13 @@ impl Service {
                 metadata BLOB NOT NULL,
                 payload BLOB NOT NULL
             );", []).unwrap();
+          //connection.execute("CREATE TABLE if not exists public(
+          //    author TEXT NOT NULL,
+          //    id 
+          //    metadata BLOB NOT NULL,
+          //    payload BLOB NOT NULL
+          //);", []).unwrap();
+
             connection.execute("CREATE TABLE if not exists inbox(
                 recipient TEXT NOT NULL,
                 timestamp INT NOT NULL,
@@ -90,20 +97,37 @@ impl Service {
                 },
                 Err(e) => Response::InvalidSignature(e.to_string())
             },
-            Request::Create(payload) => {
+            Request::Create(payload, inc) => {
                 let metadata = Signed::new(secret, Metadata::new(payload.as_ref())).unwrap();
                 match payload.verify(None) {
-                    Ok(discover) => {
-                        let result = connection.query_row(
-                            "INSERT INTO private(discover, metadata, payload) VALUES (?1, ?2, ?3) ON CONFLICT DO UPDATE SET discover=discover RETURNING metadata;",
-                            params![
-                                discover.to_string(),
-                                serde_json::to_vec(&metadata).unwrap(),
-                                serde_json::to_vec(&payload).unwrap(),
-                            ],
-                            |row| Ok(serde_json::from_slice::<Receipt>(&row.get::<_, Vec<u8>>(0)?).unwrap())
-                        ).unwrap();
-                        if result == metadata {Response::Receipt(metadata)} else {Response::Receipt(result)}
+                    Ok(discover) => match inc {
+                        true => {
+                            let result = connection.query_row(
+                                "INSERT INTO private(discover, metadata, payload) VALUES (?1, ?2, ?3) ON CONFLICT DO UPDATE SET discover=discover RETURNING metadata, payload;",
+                                params![
+                                    discover.to_string(),
+                                    serde_json::to_vec(&metadata).unwrap(),
+                                    serde_json::to_vec(&payload).unwrap(),
+                                ],
+                                |row| Ok((
+                                    serde_json::from_slice::<Receipt>(&row.get::<_, Vec<u8>>(0)?).unwrap(),
+                                    serde_json::from_slice::<KeySigned<Vec<u8>>>(&row.get::<_, Vec<u8>>(1)?).unwrap(),
+                                ))
+                            ).unwrap();
+                            if result.0 == metadata {Response::Receipt(metadata)} else {Response::Private(result.0, result.1)}
+                        },
+                        false => {
+                            let result = connection.query_row(
+                                "INSERT INTO private(discover, metadata, payload) VALUES (?1, ?2, ?3) ON CONFLICT DO UPDATE SET discover=discover RETURNING metadata;",
+                                params![
+                                    discover.to_string(),
+                                    serde_json::to_vec(&metadata).unwrap(),
+                                    serde_json::to_vec(&payload).unwrap(),
+                                ],
+                                |row| Ok(serde_json::from_slice::<Receipt>(&row.get::<_, Vec<u8>>(0)?).unwrap())
+                            ).unwrap();
+                            if result == metadata {Response::Receipt(metadata)} else {Response::Receipt(result)}
+                        }
                     },
                     Err(e) => Response::InvalidSignature(e.to_string())
                 }
@@ -168,12 +192,15 @@ mod test {
     async fn test_private() {
         let key = SecretKey::new();
         let item = KeySigned::new(&key, b"hello".to_vec());
+        let other = KeySigned::new(&key, b"other".to_vec());
         let hash = Metadata::new(item.as_ref()).hash;
         assert_eq!(metadata(run(&Name::orange_me(), Request::Read(key.public_key(), false)).await), Some((Id::MIN, 0)));
-        assert_eq!(metadata(run(&Name::orange_me(), Request::Create(item.clone())).await), Some((hash, 5)));
+        assert_eq!(metadata(run(&Name::orange_me(), Request::Create(item.clone(), false)).await), Some((hash, 5)));
+        assert_eq!(metadata(run(&Name::orange_me(), Request::Create(other.clone(), false)).await), Some((hash, 5)));
+        assert_eq!(private(run(&Name::orange_me(), Request::Create(other, true)).await), Some(item.clone().into_inner()));
         assert_eq!(private(run(&Name::orange_me(), Request::Read(key.public_key(), true)).await), Some(item.clone().into_inner()));
         assert_eq!(metadata(run(&Name::orange_me(), Request::Read(key.public_key(), false)).await), Some((hash, 5)));
-        assert_eq!(metadata(run(&Name::orange_me(), Request::Create(KeySigned::new(&key, b"goodbye".to_vec()))).await), Some((hash, 5)));
+        assert_eq!(metadata(run(&Name::orange_me(), Request::Create(KeySigned::new(&key, b"goodbye".to_vec()), false)).await), Some((hash, 5)));
     }
 
     #[tokio::test]
