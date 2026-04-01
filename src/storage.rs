@@ -46,7 +46,7 @@ pub enum Response {
     InvalidSignature(String),
 }
 
-pub struct Service(pub bool);
+pub(crate) struct Service(pub bool);
 impl Service {
     pub async fn process(&mut self, connection: &mut Connection, secret: &Secret, request: Request) -> Response {
         if self.0 {

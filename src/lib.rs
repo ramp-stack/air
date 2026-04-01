@@ -1,6 +1,6 @@
 pub mod names;
 
-mod storage;
+pub mod storage;
 
 mod chandler;
 pub use chandler::{Chandler, Request, Response};
