@@ -55,6 +55,11 @@ impl AsRef<[u8]> for Id {fn as_ref(&self) -> &[u8] {&self.0}}
 impl std::ops::Deref for Id {type Target = [u8; 32]; fn deref(&self) -> &Self::Target {&self.0}}
 impl std::ops::DerefMut for Id {fn deref_mut(&mut self) -> &mut Self::Target {&mut self.0}}
 impl From<[u8; 32]> for Id {fn from(id: [u8; 32]) -> Self {Id(id)}}
+impl From<u64> for Id {fn from(id: u64) -> Self {
+    let mut arr = [0u8; 32];
+    arr[0..8].copy_from_slice(&id.to_le_bytes());
+    Id(arr)
+}}
 impl Id {
     pub const MAX: Id = Id([u8::MAX; 32]);
     pub const MIN: Id = Id([u8::MIN; 32]);
@@ -111,6 +116,7 @@ impl Secret {
         let temporary = secp256k1::SecretKey::new();
         Secret{name: Name(temporary.public_key()), path: vec![], temporary}
     }
+    pub fn harden(&self) -> secp256k1::SecretKey {self.temporary.derive(&self.path)}
     pub fn name(&self) -> Name {self.name}
     pub fn path(&self) -> &Vec<Id> {&self.path}
     pub fn public(&self) -> Public {Public(self.temporary.public_key())}

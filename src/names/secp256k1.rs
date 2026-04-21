@@ -7,7 +7,7 @@ use serde::{Serialize, Deserialize};
 use serde::ser::Serializer;
 use serde::de::Deserializer;
 
-use super::{AirHash, Error};
+use super::{AirHash, Error, Id};
 
 use std::hash::{Hasher, Hash};
 use std::ops::Deref;
@@ -85,14 +85,11 @@ impl SecretKey {
         Ok(payload)
     }
 
-    /// Hashes the current key with the path item, (key, path) = child_key
-    /// /1020/0/234 is not the same as /1020/0234
-    pub fn derive<H: Hash>(&self, path: &[H]) -> Self {
+    pub fn derive(&self, path: &[Id]) -> Self {
         let mut key = self.0;
-        for p in path {
-            let bytes = super::HashReader::read(p);
+        for id in path {
             key = secp256k1::SecretKey::from_byte_array(
-                *AirHash::hash(&[&key.secret_bytes() as &[u8], &bytes].concat()).as_ref()
+                *AirHash::hash(&[&key.secret_bytes() as &[u8], id.as_ref() as &[u8]].concat()).as_ref()
             ).unwrap();
         }
         SecretKey(key)

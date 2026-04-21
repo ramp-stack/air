@@ -1,12 +1,18 @@
 pub mod names;
 
-pub mod storage;
+mod storage;
+pub use storage::{Request, Response};
 
 mod chandler;
-pub use chandler::{Chandler, Request, Response};
+pub use chandler::Chandler;
 
 mod purser;
 pub use purser::Purser;
+
+mod channel;
+pub use channel::Channel;
+
+pub mod contract;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Error {

@@ -22,3 +22,5 @@ chacha20-poly1305 = "0.1.2"
 secp256k1 = { version = "0.31.1", features = ["serde", "global-context", "rand", "hashes", "alloc"] }
 bitcoin_hashes = "0.20.0"
 chrono = "0.4.44"
+
+substance = {path="../substance"}
