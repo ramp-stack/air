@@ -1,40 +1,39 @@
-use crate::names::{Id, Secret, Name, Signed, Resolver, now};
-use crate::names::secp256k1::{SecretKey};
-use crate::{Purser, Response, Channel};
+use crate::names::{Id, Secret, Resolver, Signed, Name, secp256k1::SecretKey};
+
+use crate::{Purser, Channel, Response, Request as StorageRequest};
 
 use std::collections::BTreeMap;
 use std::path::{PathBuf, Path};
 use std::hash::Hash;
-use std::ops::Deref;
-use std::pin::Pin;
 use std::any::TypeId;
-use std::sync::Arc;
-use std::str::FromStr;
 
 use serde::{Serialize, Deserialize};
-use rusqlite::Connection;
-pub use substance::{Substance, Beaker, into, from, Offset};
+pub use substance::{Substance, Beaker, into, from};
 
-use tokio::time::{interval, Duration};
+#[derive(Debug)]
+pub enum Error {
+    UnregisteredContract(Id),
+    InvalidReactant(Id, PathBuf),
+    InvalidInstance(String)
+}
+impl std::error::Error for Error {}
+impl std::fmt::Display for Error {fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {write!(f, "{self:?}")}}
+
 
 pub trait Reactant: Serialize + for<'a> Deserialize<'a> + Hash {
     type Contract: Contract;
     type Error: std::error::Error;
 
-    fn index<P: AsRef<Path>>(path: P) -> Option<usize> where Self: 'static {
-        Self::Contract::routes().get(&path.as_ref().to_path_buf()).and_then(|rs| rs.index::<Self>())
-    }
-
     fn to_vec(&self) -> Vec<u8> {serde_json::to_vec(self).unwrap()}
     fn from_slice(s: &[u8]) -> Result<Self, String> {serde_json::from_slice(s).map_err(|e| e.to_string())}
 
-    fn apply<B: Beaker>(self, path: &Path, signer: Name, timestamp: u64, substance: &mut B) -> Result<(), Self::Error>;
+    fn apply<B: Beaker>(self, path: &Path, signer: &Name, timestamp: u64, substance: &mut B) -> Result<(), Self::Error>;
 }
 
 pub trait Contract: Serialize + for<'a> Deserialize<'a> + Hash {
     fn id() -> Id;
 
-    fn init(self) -> Substance;
+    fn init(self, signer: &Name, timestamp: u64) -> Substance;
 
     fn routes() -> BTreeMap<PathBuf, Reactants>;
 
@@ -42,301 +41,208 @@ pub trait Contract: Serialize + for<'a> Deserialize<'a> + Hash {
     fn from_slice(s: &[u8]) -> Result<Self, String> {serde_json::from_slice(s).map_err(|e| e.to_string())}
 }
 
-enum Request {
-    Create(Id, Vec<u8>),
-    Share(Id, Id, Name),
-    Send(Id, Id, PathBuf, usize, Vec<u8>),
-    //Get(Id, Id, PathBuf)
-}
-
-//  impl Request {
-//      fn create<C: Contract>(secret: &Secret, contract: C) -> (Id, Self) {
-//          (
-//              Id::hash(&secret.derive(&[C::id(), Id::hash(&contract)]).unwrap().harden()),
-//              Request::Create(C::id(), serde_json::to_vec(&contract).unwrap())
-//          )
-//      }
-
-//      fn share<C: Contract>(id: Id, name: Name) -> Request {Request::Share(C::id(), id, name)}
-
-//      fn send<P: AsRef<Path>, R: Reactant + 'static, B: Beaker>(secret: &Secret, path: P, reactant: R, beaker: &B) -> Option<Result<Self, R::Error>> {
-//          let path = path.as_ref().to_path_buf();
-//          R::index(&path).map(|i| {
-//              let id = Id::hash(&reactant);
-//              let ser = serde_json::to_vec(&reactant).unwrap();
-//              reactant.apply(path.as_ref(), secret.name(), now(), &mut beaker.copy())?;
-//              Ok(Request::Send(R::Contract::id(), id, path, i, ser))
-//          })
-//      }
-//  }
-
-type Erased = Box<dyn Fn(&[u8], &Path, Name, u64, &mut Offset<Substance>) + Send + Sync>;
+type Apply = Box<dyn Fn(&[u8], &Path, &Name, u64, &mut Substance) -> bool + Send + Sync>;
 
 #[derive(Default)]
-pub struct Reactants(Vec<(Erased, TypeId, String)>);
+pub struct Reactants(Vec<(Apply, TypeId, String)>);
 impl Reactants {
     pub fn new() -> Self {Self::default()}
 
-    pub fn add<R: Reactant + 'static>(&mut self) {
+    pub fn add<R: Reactant + 'static>(mut self) -> Self{
         if self.index::<R>().is_none() {
-            self.0.push((Box::new(|b: &[u8], p: &Path, n: Name, t: u64, c: &mut Offset<Substance>|
-                match serde_json::from_slice::<R>(b).map(|e| e.apply(p, n, t, c)) {
-                    Err(s) => log::warn!("Corrupted Reactant: {s}"),
-                    Ok(Err(s)) => log::warn!("Reactant Error: {s}"),
-                    Ok(Ok(())) => {},
+            self.0.push((Box::new(|b: &[u8], p: &Path, n: &Name, t: u64, c: &mut Substance|
+                match R::from_slice(b).map(|e| e.apply(p, n, t, c)) {
+                    Err(s) => {log::warn!("Corrupted Reactant: {s}"); false},
+                    Ok(Err(s)) => {log::warn!("Reactant Error: {s}"); false},
+                    Ok(Ok(())) => true,
                 }
             ), TypeId::of::<R>(), std::any::type_name::<R>().to_string()));
         }
+        self
     }
 
-    pub fn index<R: Reactant + 'static>(&self) -> Option<usize> {
-        let id = TypeId::of::<R>(); self.0.iter().position(|r| r.1 == id)
+    fn call(&self, index: usize, b: &[u8], p: &Path, s: &Name, t: u64, o: &mut Substance) -> bool {
+        match self.0.get(index) {
+            Some((e, _, _)) => {e(b, p, s, t, o); true},
+            None => false
+        }
+    }
+
+    fn index<R: Reactant + 'static>(&self) -> Option<usize> {
+        let id = TypeId::of::<R>();
+        self.0.iter().position(|r| r.1 == id)
     }
 }
 
+type Routes = BTreeMap<PathBuf, Reactants>;
+type InitFromSlice = Box<dyn Fn(&[u8], &Name, u64) -> Result<(Id, Substance), Error> + Send + Sync>;
+type Pending = BTreeMap<u64, Signed<Vec<u8>>>;
 
+#[derive(Serialize, Deserialize, Debug, Hash)]
+struct Missive(Id, SecretKey, Vec<u8>); 
+#[derive(Serialize, Deserialize, Debug)]
+struct Instance(Id, Channel, Substance);
 
-//  #[derive(Debug)]
-//  pub enum Error<E> {
-//      InvalidEvent,
-//      ManagerClosed,
-//      Event(E),
-//  }
-//  impl<E: std::error::Error> std::error::Error for Error<E> {}
-//  impl<E: std::error::Error> std::fmt::Display for Error<E> {
-//      fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {write!(f, "{:?}", self)}
-//  }
-//  impl<E: std::error::Error> From<E> for Error<E> {fn from(error: E) -> Self {Self::Event(error)}}
+#[derive(Default)]
+pub struct Contracts(BTreeMap<Id, (InitFromSlice, Routes)>);
+impl Contracts {
+    pub fn new() -> Self {Contracts(BTreeMap::new())}
+    pub fn add<C: Contract + 'static>(mut self) -> Self {
+        self.0.insert(C::id(), (Box::new(|b: &[u8], signer: &Name, timestamp: u64|
+            C::from_slice(b).map_err(Error::InvalidInstance).map(|c| (Id::hash(&(signer, &c)), c.init(signer, timestamp)))), C::routes()
+        ));
+        self
+    }
 
+    fn accept(&self, missive: &Signed<Missive>) -> Result<Instance, Error> {
+        let c = self.0.get(&missive.as_ref().0).ok_or(Error::UnregisteredContract(missive.as_ref().0))?;
+        (c.0)(&missive.as_ref().2, &missive.signer(), missive.datetime()).map(|(hash, s)| 
+            Instance(Id::hash(&(&missive.as_ref().1, hash)), Channel::from(missive.as_ref().1), s)
+        )
+    }
+}
 
-//  pub type Events = Vec<Erased>;
+enum _Request {
+    Create(Missive),
+    Share(Id, Id, Name),
+    Send(Id, Id, PathBuf, usize, Vec<u8>),
+}
+pub struct Request(_Request);
+#[derive(Clone, Debug)]
+pub struct RequestBuilder(Secret, BTreeMap<Id, BTreeMap<PathBuf, Vec<TypeId>>>);
+impl RequestBuilder {
+    pub fn name(&self) -> Name {self.0.name()}
 
+    pub fn create<C: Contract>(&self, contract: C) -> Result<(Id, Request), Error> {
+        let id = C::id();
+        if !self.1.contains_key(&id) {Err(Error::UnregisteredContract(id))?}
+        let hash = Id::hash(&(&self.0.name(), &contract));
+        let key = self.0.derive(&[id, hash]).harden();
+        let iid = Id::hash(&(&key, hash));
+        Ok((iid, Request(_Request::Create(Missive(id, key, serde_json::to_vec(&contract).unwrap())))))
+    }
 
+    pub fn share<C: Contract>(&self, iid: Id, name: Name) -> Result<Request, Error> {
+        let id = C::id();
+        if !self.1.contains_key(&id) {Err(Error::UnregisteredContract(id))?}
+        Ok(Request(_Request::Share(id, iid, name)))
+    }
 
+    pub fn send<P: AsRef<Path>, R: Reactant + 'static>(&self, id: Id, path: P, reactant: R) -> Result<Request, Error> {
+        let c_id = R::Contract::id();
+        let path = path.as_ref().to_path_buf();
+        let rid = TypeId::of::<R>();
+        let i = self.1.get(&c_id).ok_or(Error::UnregisteredContract(c_id))?.get(&path).and_then(|r| r.iter().position(|r| *r == rid)).ok_or(Error::InvalidReactant(c_id, path.clone()))?;
+        let ser = serde_json::to_vec(&reactant).unwrap();
+        Ok(Request(_Request::Send(c_id, id, path, i, ser)))
+      //Ok(reactant.apply(path.as_ref(), self.name(), now(), &mut beaker.copy()).map(|_|
+      //    Request(_Request::Send(c_id, id, path, i, ser))
+      //))
+    }
+}
 
+type I = (Signed<Missive>, Instance);
 
+#[derive(Serialize, Deserialize)]
+pub struct Manager {
+    secret: Secret,
+    root: Channel,
+    channels: BTreeMap<Id, (Channel, BTreeMap<Id, I>)>,
+    inbox_time: u64,
+    #[serde(skip)]
+    contracts: Contracts,
+}
+impl Manager {
+    pub fn new(secret: Secret) -> Self {
+        let root = secret.derive(&[Id::hash("contracts")]);
+        Manager {
+            root: Channel::from(root.harden()),
+            channels: BTreeMap::default(),
+            secret,
+            inbox_time: 0,
+            contracts: Contracts::default()
+        }
+    }
 
-//  type Routes = Box<dyn Fn() -> BTreeMap<PathBuf, Vec<Erased>>>;
+    pub fn init(&mut self, contracts: Contracts) {
+        contracts.0.keys().for_each(|id| {self.channels.entry(*id).or_insert((Channel::from(self.secret.derive(&[Id::hash("contracts"), *id]).harden()), BTreeMap::new()));});
+        self.contracts = contracts;
+    }
 
+    pub fn request_builder(&self) -> RequestBuilder {
+        RequestBuilder(self.secret.clone(), self.contracts.0.iter().map(|(id, c)|
+            (*id, c.1.iter().map(|(p, r)| (p.clone(), r.0.iter().map(|t| t.1).collect())).collect())
+        ).collect())
+    }
 
+    pub fn get(&self) -> BTreeMap<Id, BTreeMap<Id, Substance>> {
+        self.channels.iter().map(|(i, c)| (*i, c.1.iter().map(|(ii, t)| (*ii, t.1.2.clone())).collect())).collect()
+    }
 
-//  #[derive(Default, Debug)]
-//  pub struct Contracts(BTreeMap<Id, (TypeId, BTreeMap<PathBuf, Vec<Erased>>)>);
-//  impl Contracts {
-//      pub fn new() -> Self {Contracts(BTreeMap::new())}
-//      pub fn add<C: Contract + 'static>(mut self) -> Self {
-//          self.0.insert(C::id(), (TypeId::of::<C>(), C::routes()));
-//          self
-//      }
-//  }
+    pub async fn tick(&mut self, requests: Option<Request>) {
+        let mut pending_events: BTreeMap<(Id, Id), Pending> = BTreeMap::new();
+        let mut pending_instances: BTreeMap<Id, Pending> = BTreeMap::new();
+        //1. Scan Missives
+        if let Response::Inbox(missives) = Purser::send(&mut Resolver, &Name::orange_me(), StorageRequest::Receive(Signed::new(&self.secret, self.inbox_time).unwrap())).await.unwrap() {
+            for (m, data) in missives {
+                self.inbox_time = self.inbox_time.max(m.as_ref().timestamp);
+                if let Ok(missive) = serde_json::from_slice::<Signed<Missive>>(&data)
+                && let Some((_, instances)) = self.channels.get_mut(&missive.as_ref().0)
+                && let Ok(instance) = self.contracts.accept(&missive) 
+                && !instances.contains_key(&instance.0) {
+                    instances.insert(instance.0, (missive, instance));
+                }
+            }
+        }
+        //2. Handle Inputs
+        if let Some(Request(request)) = requests {match request {
+            _Request::Create(missive) => {
+                let id = missive.0;
+                let contract_channel = &mut self.channels.get_mut(&id).unwrap().0;
+                let results = contract_channel.send_all(Some(Signed::new(&self.secret, serde_json::to_vec(&Signed::new(&self.secret, missive).unwrap()).unwrap()).unwrap())).await.unwrap();
+                pending_instances.entry(id).or_default().extend(results);
+            },
+            _Request::Share(id, iid, name) => {
+                let instances = &mut self.channels.get_mut(&id).unwrap().1;
+                let missive = &instances.get_mut(&iid).unwrap().0;
+                Purser::send(&mut Resolver, &Name::orange_me(), StorageRequest::Send(name, serde_json::to_vec(missive).unwrap())).await.unwrap();
+            },
+            _Request::Send(id, iid, path, index, event) => {
+                let instances = &mut self.channels.get_mut(&id).unwrap().1;
+                let instance = instances.get_mut(&iid).unwrap();
 
-//  //  #[derive(Clone, Debug)]
-//  //  pub struct Instance(Id, TypeId, Id, PathBuf);
-//  //  impl Instance {pub fn new(contract: Id, ty_id: TypeId, channel: Id) -> Self {Instance(contract, ty_id, channel, PathBuf::from(format!("{contract}/{channel}")))}}
-//  //  impl Deref for Instance { type Target = Id; fn deref(&self) -> &Id {&self.2} }
-//  //  impl AsRef<Path> for Instance {fn as_ref(&self) -> &Path {&self.3}}
+                let results = instance.1.1.send_all(Some(Signed::new(&self.secret, serde_json::to_vec(&(path, index, event)).unwrap()).unwrap())).await.unwrap();
+                pending_events.entry((id, iid)).or_default().extend(results);
+            }
+        }}
+        
 
-//  #[derive(Debug)]
-//  pub struct Remote {
-//      output: Output<Value>,
-//      tx: Tx<Array<_Request>>,
-//  }
-//  impl Deref for Remote {
-//      type Target = Value;
-//      fn deref(&self) -> &Value {self.output.output_buffer()}
-//  }
+        //3. Scan for new instances, events
+        for (id, (channel, instances)) in &mut self.channels {
+            let results = channel.send_all(None).await.unwrap();
+            pending_instances.entry(*id).or_default().extend(results);
 
-//  impl Remote {
-//      pub fn new<B: Beaker + Send + 'static>(beaker: B, secret: Secret, mut contracts: Contracts) -> Result<Self, B::Error> {
-//          let value = beaker.query("values")?.unwrap_or(Value::Map(contracts.0.keys().map(|id| (id.to_string(), Value::map())).collect()));
-//          let (mut input, output) = triple_buffer::triple_buffer(&value);
+            instances.extend(pending_instances.remove(id).unwrap().into_values().flat_map(|signed| {
+                let me = signed.signer() == self.secret.name();
+                let missive = serde_json::from_slice::<Signed<Missive>>(&signed.into_inner()).ok().filter(|_| me).unwrap();//?;
+                let instance = self.contracts.accept(&missive).ok().unwrap();//?;
+                Some((instance.0, (missive, instance)))
+            }));
 
-//          let (tx, mut rx) = bounded_blocking(100);
-//          let mut channels = beaker.query("channels")?.ok().and_then(|f| from(f).ok()).unwrap_or(
-//              Channels(Channel::from(secret.derive(&[Id::hash("$channel")]).unwrap().harden()), BTreeMap::new(), 0)
-//          );
+            for (iid, (_, instance)) in instances {
+                let results = instance.1.send_all(None).await.unwrap();
+                pending_events.entry((*id, *iid)).or_default().extend(results);
 
-//          let mut task = Task{beaker, secret, channels, contracts, input, value, rx};
-//          tokio::task::spawn(async move {task.run().await.unwrap()});
-
-//          Ok(Remote{output, tx})
-//      }
-
-//      ///Will return None if the manager is closed
-//      pub fn create<C: Contract>(&mut self, contract: C) -> Option<PathBuf> {
-//          let channel = Channel::default();
-//          let channel_id = channel.id();
-//          let c_id = C::id();
-//          self.tx.send(_Request::New(c_id, channel, contract.init())).ok()?;
-//          Some(PathBuf::from(format!("{c_id}/{channel_id}")))
-//      }
-
-//      pub fn send<P: AsRef<Path>, E: Event + 'static>(&self, path: P, event: E) -> Result<(), Error<E::Error>> {
-//          //TODO: Optionally Attempt to eval Event and return any possible error prior to sending it
-//          let ty_id = TypeId::of::<E>();
-//          let mut components = path.as_ref().components();
-//          let id = components.next().and_then(|id| Id::from_str(&id.as_os_str().to_string_lossy()).ok()).ok_or(Error::InvalidEvent)?;
-//          let iid = components.next().and_then(|id| Id::from_str(&id.as_os_str().to_string_lossy()).ok()).ok_or(Error::InvalidEvent)?;
-//          let path = components.as_path().to_path_buf();
-
-//          self.tx.send(_Request::Send(id, iid, path, ty_id, serde_json::to_vec(&event).unwrap())).map_err(|_| Error::ManagerClosed)?;
-//          Ok(())
-//      }
-
-//      pub fn share(&self, id: Id, name: Name) {}
-//  }
-
-//  #[derive(Serialize, Deserialize)]
-//  struct Channels(Channel, BTreeMap<Id, (Channel, BTreeMap<Id, Channel>)>, u64);
-
-
-//  struct Task<B> {
-//      beaker: B,
-//      secret: Secret,
-//      channels: Channels,
-//      contracts: Contracts,
-//      input: Input<Value>,
-//      value: Value,
-//      rx: Rx<Array<_Request>>
-//  }
-
-//  impl<B: Beaker> Task<B> {
-//      ///I can turn this into a run function that responsds to channel results and incomming requests
-//      ///and poll the channels as fast as possible?
-//      pub async fn run(&mut self) -> Result<(), B::Error> {
-//          loop {
-//              let mut pending_events: BTreeMap<(Id, Id), BTreeMap<u64, Signed<Vec<u8>>>> = BTreeMap::new();
-//              let mut pending_instances: BTreeMap<Id, BTreeMap<u64, Signed<Vec<u8>>>> = BTreeMap::new();
-//              //1. Scan Missives
-//              if let Response::Inbox(missives) = Purser::send(&mut Resolver, &Name::orange_me(), Request::Receive(Signed::new(&self.secret, self.channels.2).unwrap())).await.unwrap() {
-//                  for (m, data) in missives {
-//                      self.channels.2 = self.channels.2.max(m.as_ref().timestamp);
-//                      if let Ok((id, key)) = serde_json::from_slice::<(Id, SecretKey)>(&data)
-//                      && let Some((_, instances)) = self.channels.1.get_mut(&id) {
-//                          let channel = Channel::from(key);
-//                          instances.insert(channel.id(), channel);
-//                      }
-//                  }
-//              }
-//              //2. Handle Inputs
-//              while let Ok(request) = self.rx.try_recv() {match request {
-//                  _Request::New(id, channel, init) => {
-//                      let (contract_channel, instances) = self.channels.1.get_mut(&id).unwrap();
-//                      let results = contract_channel.send_all(Some(Signed::new(&self.secret, serde_json::to_vec(&channel).unwrap()).unwrap())).await.unwrap();
-//                      pending_instances.entry(id).or_default().extend(results);
-//                  },
-//                  _Request::Share(id, iid, name) => {
-//                      let (contract_channel, instances) = self.channels.1.get_mut(&id).unwrap();
-//                      let instance = instances.get_mut(&iid).unwrap();
-//                      Purser::send(&mut Resolver, &Name::orange_me(), Request::Send(name, serde_json::to_vec(&(id, instance.key)).unwrap())).await.unwrap();
-//                  },
-//                  _Request::Send(id, iid, path, ty_id, event) => {
-//                      let (contract_channel, instances) = self.channels.1.get_mut(&id).unwrap();
-//                      let instance = instances.get_mut(&iid).unwrap();
-
-//                      let (index, _) = self.contracts.0.get(&id).unwrap().1.get(&path).unwrap().iter().enumerate().find(|(i, e)| e.1 == ty_id).unwrap();
-//                      let results = instance.send_all(Some(Signed::new(&self.secret, serde_json::to_vec(&(path, index, event)).unwrap()).unwrap())).await.unwrap();
-//                      pending_events.entry((id, iid)).or_default().extend(results);
-//                  }
-//              }}
-//              
-
-//              //3. Scan for new instances, events
-//              for (id, (channel, instances)) in &mut self.channels.1 {
-//                  let results = channel.send_all(None).await.unwrap();
-//                  pending_instances.entry(*id).or_default().extend(results);
-
-//                  instances.extend(pending_instances.remove(id).unwrap().into_values().flat_map(|signed| {
-//                      let me = signed.signer() == self.secret.name();
-//                      serde_json::from_slice::<Channel>(&signed.into_inner()).ok().filter(|_| me).map(|c| (c.id(), c))
-//                  }));
-
-//                  for (iid, instance) in instances {
-//                      let results = instance.send_all(None).await.unwrap();
-//                      pending_events.entry((*id, *iid)).or_default().extend(results);
-
-//                      pending_events.remove(&(*id, *iid)).unwrap().into_iter().for_each(|(t, signed)| {
-//                          let signer = signed.signer();
-//                          if let Ok((path, index, event)) = serde_json::from_slice(&signed.into_inner()) {
-//                              let mut offset = Offset::new(&mut self.value, PathBuf::from(&format!("{id}/{iid}")));
-//                              if let Some(erased) = self.contracts.0.get(id).unwrap().1.get(path).and_then(|e| e.get::<usize>(index)) {
-//                                  let erased: &Erased = erased;
-//                                  (*erased.0)(event, path, signer, t, &mut offset)
-//                              }
-//                          }
-//                      });
-
-//                  }
-//              }
-
-//              //TODO: These need to happen in the same atomic transaction
-//              self.input.write(self.value.clone());
-//              self.beaker.insert("value", into(&self.value).unwrap())?.unwrap();
-//              self.beaker.insert("channels", into(&self.channels).unwrap())?.unwrap();
-//          }
-//      }
-//  }
-
-//  #[macro_export]
-//  macro_rules! events {
-//      ($($item:ty),* $(,)?) => {{
-//          vec![$($crate::air::Erased::new::<$item>()),*]
-//      }};
-//  }
-
-
-
-//  #[cfg(test)]
-//  mod test {
-//      use super::*;
-
-//      use tokio::time::{sleep, interval, Duration};
-//      use std::convert::Infallible;
-
-//      #[derive(Serialize, Deserialize)]
-//      pub struct Send(String);
-//      impl Send { pub fn new(body: &str) -> Self { Send(body.to_string())}}
-//      impl Event for Send {
-//          type Error = Infallible;
-//        //fn serialize(&self) -> Vec<u8> {serde_json::to_vec(self).unwrap()}
-//        //fn deserialize(b: &[u8]) -> Option<Self> {serde_json::from_slice(b).ok()}
-
-//          fn eval<B: Beaker>(self, path: &Path, signer: Name, timestamp: u64, beaker: &mut B) -> Result<(), EventError<B::Error, Self::Error>> {
-//              beaker.insert("-", into(&format!("{}: {}", signer, self.0)).unwrap())?;
-//              Ok(())
-//          }
-//      }
-
-//      #[derive(Hash, PartialEq)]
-//      pub struct Room;
-//      impl Contract for Room {
-//          fn id() -> Id {Id::hash("Room")}
-
-//          fn init(self) -> Value {Value::Seq(vec![])}
-
-//          fn routes() -> BTreeMap<PathBuf, Events> {
-//              BTreeMap::from([
-//                  (PathBuf::from("/"), events![Send])
-//              ])
-//          }
-//      }
-
-//      #[tokio::test]
-//      async fn test() {
-//          let bob = Secret::new();
-//          let c = Connection::open("file:bob?mode=memory&cache=shared").unwrap();
-
-//          let mut r = Remote::new(c, bob, Contracts::new().add::<Room>()).unwrap();
-
-//          let room = r.create(Room).unwrap();
-//          r.send(room, Send::new("Hello")).unwrap();
-//          r.send(room, Send::new("Goodbye")).unwrap();
-
-//          sleep(Duration::from_millis(20)).await;
-
-//          assert_eq!(r.query(room).unwrap(), Ok(Value::Seq(vec![
-//              Value::Field(Primitive::String("Hello".to_string())),
-//              Value::Field(Primitive::String("Goodbye".to_string()))
-//          ])));
-//      }
-//  }
+                pending_events.remove(&(*id, *iid)).unwrap().into_iter().for_each(|(t, signed)| {
+                    let signer = signed.signer();
+                    let (path, index, event) = serde_json::from_slice::<(PathBuf, usize, Vec<u8>)>(&signed.into_inner()).unwrap();
+                    let mut substance = instance.2.clone();
+                    if let Some(reactants) = &self.contracts.0.get(id).and_then(|c| c.1.get(&path))
+                    && reactants.call(index, &event, &path, &signer, t, &mut substance) {
+                        instance.2 = substance;
+                    } else {panic!("p");}
+                });
+            }
+        }
+    }
+}

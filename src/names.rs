@@ -129,12 +129,12 @@ impl Secret {
         self.temporary.decrypt(payload)
     }
 
-    pub fn derive(&self, path: &[Id]) -> Result<Self, Error> {
-        Ok(Secret{
+    pub fn derive(&self, path: &[Id]) -> Self {
+        Secret{
             name: self.name,
             path: [&self.path, path].concat(),
             temporary: self.temporary
-        })
+        }
     }
 }
 impl Default for Secret {fn default() -> Self {Self::new()}}
@@ -272,7 +272,7 @@ mod test {
         let id = Id::random();
 
         let m = vec![1, 2, 3];
-        let s = secret.derive(&[id]).unwrap().sign(&m).unwrap();
+        let s = secret.derive(&[id]).sign(&m).unwrap();
         block_on(Resolver.verify(&name, None, &[id], &s, &m)).unwrap();
     }
 }

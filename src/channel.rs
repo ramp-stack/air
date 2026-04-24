@@ -46,11 +46,16 @@ impl Channel {
         }
     }
 
-    pub async fn send_all(&mut self, outgoing: Option<Signed<Vec<u8>>>) -> Result<BTreeMap<u64, Signed<Vec<u8>>>, Error> {
+    pub async fn send_all(&mut self, mut outgoing: Option<Signed<Vec<u8>>>) -> Result<BTreeMap<u64, Signed<Vec<u8>>>, Error> {
         let mut results = BTreeMap::new();
         loop {
             match self.send(outgoing.as_ref()).await? {
-                None => break Ok(results),
+                None => {
+                    if let Some(outgoing) = outgoing.take() {
+                        results.insert(self.timestamp, outgoing); 
+                    }
+                    break Ok(results)
+                },
                 Some(m) => {if let Some(m) = m {results.insert(self.timestamp, m);}}
             }
         }
@@ -61,12 +66,11 @@ impl Channel {
 mod test {
     use super::*;
 
-    use tokio::time::{sleep, Duration};
+    use crate::names::Secret;
 
      #[tokio::test]
     async fn test_channel() {
         let secret = Secret::new();
-        let name = secret.name();
 
         let key = SecretKey::new();
 

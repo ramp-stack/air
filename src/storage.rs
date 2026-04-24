@@ -71,7 +71,8 @@ impl Service {
             );", []).unwrap();
 
         }
-        match request {
+        println!("request: {:?}", request);
+        let response = match request {
             Request::Send(recipient, payload) => {
                 let metadata = Signed::new(secret, Metadata::new(payload.as_ref())).unwrap();
                 connection.execute(
@@ -152,7 +153,9 @@ impl Service {
                     len: 0
                 }).unwrap()))
             }
-        }
+        };
+        println!("response: {:?}", response);
+        response
     }
 }
 
@@ -160,7 +163,11 @@ impl Service {
 mod test {
     use super::*;
     use crate::Purser;
-    use crate::names::{Name, secp256k1::{SecretKey}};
+    use crate::names::{Name, secp256k1::{SecretKey}, Resolver};
+
+    async fn run(name: &Name, request: Request) -> Response {
+        Purser::send(&mut Resolver, name, request).await.unwrap()
+    }
 
     fn metadata(response: Response) -> Option<(Id, usize)> {
         match response {
@@ -185,33 +192,29 @@ mod test {
 
     #[tokio::test]
     async fn test_private() {
-        let (purser, task) = Purser::new();
-        tokio::task::spawn(task);
         let key = SecretKey::new();
         let item = KeySigned::new(&key, b"hello".to_vec());
         let other = KeySigned::new(&key, b"other".to_vec());
         let hash = Metadata::new(item.as_ref()).hash;
-        assert_eq!(metadata(purser.send(Name::orange_me(), Request::Read(key.public_key(), false)).recv().await.unwrap()), Some((Id::MIN, 0)));
-        assert_eq!(metadata(purser.send(Name::orange_me(), Request::Create(item.clone(), false)).recv().await.unwrap()), Some((hash, 5)));
-        assert_eq!(metadata(purser.send(Name::orange_me(), Request::Create(other.clone(), false)).recv().await.unwrap()), Some((hash, 5)));
-        assert_eq!(private(purser.send(Name::orange_me(), Request::Create(other, true)).recv().await.unwrap()), Some(item.clone().into_inner()));
-        assert_eq!(private(purser.send(Name::orange_me(), Request::Read(key.public_key(), true)).recv().await.unwrap()), Some(item.clone().into_inner()));
-        assert_eq!(metadata(purser.send(Name::orange_me(), Request::Read(key.public_key(), false)).recv().await.unwrap()), Some((hash, 5)));
-        assert_eq!(metadata(purser.send(Name::orange_me(), Request::Create(KeySigned::new(&key, b"goodbye".to_vec()), false)).recv().await.unwrap()), Some((hash, 5)));
+        assert_eq!(metadata(run(&Name::orange_me(), Request::Read(key.public_key(), false)).await), Some((Id::MIN, 0)));
+        assert_eq!(metadata(run(&Name::orange_me(), Request::Create(item.clone(), false)).await), Some((hash, 5)));
+        assert_eq!(metadata(run(&Name::orange_me(), Request::Create(other.clone(), false)).await), Some((hash, 5)));
+        assert_eq!(private(run(&Name::orange_me(), Request::Create(other, true)).await), Some(item.clone().into_inner()));
+        assert_eq!(private(run(&Name::orange_me(), Request::Read(key.public_key(), true)).await), Some(item.clone().into_inner()));
+        assert_eq!(metadata(run(&Name::orange_me(), Request::Read(key.public_key(), false)).await), Some((hash, 5)));
+        assert_eq!(metadata(run(&Name::orange_me(), Request::Create(KeySigned::new(&key, b"goodbye".to_vec()), false)).await), Some((hash, 5)));
     }
 
     #[tokio::test]
     async fn test_inbox() {
-        let (purser, task) = Purser::new();
-        tokio::task::spawn(task);
         let secret = Secret::new();
         let name = secret.name();
         let item = b"hello bob".to_vec();
         let hash = Id::hash(&item);
-        assert_eq!(inbox(purser.send(Name::orange_me(), Request::Receive(Signed::new(&secret, 0).unwrap())).recv().await.unwrap()), Some(vec![]));
-        assert_eq!(metadata(purser.send(Name::orange_me(), Request::Send(name, item.clone())).recv().await.unwrap()), Some((hash, 9)));
-        assert_eq!(inbox(purser.send(Name::orange_me(), Request::Receive(Signed::new(&secret, 0).unwrap())).recv().await.unwrap()), Some(vec![item.clone()]));
-        assert_eq!(metadata(purser.send(Name::orange_me(), Request::Send(name, item.clone())).recv().await.unwrap()), Some((hash, 9)));
-        assert_eq!(inbox(purser.send(Name::orange_me(), Request::Receive(Signed::new(&secret, 0).unwrap())).recv().await.unwrap()), Some(vec![item.clone(), item]));
+        assert_eq!(inbox(run(&Name::orange_me(), Request::Receive(Signed::new(&secret, 0).unwrap())).await), Some(vec![]));
+        assert_eq!(metadata(run(&Name::orange_me(), Request::Send(name, item.clone())).await), Some((hash, 9)));
+        assert_eq!(inbox(run(&Name::orange_me(), Request::Receive(Signed::new(&secret, 0).unwrap())).await), Some(vec![item.clone()]));
+        assert_eq!(metadata(run(&Name::orange_me(), Request::Send(name, item.clone())).await), Some((hash, 9)));
+        assert_eq!(inbox(run(&Name::orange_me(), Request::Receive(Signed::new(&secret, 0).unwrap())).await), Some(vec![item.clone(), item]));
     }
 }
