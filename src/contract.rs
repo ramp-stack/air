@@ -225,7 +225,7 @@ impl Manager {
             instances.extend(pending_instances.remove(id).unwrap().into_values().flat_map(|signed| {
                 let me = signed.signer() == self.secret.name();
                 let missive = serde_json::from_slice::<Signed<Missive>>(&signed.into_inner()).ok().filter(|_| me).unwrap();//?;
-                let instance = self.contracts.accept(&missive).ok().unwrap();//?;
+                let instance = self.contracts.accept(&missive).ok()?;
                 Some((instance.0, (missive, instance)))
             }));
 
