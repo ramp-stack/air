@@ -74,15 +74,6 @@ impl Reactants {
     }
 }
 
-type Routes = BTreeMap<PathBuf, Reactants>;
-type InitFromSlice = Box<dyn Fn(&[u8], &Name, u64) -> Result<(Id, Substance), Error> + Send + Sync>;
-type Pending = BTreeMap<u64, Signed<Vec<u8>>>;
-
-#[derive(Serialize, Deserialize, Debug, Hash)]
-struct Missive(Id, SecretKey, Vec<u8>); 
-#[derive(Serialize, Deserialize, Debug)]
-struct Instance(Id, Channel, Substance);
-
 #[derive(Default)]
 pub struct Contracts(BTreeMap<Id, (InitFromSlice, Routes)>);
 impl Contracts {
@@ -141,7 +132,15 @@ impl RequestBuilder {
     }
 }
 
+type Routes = BTreeMap<PathBuf, Reactants>;
+type InitFromSlice = Box<dyn Fn(&[u8], &Name, u64) -> Result<(Id, Substance), Error> + Send + Sync>;
+type Pending = BTreeMap<u64, Signed<Vec<u8>>>;
 type I = (Signed<Missive>, Instance);
+
+#[derive(Serialize, Deserialize, Debug, Hash)]
+struct Missive(Id, SecretKey, Vec<u8>); 
+#[derive(Serialize, Deserialize, Debug)]
+struct Instance(Id, Channel, Substance);
 
 #[derive(Serialize, Deserialize)]
 pub struct Manager {
@@ -216,7 +215,6 @@ impl Manager {
             }
         }}
         
-
         //3. Scan for new instances, events
         for (id, (channel, instances)) in &mut self.channels {
             let results = channel.send_all(None).await.unwrap();
