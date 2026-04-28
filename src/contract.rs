@@ -131,23 +131,9 @@ impl Contracts {
         ));
         self
     }
-
-  //fn accept(&self, missive: &Signed<Missive>) -> Result<Instance, Error> {
-  //    let c = self.0.get(&missive.as_ref().0).ok_or(Error::UnregisteredContract(missive.as_ref().0))?;
-  //    (c.0)(&missive.as_ref().1, &missive.signer(), missive.timestamp()).map(|s| 
-  //        Instance(Missive::instance_id(missive), Channel::from(missive.as_ref().2), s)
-  //    )
-  //}
 }
 
-//  #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
-//  pub struct Missive(pub(crate) Id, pub(crate) Vec<u8>, pub(crate) SecretKey); 
-//  impl Missive {
-//      pub fn contract_id(&self) -> Id {self.0}
-//      pub fn instance_id(signed: &Signed<Self>) -> Id {
-//          Id::hash(&(signed.signer(), signed.timestamp(), Id::hash(&signed.as_ref().1), signed.as_ref().2))
-//      }
-//  }
+
 #[derive(Serialize, Deserialize, Debug)]
 struct Instance(Id, Channel, Substance);
 
