@@ -124,7 +124,7 @@ impl Secret {
         Ok(Signature(self.temporary.sign(payload)))
     }
 
-    pub fn decrypt(&self, _datetime: Option<u64>, path: &[Id], payload: &[u8]) -> Result<Vec<u8>, Error> {
+    pub fn decrypt(&self, _timestamp: Option<u64>, path: &[Id], payload: &[u8]) -> Result<Vec<u8>, Error> {
         let _path = path.strip_prefix(self.path.as_slice()).ok_or(Error::MissingPermissions(path.to_vec()))?;
         self.temporary.decrypt(payload)
     }
@@ -158,7 +158,7 @@ impl Public {
 #[derive(Default, Debug)]
 pub struct Resolver;
 impl Resolver {
-    pub async fn verify(&mut self, name: &Name, _datetime: Option<u64>, path: &[Id], sig: &Signature, payload: &[u8]) -> Result<(), Error> {
+    pub async fn verify(&mut self, name: &Name, _timestamp: Option<u64>, path: &[Id], sig: &Signature, payload: &[u8]) -> Result<(), Error> {
         self.public(name).await?.verify(path, sig, payload)
     }
 
@@ -194,7 +194,7 @@ impl<H: Hash + Debug> Signed<H> {
         Ok(self.0)
     }
     pub fn signer(&self) -> Name {self.0}
-    pub fn datetime(&self) -> u64 {self.1}
+    pub fn timestamp(&self) -> u64 {self.1}
     pub fn path(&self) -> &[Id] {&self.2}
     pub fn into_inner(self) -> H {self.4}
 }

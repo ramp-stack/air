@@ -1,7 +1,7 @@
 pub mod names;
 
 mod storage;
-pub use storage::{Request, Response};
+pub use storage::{Request, Response, Compare};
 
 mod chandler;
 pub use chandler::Chandler;

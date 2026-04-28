@@ -10,12 +10,15 @@ use crate::names::{Resolver, Name, secp256k1::SecretKey};
 pub struct Purser;
 impl Purser {
     fn tcp_send(url: &str, request: &[u8]) -> Result<Vec<u8>, Error> {
-        let mut stream = TcpStream::connect(url)?;
-        stream.write_all(request)?;
-        stream.shutdown(Shutdown::Write)?;
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response)?;
-        Ok(response)
+        loop {
+            if let Ok(mut stream) = TcpStream::connect(url) {
+                stream.write_all(request)?;
+                stream.shutdown(Shutdown::Write)?;
+                let mut response = Vec::new();
+                stream.read_to_end(&mut response)?;
+                break Ok(response);
+            }
+        }
     }
 
     pub async fn send(resolver: &mut Resolver, recipient: &Name, request: Request) -> Result<Response, Error> {

@@ -6,7 +6,7 @@ use crate::{Purser, Request, Response, Error};
 use std::collections::BTreeMap;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
-pub struct Channel{
+pub struct Channel {
     //pub servers: Vec<Name>,
     pub key: SecretKey,
     pub index: u64,
@@ -62,6 +62,11 @@ impl Channel {
     }
 }
 
+//Fire and confirm but forget
+//Send and get timestamp back
+//
+//Send at an index and confirm data matches and get timestamp back
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -85,3 +90,4 @@ mod test {
         assert_eq!(channel.send(None).await, Ok(Some(Some(msg_b))));//Channel read message successfuly
     }
 }
+
