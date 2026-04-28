@@ -276,7 +276,7 @@ impl Manager {
             for signed in pending_instances.remove(id).unwrap().into_values() {
                 let me = signed.signer() == self.secret.name();
                 //After getting location follow it to pull the contract instance
-                let location = serde_json::from_slice::<Signed<Location>>(&signed.into_inner()).ok().filter(|_| me).unwrap().into_inner();//?;
+                let location = serde_json::from_slice::<Location>(&signed.into_inner()).ok().filter(|_| me).unwrap();//?;
                 let instance = location.read(&self.contracts).await.unwrap().unwrap();
                 instances.entry(instance.0).or_insert((location, instance));
             }
