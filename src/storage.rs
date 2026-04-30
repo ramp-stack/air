@@ -1,6 +1,5 @@
 use std::hash::Hash;
 use std::fmt::Debug;
-use std::collections::BTreeMap;
 
 use crate::names::{now, Signed, secp256k1::{Signed as KeySigned, PublicKey}, Id, Secret, Resolver, Name};
 

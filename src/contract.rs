@@ -19,7 +19,6 @@ pub enum Error {
 impl std::error::Error for Error {}
 impl std::fmt::Display for Error {fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {write!(f, "{self:?}")}}
 
-
 pub trait Reactant: Serialize + for<'a> Deserialize<'a> {
     type Contract: Contract;
     type Error: std::error::Error;
@@ -73,8 +72,6 @@ impl Reactants {
         self.0.iter().position(|r| r.1 == id)
     }
 }
-
-
 
 enum _Request {
     Create(Location, Vec<u8>),
@@ -190,7 +187,9 @@ impl Manager {
     }
 
     pub fn init(&mut self, contracts: Contracts) {
-        contracts.0.keys().for_each(|id| {self.channels.entry(*id).or_insert((Channel::from(self.secret.derive(&[Id::hash("contracts"), *id]).harden()), BTreeMap::new()));});
+        let mut channels = BTreeMap::new();
+        contracts.0.keys().for_each(|id| {channels.insert(*id, self.channels.remove(id).unwrap_or((Channel::from(self.secret.derive(&[Id::hash("contracts"), *id]).harden()), BTreeMap::new())));});
+        self.channels = channels;
         self.contracts = contracts;
     }
 
@@ -275,8 +274,8 @@ impl Manager {
                     let signer = signed.signer();
                     let (path, index, event) = serde_json::from_slice::<(PathBuf, usize, Vec<u8>)>(&signed.into_inner()).unwrap();
                     let mut substance = instance.2.clone();
-                    if let Some(reactants) = &self.contracts.0.get(id).and_then(|c| c.1.get(&path))
-                    && reactants.call(index, &event, &path, &signer, t, &mut substance) {
+                    let reactants = &self.contracts.0.get(id).and_then(|c| c.1.get(&path)).unwrap();
+                    if reactants.call(index, &event, &path, &signer, t, &mut substance) {
                         instance.2 = substance;
                     } else {panic!("p");}
                 });
