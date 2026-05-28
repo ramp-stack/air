@@ -1,47 +1,42 @@
 use secp256k1::schnorr::Signature as SchnorrSignature;
 use secp256k1::{Keypair, SECP256K1};
-use secp256k1::ellswift::{Party, ElligatorSwift};
+use secp256k1::ellswift::ElligatorSwift;
 
-use chacha20_poly1305::{ChaCha20Poly1305, Nonce, Key as ChaChaKey};
 use serde::{Serialize, Deserialize};
 use serde::ser::Serializer;
 use serde::de::Deserializer;
 
-use super::{AirHash, Error, Id};
+use super::{TAG, Error, Id};
 
 use std::hash::{Hasher, Hash};
-use std::ops::Deref;
 use std::fmt::Debug;
 
-pub use secp256k1::rand;
-pub(crate) use secp256k1::Error as E;
+use super::fschacha20poly1305::FSChaCha20Poly1305;
 
-const DATA: &str = "easy_secp256k1_ellswift_xonly_ecdh";
+pub(crate) use secp256k1::rand;
+use secp256k1::ellswift::Party;
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Signature(SchnorrSignature);
+impl Signature {
+    pub fn new(key: &SecretKey, id: Id) -> Self {
+        let keypair = Keypair::from_secret_key(SECP256K1, &key.0);
+        Signature(SECP256K1.sign_schnorr(id.as_ref(), &keypair))
+    }
+
+    pub fn verify(&self, key: &PublicKey, id: Id) -> Result<(), Error> {
+        self.0.verify(id.as_ref(), &key.0.x_only_public_key().0).map_err(|_| Error::ValidationFailed)
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd, Hash)]
 pub struct PublicKey(secp256k1::PublicKey);
 impl PublicKey {
-    pub fn verify(&self, signature: &Signature, payload: &[u8]) -> Result<(), Error> {
-        Ok(signature.0.verify(
-            AirHash::hash(payload).as_ref(),
-            &self.0.x_only_public_key().0
-        )?)
-    }
-
-    pub fn encrypt(&self, mut payload: Vec<u8>) -> Vec<u8> {
-        let secret = SecretKey::new();
-        let mine = ElligatorSwift::from_pubkey(secret.public_key().0);
-        let theirs = ElligatorSwift::from_pubkey(self.0);
-        let ecdh_sk = ElligatorSwift::shared_secret(mine, theirs, secret.0, Party::Initiator, Some(DATA.as_bytes()));
-        let key = ChaChaKey::new(ecdh_sk.to_secret_bytes());
-        [
-            mine.to_array().to_vec(),
-            ChaCha20Poly1305::new(key, Nonce::new([0; 12])).encrypt(&mut payload, None).to_vec(),
-            payload
-        ].concat()
+    pub fn verify(&self, signature: &Signature, id: Id) -> Result<(), Error> {signature.verify(self, id)}
+    pub fn encrypt(&self, data: Vec<u8>) -> Encrypted {
+        let (mut stream, init) = EncryptionStream::new(self);
+        let message = stream.encrypt(data);
+        Encrypted(init, message)
     }
 }
 
@@ -51,8 +46,8 @@ impl std::fmt::Display for PublicKey {
 
 impl std::str::FromStr for PublicKey {
     type Err = Error;
-    fn from_str(s: &str) -> Result<PublicKey, Error> {
-        Ok(PublicKey(secp256k1::PublicKey::from_str(s)?))
+    fn from_str(s: &str) -> Result<PublicKey, Self::Err> {
+        Ok(PublicKey(secp256k1::PublicKey::from_str(s).map_err(|_| Error::InvalidPublicKey)?))
     }
 }
 
@@ -62,34 +57,18 @@ impl SecretKey {
     pub fn new() -> Self {
         SecretKey(secp256k1::SecretKey::new(&mut secp256k1::rand::rng()))
     }
-    pub fn public_key(&self) -> PublicKey {
-        PublicKey(self.0.public_key(SECP256K1))
-    }
-
-    pub fn sign(&self, payload: &[u8]) -> Signature {
-        let keypair = Keypair::from_secret_key(SECP256K1, &self.0);
-        Signature(SECP256K1.sign_schnorr(AirHash::hash(payload).as_ref(), &keypair))
-    }
-
-    pub fn decrypt(&self, payload: &[u8]) -> Result<Vec<u8>, Error> {
-        if payload.len() < 64+16 {return Err(Error::InvalidMessage);}
-        let theirs = ElligatorSwift::from_array(payload[0..64].try_into().or(Err(Error::InvalidMessage))?);
-        let tag: [u8; 16] = payload[64..64+16].try_into().or(Err(Error::InvalidMessage))?;
-        let mut payload = payload[64+16..].to_vec();
-
-        let mine = ElligatorSwift::from_pubkey(self.public_key().0);
-        let ecdh_sk = ElligatorSwift::shared_secret(theirs, mine, self.0, Party::Responder, Some(DATA.as_bytes()));
-        let key = ChaChaKey::new(ecdh_sk.to_secret_bytes());
-
-        ChaCha20Poly1305::new(key, Nonce::new([0; 12])).decrypt(&mut payload, tag, None).map_err(|_| Error::InvalidMessage)?;
-        Ok(payload)
+    pub fn public_key(&self) -> PublicKey {PublicKey(self.0.public_key(SECP256K1))}
+    pub fn sign(&self, id: Id) -> Signature {Signature::new(self, id)}
+    pub fn decrypt(&self, encrypted: Encrypted) -> Result<Vec<u8>, Error> {
+        let mut stream = EncryptionStream::receive(self, encrypted.0);
+        stream.decrypt(encrypted.1)
     }
 
     pub fn derive(&self, path: &[Id]) -> Self {
         let mut key = self.0;
         for id in path {
             key = secp256k1::SecretKey::from_byte_array(
-                *AirHash::hash(&[&key.secret_bytes() as &[u8], id.as_ref() as &[u8]].concat()).as_ref()
+                *Id::hash(&[&key.secret_bytes() as &[u8], id.as_ref() as &[u8]].concat())
             ).unwrap();
         }
         SecretKey(key)
@@ -98,74 +77,116 @@ impl SecretKey {
 impl Hash for SecretKey {fn hash<H: Hasher>(&self, state: &mut H) {state.write(&self.0.secret_bytes());}}
 impl Default for SecretKey {fn default() -> Self {Self::new()}}
 
-#[derive(Debug, Hash, PartialEq, Eq)]
-pub struct Signed<H: Hash + Debug>{
-    signer: PublicKey,
-    signature: Signature,
-    signed: H
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Encrypted(Init, Message);
+
+///The inital data required for decryption
+#[derive(Clone, Debug)]
+pub struct Init(ElligatorSwift);
+//  impl Init {
+//      fn to_array(&self) -> [u8; 64] {self.0.to_array()}
+//      fn from_array(array: [u8; 64]) -> Self {Self(ElligatorSwift::from_array(array))}
+//  }
+impl Serialize for Init {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {s.serialize_bytes(&self.0.to_array())}
 }
-impl<H: Hash + Debug> Signed<H> {
-    pub fn new(signer: &SecretKey, payload: H) -> Self {
-        let bytes = super::HashReader::read(&payload);
-        Signed{signer: signer.public_key(), signature: signer.sign(&bytes), signed: payload}
+
+impl<'de> Deserialize<'de> for Init {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {<&[u8]>::deserialize(d).and_then(|b| {
+        Ok(Self(ElligatorSwift::from_array(b.try_into().map_err(|_| serde::de::Error::invalid_length(64, &"Expected a 64 byte array"))?)))
+    })}
+}
+
+#[derive(Debug, Hash, PartialEq, Eq)]
+pub struct Signed<I: Hash + Debug>{
+    pub key: PublicKey,
+    pub signature: Signature,
+    pub payload: I
+}
+impl<I: Hash + Debug> Signed<I> {
+    pub fn new(signer: &SecretKey, payload: I) -> Self {
+        Signed{key: signer.public_key(), signature: signer.sign(Id::hash(&payload)), payload}
     }
 
-    pub fn verify(&self, signer: Option<PublicKey>) -> Result<PublicKey, Error> {
-        if let Some(signer) = signer && signer != self.signer {Err(Error::InvalidSignature)?}
-        self.signer.verify(&self.signature, &super::HashReader::read(&self.signed))?;
-        Ok(self.signer)
-    }
-    pub fn signer(&self) -> PublicKey {self.signer}
-    pub fn into_inner(self) -> H {self.signed}
-}
-impl<H: Hash + Debug> Deref for Signed<H> {
-    type Target = H;
-    fn deref(&self) -> &H {&self.signed}
+    pub fn verify(&self) -> Result<(), Error> {self.signature.verify(&self.key, Id::hash(&self.payload))}
 }
 impl<H: Hash + Debug + Clone> Clone for Signed<H> {
-    fn clone(&self) -> Self {Signed{
-        signer: self.signer, signature: self.signature.clone(), signed: self.signed.clone()
-    }}
+    fn clone(&self) -> Self {Signed{key: self.key, signature: self.signature, payload: self.payload.clone()}}
 }
 impl<H: Hash + Debug + Serialize> Serialize for Signed<H> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        (&self.signer, &self.signature, &self.signed).serialize(serializer)
+        (&self.key, &self.signature, &self.payload).serialize(serializer)
     }
 }
 impl<'de, H: Hash + Debug + Deserialize<'de>> Deserialize<'de> for Signed<H> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        <(PublicKey, Signature, H)>::deserialize(deserializer).map(|(signer, signature, signed)|
-            Signed{signer, signature, signed}
-        )
+        <(PublicKey, Signature, H)>::deserialize(deserializer).map(|(key, signature, payload)| Signed{key, signature, payload})
     }
 }
-impl<H: Hash + Debug> AsRef<H> for Signed<H> {fn as_ref(&self) -> &H {&self.signed}}
+impl<H: Hash + Debug> AsRef<H> for Signed<H> {fn as_ref(&self) -> &H {&self.payload}}
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
-pub enum Key {Secret(SecretKey), Public(PublicKey)}
-impl Hash for Key {fn hash<H: Hasher>(&self, state: &mut H) {self.public_key().hash(state);}}
-impl PartialEq for Key {fn eq(&self, other: &Self) -> bool {self.public_key() == other.public_key()}}
-impl Eq for Key {}
-impl Key {
-    pub fn public_key(&self) -> PublicKey {match self {
-        Key::Secret(key) => key.public_key(),
-        Key::Public(key) => *key
-    }}
-    pub fn secret_key(&self) -> Option<SecretKey> {match self {
-        Key::Secret(key) => Some(*key),
-        Key::Public(_) => None 
-    }}
-    pub fn merge(self, other: Self) -> Option<Self> {
-        if self != other {return None;} 
-        Some(self.secret_key().or(other.secret_key()).map(Key::Secret).unwrap_or(self))
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Message([u8; 16], Vec<u8>);
+
+pub struct Sink(FSChaCha20Poly1305);
+impl Sink {
+    pub fn encrypt(&mut self, mut data: Vec<u8>) -> Message {
+        let tag = self.0.encrypt(&[], &mut data);
+        Message(tag, data)
     }
+}
+
+pub struct Drain(FSChaCha20Poly1305);
+impl Drain {
+    pub fn decrypt(&mut self, mut message: Message) -> Result<Vec<u8>, Error> {
+        self.0.decrypt(&[], &mut message.1, message.0).map_err(|_| Error::DecryptionFailed)?;
+        Ok(message.1)
+    }
+}
+
+//I can use the FsChaCha for length encryption like in BIP324 if needed
+pub struct EncryptionStream(Sink, Drain);
+impl EncryptionStream {
+    pub fn new(recipient: &PublicKey) -> (Self, Init) {
+        let key = SecretKey::new();
+        let mine = ElligatorSwift::from_pubkey(key.public_key().0);
+        let theirs = ElligatorSwift::from_pubkey(recipient.0);
+        let ecdh_sk = ElligatorSwift::shared_secret(mine, theirs, key.0, Party::Initiator, Some(TAG.as_bytes()));
+        let shared = SecretKey(secp256k1::SecretKey::from_byte_array(ecdh_sk.to_secret_bytes()).unwrap());
+
+        let sender = FSChaCha20Poly1305::new(shared.derive(&[Id::MAX]).0.secret_bytes());
+        let receiver = FSChaCha20Poly1305::new(shared.derive(&[Id::MIN]).0.secret_bytes());
+        (Self(Sink(sender), Drain(receiver)), Init(mine))
+    }
+
+    pub fn receive(secret: &SecretKey, init: Init) -> Self {
+        let mine = ElligatorSwift::from_pubkey(secret.public_key().0);
+        let ecdh_sk = ElligatorSwift::shared_secret(init.0, mine, secret.0, Party::Responder, Some(TAG.as_bytes()));
+        let shared = SecretKey(secp256k1::SecretKey::from_byte_array(ecdh_sk.to_secret_bytes()).unwrap());
+
+        let receiver = FSChaCha20Poly1305::new(shared.derive(&[Id::MAX]).0.secret_bytes());
+        let sender = FSChaCha20Poly1305::new(shared.derive(&[Id::MIN]).0.secret_bytes());
+        Self(Sink(sender), Drain(receiver))
+    }
+
+    pub fn encrypt(&mut self, data: Vec<u8>) -> Message {
+        self.0.encrypt(data)
+    }
+
+    pub fn decrypt(&mut self, message: Message) -> Result<Vec<u8>, Error> {
+        self.1.decrypt(message)
+    }
+    
+    pub fn split(self) -> (Sink, Drain) {(self.0, self.1)}
 }
 
 #[test]
 fn signature() {
+    let id = Id::hash(b"hello");
     let signer = SecretKey::new();
-    let signed = Signed::new(&signer, b"my message");
-    signed.verify(Some(signer.public_key())).unwrap();
+    let signed = Signature::new(&signer, id);
+    signed.verify(&signer.public_key(), id).unwrap();
 }
 
 #[test]
@@ -176,5 +197,30 @@ fn encryption() {
     let message = b"my message".to_vec();
     let payload = public_key.encrypt(message.clone());
 
-    assert_eq!(message, secret_key.decrypt(&payload).unwrap());
+    assert_eq!(message, secret_key.decrypt(payload).unwrap());
+}
+
+#[test]
+fn stream() {
+    let remote = SecretKey::new();
+    let rpub = remote.public_key();
+    let (mut stream, init) = EncryptionStream::new(&rpub);
+
+    let msg0 = b"hello".to_vec();
+    let msg1 = b"I am trying to talk to you".to_vec();
+    let msg2 = b"Sorry just saw these messages".to_vec();
+    let msg3 = b"I also just don't want to talk to you...".to_vec();
+
+    let mut receiver_stream = EncryptionStream::receive(&remote, init);
+
+    let message0 = stream.encrypt(msg0.clone());
+    let message1 = stream.encrypt(msg1.clone());
+    assert_eq!(receiver_stream.decrypt(message0), Ok(msg0));
+    assert_eq!(receiver_stream.decrypt(message1), Ok(msg1));
+
+    let message2 = receiver_stream.encrypt(msg2.clone());
+    assert_eq!(stream.decrypt(message2), Ok(msg2));
+
+    let message3 = receiver_stream.encrypt(msg3.clone());
+    assert_eq!(stream.decrypt(message3), Ok(msg3));
 }

@@ -1,4 +1,4 @@
-use crate::names::{Secret, EncryptionStream, Init};
+use crate::names::{Secret, EncryptionStream};
 use crate::storage::{Storage, Request, Response};
 
 use futures_util::{StreamExt, SinkExt};
@@ -14,7 +14,6 @@ use tungstenite::protocol::Message;
 use tungstenite::http::StatusCode;
 
 use futures_util::stream::{SplitStream, FuturesUnordered};
-use futures_util::Stream;
 use std::pin::Pin;
 
 use tokio_tungstenite::{connect_async, MaybeTlsStream};
@@ -63,7 +62,8 @@ impl Purser {
         while let Ok((name, responder)) = rx.recv().await {
             //TODO: Do timeout based cleanup after a connection isnt used
             //open_connections.retain(|_, c| c.0.get_tx_count() > 1);
-            let identity = resolver.resolve(&name).await.unwrap();
+            let identity = resolver.resolve(name, None).await;
+
             let result = match open_connections.entry(name) {
                 Entry::Occupied(occupied) => Ok(occupied.get().clone()),
                 Entry::Vacant(vacant) => {
@@ -113,9 +113,9 @@ impl Purser {
                 Some(ws_result) = read.next() => {
                     //TODO: Again be more resilant to bad connections
                     match ws_result.unwrap() {
-                        Message::Binary(payload) if payload.len() > 20 => {
+                        Message::Binary(payload) => {
                             let (index, response): (u64, Response) = postcard::from_bytes(&drain.decrypt(postcard::from_bytes(&payload).unwrap()).unwrap()).unwrap();
-                            pending.remove(&(index as usize)).unwrap().send(response).await.unwrap();
+                            let _ = pending.remove(&(index as usize)).unwrap().send(response).await;
                         },
                         m => panic!("Unexpected Message: {m:?}")
                     }
@@ -134,11 +134,12 @@ pub struct Chandler {
 
 impl Chandler {
     pub async fn start(secret: Secret) {
-        let storage = Storage::start(secret.clone());
+        let storage = Storage::start(&secret);
         let chandler = Chandler{storage, secret};
 
         let listener = TcpListener::bind("0.0.0.0:5702").await.unwrap();
         while let Ok((stream, _)) = listener.accept().await {
+            println!("new stream");
             spawn(chandler.clone().upgrade(stream));
         }
     }
@@ -167,7 +168,7 @@ impl Chandler {
 
     //Each Socket needs to handle request sequentially, paralization could be used to prepare
     //decrypted/deserialized responses for the read/write step
-    async fn socket(&mut self, mut stream: WebSocketStream<TcpStream>, encryption: EncryptionStream) {
+    async fn socket(&mut self, stream: WebSocketStream<TcpStream>, encryption: EncryptionStream) {
         let (mut write, mut read) = stream.split();
         let (mut sink, mut drain) = encryption.split();
         let mut index: usize = 0;
@@ -177,23 +178,94 @@ impl Chandler {
             tokio::select! {
                 biased;
                 Some(Ok((index, response))) = futures.next() => {
-                    write.send(Message::Binary(postcard::to_allocvec(&sink.encrypt(postcard::to_allocvec(&(index, response)).unwrap())).unwrap().into())).await.unwrap();
+                    println!("response");
+                    let _ = write.send(Message::Binary(postcard::to_allocvec(&sink.encrypt(postcard::to_allocvec(&(index, response)).unwrap())).unwrap().into())).await;
                 },
                 Some(ws_result) = read.next() => {
                     match ws_result {
-                        Ok(Message::Binary(payload)) => {
-                            println!("request");
-                            let request = postcard::from_bytes(&drain.decrypt(postcard::from_bytes(&payload).unwrap()).unwrap()).unwrap();
-                            let (stx, srx): (_, AsyncRx<_>) = spsc::build(spsc::One::new());
-                            self.storage.0.send((request, stx)).await.unwrap();
-                            futures.push(Box::pin(async move {srx.recv().await.map(|r| (index, r))}) as _);
-                            index += 1;
+                        Ok(message) => match message {
+                            Message::Binary(payload) => {
+                                println!("request");
+                                let request = postcard::from_bytes(&drain.decrypt(postcard::from_bytes(&payload).unwrap()).unwrap()).unwrap();
+                                let srx = self.storage.request(request).await;
+                                futures.push(Box::pin(async move {srx.recv().await.map(|r| (index, r))}) as _);
+                                index += 1;
+                            },
+                            Message::Close(_) => {
+                                println!("Client disconnected");
+                                break;
+                            },
+                            e => {println!("Ignored Request: {e:?}");}
                         },
-                        e => {println!("Invalid Request: {e:?}");}
+                        Err(e) => {
+                            println!("Client Errored: {:?}", e);
+                            break;
+                        },
                     }
                 },
-                else => {}
+                else => {println!("unknown");}
             }
         }
     }
+}
+
+#[cfg(test)]
+mod test {
+  //use super::*;
+  //use crate::storage::{Request, Response, Compare, Metadata};
+  //use crate::names::{Name, secp256k1::{SecretKey, Signed as KeySigned}, Resolver, Id, Signed, Secret};
+
+  //fn metadata(response: Response) -> Option<(Id, usize)> {
+  //    match response {
+  //        Response::Receipt(m) => Some((m.as_ref().hash, m.as_ref().len)),
+  //        _ => None,
+  //    }
+  //}
+
+  //fn private(response: Response) -> Option<Vec<u8>> {
+  //    match response {
+  //        Response::Private(_, p) => Some(p.into_inner()),
+  //        _ => None,
+  //    }
+  //}
+
+  //fn inbox(response: Response) -> Option<Vec<Vec<u8>>> {
+  //    match response {
+  //        Response::Inbox(i) => Some(i.into_iter().map(|(_, p)| p).collect()),
+  //        _ => None,
+  //    }
+  //}
+
+  //#[tokio::test]
+  //async fn test_private() {
+  //    let purser = Purser::start(Resolver);
+  //    let connection = purser.connect(Name::orange_me()).await.unwrap();
+  //    let key = SecretKey::new();
+  //    let item = KeySigned::new(&key, b"hello".to_vec());
+  //    let other = KeySigned::new(&key, b"other".to_vec());
+  //    let hash = Metadata::new(item.as_ref()).hash;
+  //    assert_eq!(metadata(connection.send(Request::Read(key.public_key(), false)).await), Some((Id::MIN, 0)));
+  //    assert_eq!(metadata(connection.send(Request::Create(item.clone(), false)).await), Some((hash, 5)));
+  //    assert_eq!(metadata(connection.send(Request::Create(other.clone(), false)).await), Some((hash, 5)));
+  //    assert_eq!(private(connection.send(Request::Create(other, true)).await), Some(item.clone().into_inner()));
+  //    assert_eq!(private(connection.send(Request::Read(key.public_key(), true)).await), Some(item.clone().into_inner()));
+  //    assert_eq!(metadata(connection.send(Request::Read(key.public_key(), false)).await), Some((hash, 5)));
+  //    assert_eq!(metadata(connection.send(Request::Create(KeySigned::new(&key, b"goodbye".to_vec()), false)).await), Some((hash, 5)));
+  //}
+
+  //#[tokio::test]
+  //async fn test_inbox() {
+  //    let purser = Purser::start(Resolver);
+  //    let connection = purser.connect(Name::orange_me()).await.unwrap();
+  //    let secret = Secret::new();
+  //    let name = secret.name();
+  //    let item = b"hello bob".to_vec();
+  //    let hash = Id::hash(&item);
+  //    let time = (Compare::GreaterOrEqual, 0);
+  //    assert_eq!(inbox(connection.send(Request::Receive(Signed::new(&secret, time).unwrap())).await), Some(vec![]));
+  //    assert_eq!(metadata(connection.send(Request::Send(name, item.clone())).await), Some((hash, 9)));
+  //    assert_eq!(inbox(connection.send(Request::Receive(Signed::new(&secret, time).unwrap())).await), Some(vec![item.clone()]));
+  //    assert_eq!(metadata(connection.send(Request::Send(name, item.clone())).await), Some((hash, 9)));
+  //    assert_eq!(inbox(connection.send(Request::Receive(Signed::new(&secret, time).unwrap())).await), Some(vec![item.clone(), item]));
+  //}
 }

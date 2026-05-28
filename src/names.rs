@@ -5,47 +5,36 @@ use serde::{Serialize, Deserialize};
 use serde::ser::Serializer;
 use serde::de::Deserializer;
 
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::hash::Hash;
 use std::fmt::Debug;
 
+mod fschacha20poly1305;
 pub mod secp256k1;
 
+pub use secp256k1::{Sink, Drain, Message};
+
+const TAG: &str = "AIR_NAMES";
 const ORANGEME_NAME: &str = "03273e58dff6f2e5334c526b0dd0100d20e1ac4bfa22dfd904725eef63931e4853";
-const ORANGEME_URL: &str = if cfg!(test) {"0.0.0.0:5702"} else {"air.orange.me:5702"};
+const ORANGEME_URL: &str = if cfg!(test) {"ws://0.0.0.0:5702"} else {"ws://air.orange.me:5702"};
 
-pub fn now() -> u64 {chrono::Utc::now().timestamp_millis() as u64}
+pub fn now() -> u64 {chrono::Utc::now().timestamp_nanos_opt().unwrap() as u64}
 
-#[derive(Debug)]
+///30 minutes
+pub const TIMEOUT: u64 = 60_000_000_000;
+
+#[derive(Debug, PartialEq)]
 pub enum Error {
-    Secp256k1(secp256k1::E),
-    InvalidMessage,
+    ///This occures if an Identity has not been refreshed in the last TIMEOUT nano seconds
+    InvalidPublicKey,
+    IdentityExpired,
     MissingPermissions(Vec<Id>),
-    InvalidSignature
+    ValidationFailed,
+    DecryptionFailed 
 }
 impl std::error::Error for Error {}
 impl std::fmt::Display for Error {fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {write!(f, "{self:?}")}}
-impl From<secp256k1::E> for Error {fn from(e: secp256k1::E) -> Self {Error::Secp256k1(e)}}
-
-struct AirTag;
-impl Tag for AirTag {
-    const MIDSTATE: Midstate = Midstate::hash_tag(b"AIR_NAMES");
-}
-type AirHash = sha256t::Hash<AirTag>;
-
-#[derive(Default)]
-pub struct HashReader(Vec<u8>);
-impl core::hash::Hasher for HashReader {
-    fn finish(&self) -> u64 {panic!("NOOP");}
-    fn write(&mut self, bytes: &[u8]) {self.0.extend(bytes);}
-}
-impl HashReader {
-    pub fn read<H: Hash + ?Sized>(h: &H) -> Vec<u8> {
-        let mut hasher = HashReader::default();
-        h.hash(&mut hasher);
-        hasher.0
-    }
-}
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Copy)]
 #[derive(serde_with::SerializeDisplay)]
@@ -55,6 +44,7 @@ impl AsRef<[u8]> for Id {fn as_ref(&self) -> &[u8] {&self.0}}
 impl std::ops::Deref for Id {type Target = [u8; 32]; fn deref(&self) -> &Self::Target {&self.0}}
 impl std::ops::DerefMut for Id {fn deref_mut(&mut self) -> &mut Self::Target {&mut self.0}}
 impl From<[u8; 32]> for Id {fn from(id: [u8; 32]) -> Self {Id(id)}}
+impl From<Id> for [u8; 32] {fn from(val: Id) -> Self {val.0}}
 impl From<u64> for Id {fn from(id: u64) -> Self {
     let mut arr = [0u8; 32];
     arr[0..8].copy_from_slice(&id.to_le_bytes());
@@ -85,9 +75,7 @@ impl std::str::FromStr for Id {
     }
 }
 
-#[derive(Clone, Copy, Debug, Hash, Ord, Eq, PartialOrd, PartialEq)]
-#[derive(serde_with::SerializeDisplay)]
-#[derive(serde_with::DeserializeFromStr)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Hash, Ord, Eq, PartialOrd, PartialEq)]
 pub struct Name(secp256k1::PublicKey);
 impl Name {
     pub fn orange_me() -> Name {Name::from_str(ORANGEME_NAME).unwrap()}
@@ -108,25 +96,17 @@ impl std::str::FromStr for Name {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Secret {
     name: Name,
-    path: Vec<Id>,
     temporary: secp256k1::SecretKey,
+    path: Vec<Id>,
 }
 impl Secret {
+    pub fn name(&self) -> Name {self.name}
+    pub fn path(&self) -> &Vec<Id> {&self.path}
+    pub fn harden(&self) -> secp256k1::SecretKey {self.temporary.derive(&self.path)}
+
     pub fn new() -> Self {
         let temporary = secp256k1::SecretKey::new();
         Secret{name: Name(temporary.public_key()), path: vec![], temporary}
-    }
-    pub fn harden(&self) -> secp256k1::SecretKey {self.temporary.derive(&self.path)}
-    pub fn name(&self) -> Name {self.name}
-    pub fn path(&self) -> &Vec<Id> {&self.path}
-    pub fn public(&self) -> Public {Public(self.temporary.public_key())}
-    pub fn sign(&self, payload: &[u8]) -> Result<Signature, Error> {
-        Ok(Signature(self.temporary.sign(payload)))
-    }
-
-    pub fn decrypt(&self, _timestamp: Option<u64>, path: &[Id], payload: &[u8]) -> Result<Vec<u8>, Error> {
-        let _path = path.strip_prefix(self.path.as_slice()).ok_or(Error::MissingPermissions(path.to_vec()))?;
-        self.temporary.decrypt(payload)
     }
 
     pub fn derive(&self, path: &[Id]) -> Self {
@@ -136,143 +116,184 @@ impl Secret {
             temporary: self.temporary
         }
     }
+
+    pub fn sign(&self, id: Id) -> Signature {Signature::new(self, id)}
+    pub fn decrypt(&self, encrypted: Encrypted) -> Result<Vec<u8>, Error> {
+        self.temporary.decrypt(encrypted.0)
+    }
 }
 impl Default for Secret {fn default() -> Self {Self::new()}}
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Signature(secp256k1::Signature);
-
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Public(secp256k1::PublicKey);
-
-impl Public {
-    pub fn verify(&mut self, _path: &[Id], sig: &Signature, payload: &[u8]) -> Result<(), Error> {
-        self.0.verify(&sig.0, payload).map_err(|_| Error::InvalidSignature)
+impl Signature {
+    pub fn new(secret: &Secret, id: Id) -> Self {
+        Signature(secp256k1::Signature::new(&secret.temporary, Id::hash(&(id, &secret.path))))
     }
 
-    pub fn encrypt(&mut self, _path: &[Id], payload: Vec<u8>) -> Result<Vec<u8>, Error> {
-        Ok(self.0.encrypt(payload))
+    pub fn verify(&self, identity: &Identity, path: &[Id], id: Id) -> Result<(), Error> {
+        self.0.verify(&identity.name.0, Id::hash(&(id, path.to_vec())))
     }
 }
 
-#[derive(Default, Debug)]
-pub struct Resolver;
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Identity {
+    name: Name,
+    servers: Vec<Name>,
+    url: Vec<String>,
+    #[serde(flatten)]
+    data: HashMap<String, String>
+}
+
+impl Identity {
+    pub fn name(&self) -> Name {self.name}
+
+    pub fn verify(&self, path: &[Id], signature: &Signature, id: Id) -> Result<(), Error> {
+        signature.verify(self, path, id)
+    }
+
+    ///You always want to encrypt something to the identity now
+    pub fn encrypt(&self, _path: &[Id], payload: Vec<u8>) -> Encrypted {
+        Encrypted(self.name.0.encrypt(payload))
+    }
+
+    ///If an Identity has a server it means that they actively listen to missives there
+    pub fn servers(&self) -> &Vec<Name> {&self.servers}
+
+    ///If an Identity has a url it means they have a chandler running at that location
+    pub fn url(&self) -> &Vec<String> {&self.url}
+
+    pub fn get(&self, key: &str) -> Option<&String> {self.data.get(key)}
+}
+
+#[derive(Clone, Default, Debug)]
+pub struct Resolver();
 impl Resolver {
-    pub async fn verify(&mut self, name: &Name, _timestamp: Option<u64>, path: &[Id], sig: &Signature, payload: &[u8]) -> Result<(), Error> {
-        self.public(name).await?.verify(path, sig, payload)
-    }
+    pub fn start() -> Self {Resolver()}
 
-    pub async fn encrypt(&mut self, name: &Name, path: &[Id], payload: Vec<u8>) -> Result<Vec<u8>, Error> {
-        self.public(name).await?.encrypt(path, payload)
-    }
-
-    pub async fn public(&mut self, name: &Name) -> Result<Public, Error> {
-        Ok(Public(name.0))
-    }
-
-    pub async fn url(&mut self, _name: &Name) -> Result<String, Error> {
-        Ok(ORANGEME_URL.to_string())
-    }
-
-    pub async fn air_servers(&mut self, _name: &Name) -> Result<Vec<Name>, Error> {
-        Ok(vec![Name::from_str(ORANGEME_NAME).unwrap()])
+    pub async fn resolve(&mut self, name: Name, _timestamp: Option<u64>) -> Identity {
+        if name == Name::orange_me() {
+            Identity{name, url: vec![ORANGEME_URL.to_string()], servers: vec![], data: HashMap::new()}
+        } else {
+            Identity{name, url: vec![], servers: vec![Name::orange_me()], data: HashMap::new()}
+        }
     }
 }
 
 #[derive(Debug, Hash, PartialEq, Eq)]
-pub struct Signed<H: Hash + Debug>(Name, u64, Vec<Id>, Signature, H);
-impl<H: Hash + Debug> Signed<H> {
-    pub fn new(secret: &Secret, payload: H) -> Result<Self, Error> {
-        let bytes = HashReader::read(&payload);
-        Ok(Signed(secret.name, now(), secret.path().to_vec(), secret.sign(&bytes)?, payload))
+pub struct Signed<I: Hash + Debug>{
+    pub signer: Name,
+    pub signature: Signature,
+    pub payload: I
+}
+impl<I: Hash + Debug> Signed<I> {
+    pub fn new(signer: &Secret, payload: I) -> Self {
+        Signed{signer: signer.name(), signature: signer.sign(Id::hash(&payload)), payload}
     }
-    pub async fn verify(&self, resolver: &mut Resolver, signer: Option<&Name>, path: Option<&[Id]>) -> Result<Name, Error> {
-        let bytes = HashReader::read(&self.4);
-        if let Some(signer) = signer && &self.0 != signer {Err(Error::InvalidSignature)?}
-        if let Some(path) = path && self.2 != path {Err(Error::InvalidSignature)?}
-        resolver.verify(&self.0, Some(self.1), &self.2, &self.3, &bytes).await?;
-        Ok(self.0)
+
+    pub fn verify(&self, identity: &Identity, path: &[Id]) -> Result<(), Error> {
+        if identity.name() != self.signer {Err(Error::ValidationFailed)?}
+        self.signature.verify(identity, path, Id::hash(&self.payload))
     }
-    pub fn signer(&self) -> Name {self.0}
-    pub fn timestamp(&self) -> u64 {self.1}
-    pub fn path(&self) -> &[Id] {&self.2}
-    pub fn into_inner(self) -> H {self.4}
 }
 impl<H: Hash + Debug + Clone> Clone for Signed<H> {
-    fn clone(&self) -> Self {Signed(self.0, self.1, self.2.clone(), self.3.clone(), self.4.clone())}
+    fn clone(&self) -> Self {Signed{signer: self.signer, signature: self.signature.clone(), payload: self.payload.clone()}}
 }
 impl<H: Hash + Debug + Serialize> Serialize for Signed<H> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        (&self.0, &self.1, &self.2, &self.3, &self.4).serialize(serializer)
+        (&self.signer, &self.signature, &self.payload).serialize(serializer)
     }
 }
 impl<'de, H: Hash + Debug + Deserialize<'de>> Deserialize<'de> for Signed<H> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        <(Name, u64, Vec<Id>, Signature, H)>::deserialize(deserializer).map(|(a, b, c, d, e)|
-            Signed(a, b, c, d, e)
-        )
+        <(Name, Signature, H)>::deserialize(deserializer).map(|(signer, signature, payload)| Signed{signer, signature, payload})
     }
 }
-impl<H: Hash + Debug> AsRef<H> for Signed<H> {fn as_ref(&self) -> &H {&self.4}}
+impl<H: Hash + Debug> AsRef<H> for Signed<H> {fn as_ref(&self) -> &H {&self.payload}}
+
+
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Encrypted(secp256k1::Encrypted);
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Init(secp256k1::Init);//Will contain a secp256k1 key encrypted to the path of the recipient(BSL is an alt to ECDH Key Exchange)
+
+
+///Pass init to the remote party
+///Messages do not have to be received or exchanged one after the other
+///But they do have to be decrypted in the same order they were encrypted
+pub struct EncryptionStream(secp256k1::EncryptionStream);
+impl EncryptionStream {
+    pub fn new(recipient: &Identity, _path: &[Id]) -> Result<(Self, Init), Error> {
+        let (stream, init) = secp256k1::EncryptionStream::new(&recipient.name.0);
+        Ok((Self(stream), Init(init)))
+    }
+
+    //Will error if it cannot decrypt shared key.
+    pub fn receive(secret: &Secret, init: Init) -> Result<Self, Error> {
+        Ok(Self(secp256k1::EncryptionStream::receive(&secret.temporary, init.0)))
+    }
+
+    pub fn encrypt(&mut self, data: Vec<u8>) -> Message {
+        self.0.encrypt(data)
+    }
+
+    pub fn decrypt(&mut self, message: Message) -> Result<Vec<u8>, Error> {
+        self.0.decrypt(message)
+    }
+
+    pub fn split(self) -> (Sink, Drain) {self.0.split()}
+}
+
+struct AirTag;
+impl Tag for AirTag {
+    const MIDSTATE: Midstate = Midstate::hash_tag(TAG.as_bytes());
+}
+type AirHash = sha256t::Hash<AirTag>;
+
+#[derive(Default)]
+struct HashReader(Vec<u8>);
+impl core::hash::Hasher for HashReader {
+    fn finish(&self) -> u64 {panic!("NOOP");}
+    fn write(&mut self, bytes: &[u8]) {self.0.extend(bytes);}
+}
+impl HashReader {
+    pub fn read<H: Hash + ?Sized>(h: &H) -> Vec<u8> {
+        let mut hasher = HashReader::default();
+        h.hash(&mut hasher);
+        hasher.0
+    }
+}
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::future::Future;
-    use std::sync::Arc;
-    use std::task::{Context, Poll, Wake};
-    use std::thread::{self, Thread};
-    use core::pin::pin;
 
-    /// A waker that wakes up the current thread when called.
-    struct ThreadWaker(Thread);
+    #[tokio::test]
+    async fn encryption() {
+        let secret = Secret::new();
+        let name = secret.name();
+        let mut resolver = Resolver::start();
+        let identity = resolver.resolve(name, None).await;
 
-    impl Wake for ThreadWaker {
-        fn wake(self: Arc<Self>) {
-            self.0.unpark();
-        }
+        let m = b"hello".to_vec();
+        let c = identity.encrypt(&[], m.clone());
+        assert_eq!(m, secret.decrypt(c).unwrap());
     }
 
-    /// Run a future to completion on the current thread.
-    fn block_on<T>(fut: impl Future<Output = T>) -> T {
-        // Pin the future so it can be polled.
-        let mut fut = pin!(fut);
-
-        // Create a new context to be passed to the future.
-        let t = thread::current();
-        let waker = Arc::new(ThreadWaker(t)).into();
-        let mut cx = Context::from_waker(&waker);
-
-        // Run the future to completion.
-        loop {
-            match fut.as_mut().poll(&mut cx) {
-                Poll::Ready(res) => return res,
-                Poll::Pending => thread::park(),
-            }
-        }
-    }
-
-    #[test]
-    pub fn encryption() {
+    #[tokio::test]
+    async fn signature() {
         let secret = Secret::new();
         let name = secret.name();
 
+        let mut resolver = Resolver::start();
+        let identity = resolver.resolve(name, None).await;
+
+        let path = &[Id::random()];
         let id = Id::random();
-
-        let m = vec![1, 2, 3];
-        let c = block_on(Resolver.encrypt(&name, &[id], m.clone())).unwrap();
-        assert_eq!(m, secret.decrypt(None, &[id], &c).unwrap())
-    }
-
-    #[test]
-    pub fn signature() {
-        let secret = Secret::new();
-        let name = secret.name();
-
-        let id = Id::random();
-
-        let m = vec![1, 2, 3];
-        let s = secret.derive(&[id]).sign(&m).unwrap();
-        block_on(Resolver.verify(&name, None, &[id], &s, &m)).unwrap();
+        let secret = secret.derive(path);
+        let signature = secret.sign(id);
+        identity.verify(path, &signature, id).unwrap();
     }
 }

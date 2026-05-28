@@ -1,281 +1,242 @@
+use std::collections::HashMap;
 use std::hash::Hash;
 use std::fmt::Debug;
 
-use crate::names::{now, Signed, secp256k1::{Signed as KeySigned, PublicKey}, Id, Secret, Resolver, Name};
+use crate::names::{now, Name, Signature, Id, Secret, Signed, Resolver};
+use crate::names::secp256k1::{Signature as KeySignature, Signed as KeySigned, PublicKey};
 
 use serde::{Serialize, Deserialize};
-use rusqlite::{Connection, params, OptionalExtension, Error};
+use rusqlite::{Connection, params, OptionalExtension};
 
-#[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
-pub struct Metadata {
-    pub timestamp: u64,
-    pub hash: Id,
-    pub len: usize
-}
-
-impl Metadata {
-    pub fn new(payload: &[u8]) -> Metadata {
-        Metadata{
-            timestamp: now(),
-            hash: Id::hash(payload),
-            len: payload.len()
-        }
-    }
-}
-
-pub type Receipt = Signed<Metadata>;
+use crossfire::{MAsyncTx, AsyncTx, AsyncRx, mpsc, spsc};
+use tokio::spawn;
 
 pub type Time = (Compare, u64);
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq, Copy)]
 pub enum Compare {Greater, GreaterOrEqual, Equal, LesserOrEqual, Lesser}
 impl std::fmt::Display for Compare {fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {write!(f, "{}", match self {
-    Self::Greater => "<".to_string(),
+    Self::Greater => ">".to_string(),
     Self::GreaterOrEqual => ">=".to_string(),
     Self::Equal => "=".to_string(),
     Self::LesserOrEqual => "<=".to_string(),
-    Self::Lesser => ">".to_string(),
+    Self::Lesser => "<".to_string(),
 })}}
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 pub enum Request{
-    Create(KeySigned<Vec<u8>>, bool),
-    Read(PublicKey, bool),
+    Create(KeySigned<Vec<u8>>),
+    Read(PublicKey, bool),//Subscribe
 
     Send(Name, Vec<u8>),
     Receive(Signed<Time>),
-
-  //Publish(Signed<Missive>),
-  //Query(Option<Name>, Option<Id>, Option<Id>, Option<Time>, u32)
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 pub enum Response {
-    Receipt(Receipt),
-
-    Private(Receipt, KeySigned<Vec<u8>>),
-    Inbox(Vec<(Receipt, Vec<u8>)>),
-    //Query(BTreeMap<(Name, Id, Id), (Signed<Metadata>, Signed<Missive>)>),
+    Create(Signature, u64),
+    Read(Signature, u64, Option<(KeySignature, Vec<u8>)>),
+    
+    Inbox(Vec<(Signature, u64, Vec<u8>)>),
 
     InvalidRequest(String),
     InvalidSignature(String),
 }
 
-pub struct Service(pub bool);
-impl Service {
-    pub async fn process(&mut self, connection: &mut Connection, secret: &Secret, request: Request) -> Response {
-        if self.0 {
-            self.0 = false;
-            connection.execute("CREATE TABLE if not exists private(
-                discover TEXT NOT NULL UNIQUE,
-                metadata BLOB NOT NULL,
-                payload BLOB NOT NULL
-            );", []).unwrap();
-            connection.execute("CREATE TABLE if not exists public(
-                author TEXT NOT NULL,
-                contract_id TEXT NOT NULL,
-                instance_id TEXT NOT NULL,
-                timestamp INT NOT NULL,
-                metadata BLOB NOT NULL,
-                payload BLOB NOT NULL
-            );", []).unwrap();
-            connection.execute("CREATE TABLE if not exists inbox(
-                recipient TEXT NOT NULL,
-                timestamp INT NOT NULL,
-                metadata BLOB NOT NULL,
-                payload BLOB NOT NULL
-            );", []).unwrap();
+type Responder = AsyncTx<spsc::One<Response>>;
 
-        }
-        println!("request: {:?}", request);
-        let response = match request {
-            Request::Create(payload, inc) => {
-                let metadata = Signed::new(secret, Metadata::new(payload.as_ref())).unwrap();
-                match payload.verify(None) {
-                    Ok(discover) => match inc {
-                        true => {
+#[derive(Clone)]
+pub struct Storage(MAsyncTx<mpsc::List<(Request, Responder)>>);
+impl Storage {
+    pub fn start(secret: &Secret) -> Self {
+        let (tx, rx) = mpsc::build(mpsc::List::new());
+        let resolver = Resolver::start();
+        spawn(Self::run(resolver, secret.clone(), rx));
+        Storage(tx)
+    }
+
+    pub async fn request(&mut self, request: Request) -> AsyncRx<spsc::One<Response>> {
+        let (stx, srx) = spsc::build(spsc::One::new());
+        self.0.send((request, stx)).await.unwrap();
+        srx
+    }
+
+    async fn run(mut resolver: Resolver, secret: Secret, rx: AsyncRx<mpsc::List<(Request, Responder)>>) {
+        let mut subscriptions = HashMap::<PublicKey, Vec<Responder>>::new();
+        let mut subscriptions_inbox = HashMap::<Name, Vec<Responder>>::new();
+        let connection = Connection::open("STORAGE.db").unwrap();
+        connection.execute("CREATE TABLE if not exists private(
+            key TEXT NOT NULL UNIQUE,
+            key_signature BLOB NOT NULL,
+            signature BLOB NOT NULL,
+            timestamp BLOB NOT NULL,
+            payload BLOB NOT NULL
+        );", []).unwrap();
+
+        connection.execute("CREATE TABLE if not exists inbox(
+            recipient TEXT NOT NULL,
+            timestamp INT NOT NULL,
+            signature BLOB NOT NULL,
+            payload BLOB NOT NULL
+        );", []).unwrap();
+
+        while let Ok((request, responder)) = rx.recv().await {
+            println!("request: {:?}", request);
+            match request {
+                Request::Create(signed) => {
+                    let hash = Id::hash(&signed.payload);
+                    let timestamp = now();
+                    let signature = secret.sign(Id::hash(&(signed.key, timestamp, hash)));
+                    match signed.verify() {
+                        Ok(()) => {
                             let result = connection.query_row(
-                                "INSERT INTO private(discover, metadata, payload) VALUES (?1, ?2, ?3) ON CONFLICT DO UPDATE SET discover=discover RETURNING metadata, payload;",
+                                "INSERT INTO private(key, signature, timestamp, key_signature, payload)
+                                 VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT DO UPDATE SET key=?1
+                                 RETURNING signature, key_signature, timestamp, payload;",
                                 params![
-                                    discover.to_string(),
-                                    serde_json::to_vec(&metadata).unwrap(),
-                                    serde_json::to_vec(&payload).unwrap(),
+                                    postcard::to_allocvec(&signed.key).unwrap(),
+                                    postcard::to_allocvec(&signature).unwrap(),
+                                    postcard::to_allocvec(&timestamp).unwrap(),
+                                    postcard::to_allocvec(&signed.signature).unwrap(),
+                                    signed.payload
                                 ],
                                 |row| Ok((
-                                    serde_json::from_slice::<Receipt>(&row.get::<_, Vec<u8>>(0)?).unwrap(),
-                                    serde_json::from_slice::<KeySigned<Vec<u8>>>(&row.get::<_, Vec<u8>>(1)?).unwrap(),
+                                    postcard::from_bytes::<Signature>(&row.get::<_, Vec<u8>>("signature")?).unwrap(),
+                                    postcard::from_bytes::<u64>(&row.get::<_, Vec<u8>>("timestamp")?).unwrap(),
+                                    postcard::from_bytes::<KeySignature>(&row.get::<_, Vec<u8>>("key_signature")?).unwrap(),
+                                    row.get::<_, Vec<u8>>("payload")?
                                 ))
                             ).unwrap();
-                            if result.0 == metadata {Response::Receipt(metadata)} else {Response::Private(result.0, result.1)}
+                            if signature == result.0 {
+                                if let Some(responders) = subscriptions.remove(&signed.key) {
+                                    let response = Response::Read(result.0.clone(), result.1, Some((result.2, result.3)));
+                                    for responder in responders {
+                                        responder.send(response.clone()).await.unwrap();
+                                    }
+                                }
+                                responder.send(Response::Create(result.0, result.1)).await.unwrap()
+                            } else {
+                                responder.send(Response::Read(result.0, result.1, Some((result.2, result.3)))).await.unwrap()
+                            }
                         },
-                        false => {
-                            let result = connection.query_row(
-                                "INSERT INTO private(discover, metadata, payload) VALUES (?1, ?2, ?3) ON CONFLICT DO UPDATE SET discover=discover RETURNING metadata;",
-                                params![
-                                    discover.to_string(),
-                                    serde_json::to_vec(&metadata).unwrap(),
-                                    serde_json::to_vec(&payload).unwrap(),
-                                ],
-                                |row| Ok(serde_json::from_slice::<Receipt>(&row.get::<_, Vec<u8>>(0)?).unwrap())
-                            ).unwrap();
-                            if result == metadata {Response::Receipt(metadata)} else {Response::Receipt(result)}
-                        }
-                    },
-                    Err(e) => Response::InvalidSignature(e.to_string())
-                }
-            },
-            Request::Read(discover, inc) => {
-                let now = now();
-                match inc {
-                    true => connection.query_row(
-                        &format!("SELECT metadata, payload FROM private WHERE discover='{discover}'"),
-                        [], |r| Ok(Response::Private(
-                            serde_json::from_slice(&r.get::<_, Vec<u8>>(0)?).unwrap(),
-                            serde_json::from_slice(&r.get::<_, Vec<u8>>(1)?).unwrap(),
-                        ))
-                    ).optional().unwrap(),
-                    false => connection.query_row(
-                        &format!("SELECT metadata FROM private WHERE discover='{discover}'"),
-                        [], |r| Ok(Response::Receipt(serde_json::from_slice(&r.get::<_, Vec<u8>>(0)?).unwrap()))
-                    ).optional().unwrap()
-                }.unwrap_or_else(|| Response::Receipt(Signed::new(secret, Metadata{
-                    timestamp: now,
-                    hash: Id::MIN,
-                    len: 0
-                }).unwrap()))
-            },
-          //Request::Publish(missive) => {
-          //    match missive.verify(&mut Resolver, None, None).await {
-          //        Ok(author) => {
-          //            let payload = serde_json::to_vec(&missive).unwrap();
-          //            let metadata = Signed::new(secret, Metadata::new(&payload)).unwrap();
-          //            connection.execute(
-          //                "INSERT INTO public(author, contract_id, instance_id, timestamp, metadata, payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-          //                params![
-          //                    author.to_string(),
-          //                    missive.as_ref().contract_id().to_string(),
-          //                    Missive::instance_id(&missive).to_string(),
-          //                    metadata.as_ref().timestamp as isize,
-          //                    serde_json::to_vec(&metadata).unwrap(),
-          //                    payload,
-          //                ],
-          //            ).unwrap();
-          //            Response::Receipt(metadata)
-          //        },
-          //        Err(e) => Response::InvalidSignature(e.to_string())
-          //    }
-          //},
-          //Request::Query(author, contract_id, instance_id, time, limit) => {
-          //    todo!()
-          //},
-            Request::Send(recipient, payload) => {
-                let metadata = Signed::new(secret, Metadata::new(payload.as_ref())).unwrap();
-                connection.execute(
-                    "INSERT INTO inbox(recipient, timestamp, metadata, payload) VALUES (?1, ?2, ?3, ?4)",
-                    params![
-                        recipient.to_string(),
-                        metadata.as_ref().timestamp as isize,
-                        serde_json::to_vec(&metadata).unwrap(),
-                        payload,
-                    ],
-                ).unwrap();
-                Response::Receipt(metadata)
-            },
-            Request::Receive(signed) => match signed.verify(&mut Resolver, None, None).await {
-                Ok(recipient) => {
-                    let (ordering, timestamp) = signed.into_inner();
-                    Response::Inbox(connection.prepare(&format!("SELECT metadata, payload FROM inbox WHERE recipient='{recipient}' AND timestamp{ordering}'{timestamp}'")).unwrap().query_map(
-                        [], |r| Ok((
-                            serde_json::from_slice(&r.get::<_, Vec<u8>>(0)?).unwrap(),
-                            r.get::<_, Vec<u8>>(1)?,
-                        ))
-                    ).unwrap().collect::<Result<Vec<_>, Error>>().unwrap())
+                        Err(e) => responder.send(Response::InvalidSignature(e.to_string())).await.unwrap(),
+                    }
                 },
-                Err(e) => Response::InvalidSignature(e.to_string())
-            },
-        };
-        println!("response: {:?}", response);
-        response
+                Request::Read(key, subscribe) => {
+                    if let Some(read) = connection.query_row(
+                        "SELECT signature, timestamp, key_signature, payload FROM private WHERE key=?1",
+                        [postcard::to_allocvec(&key).unwrap()], |row| Ok(Response::Read(
+                            postcard::from_bytes::<Signature>(&row.get::<_, Vec<u8>>("signature")?).unwrap(),
+                            postcard::from_bytes::<u64>(&row.get::<_, Vec<u8>>("timestamp")?).unwrap(),
+                            Some((
+                                postcard::from_bytes::<KeySignature>(&row.get::<_, Vec<u8>>("key_signature")?).unwrap(),
+                                row.get::<_, Vec<u8>>("payload")?
+                            ))
+                        ))
+                    ).optional().unwrap() {
+                        responder.send(read).await.unwrap()
+                    } else {
+                        if subscribe {
+                            subscriptions.entry(key).or_default().push(responder);
+                        } else {
+                            let timestamp = now();
+                            let id = Id::hash(&timestamp);
+                            responder.send(Response::Read(secret.sign(id), timestamp, None)).await.unwrap()
+                        }
+                    }
+                },
+                Request::Send(recipient, payload) => {
+                    let timestamp = now();
+                    let signature = secret.sign(Id::hash(&(recipient, timestamp, &payload)));
+                    connection.execute(
+                        "INSERT INTO inbox(recipient, timestamp, signature, payload) VALUES (?1, ?2, ?3, ?4)",
+                        params![
+                            recipient.to_string(),
+                            timestamp as isize,
+                            serde_json::to_vec(&signature).unwrap(),
+                            payload,
+                        ],
+                    ).unwrap();
+                    responder.send(Response::Create(signature.clone(), timestamp)).await.unwrap();
+                    if let Some(responders) = subscriptions_inbox.remove(&recipient) {
+                        let response = Response::Inbox(vec![(signature, timestamp, payload)]);
+                        for responder in responders {
+                            responder.send(response.clone()).await.unwrap();
+                        }
+                    }
+                },
+                Request::Receive(signed) => {
+                    let identity = resolver.resolve(signed.signer, None).await;
+                    match signed.verify(&identity, &[]) {
+                        Ok(()) => {
+                            let recipient = signed.signer;
+                            let (ordering, timestamp) = signed.payload;
+                            let query = format!("SELECT signature, timestamp, payload FROM inbox WHERE recipient='{recipient}' AND timestamp{ordering}'{timestamp}'");
+                            let results = connection.prepare(&query).unwrap().query_map(
+                                [], |r| Ok((
+                                    serde_json::from_slice::<Signature>(&r.get::<_, Vec<u8>>(0)?).unwrap(),
+                                    r.get::<_, isize>(1)? as u64,
+                                    r.get::<_, Vec<u8>>(2)?,
+                                ))
+                            ).unwrap().collect::<Result<Vec<_>, rusqlite::Error>>().unwrap();
+                            if results.is_empty() {
+                                subscriptions_inbox.entry(signed.signer).or_default().push(responder);
+                            } else {
+                                responder.send(Response::Inbox(results)).await.unwrap();
+                            }
+                        },
+                        Err(e) => responder.send(Response::InvalidSignature(e.to_string())).await.unwrap()
+                    }
+                }
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::Purser;
-    use crate::names::{Name, secp256k1::{SecretKey}, Resolver};
-
-    async fn run(name: &Name, request: Request) -> Response {
-        Purser::send(&mut Resolver, name, request).await.unwrap()
-    }
-
-    fn metadata(response: Response) -> Option<(Id, usize)> {
-        match response {
-            Response::Receipt(m) => Some((m.as_ref().hash, m.as_ref().len)),
-            _ => None,
-        }
-    }
-
-    fn private(response: Response) -> Option<Vec<u8>> {
-        match response {
-            Response::Private(_, p) => Some(p.into_inner()),
-            _ => None,
-        }
-    }
-
-    fn inbox(response: Response) -> Option<Vec<Vec<u8>>> {
-        match response {
-            Response::Inbox(i) => Some(i.into_iter().map(|(_, p)| p).collect()),
-            _ => None,
-        }
-    }
-
-  //fn inbox(response: Response) -> Option<Vec<Vec<u8>>> {
-  //    match response {
-  //        Response::Inbox(i) => Some(i.into_iter().map(|(_, p)| p).collect()),
-  //        _ => None,
-  //    }
-  //}
-
-    
+    use crate::names::{Resolver, secp256k1::SecretKey};
 
     #[tokio::test]
-    async fn test_private() {
-        let key = SecretKey::new();
-        let item = KeySigned::new(&key, b"hello".to_vec());
-        let other = KeySigned::new(&key, b"other".to_vec());
-        let hash = Metadata::new(item.as_ref()).hash;
-        assert_eq!(metadata(run(&Name::orange_me(), Request::Read(key.public_key(), false)).await), Some((Id::MIN, 0)));
-        assert_eq!(metadata(run(&Name::orange_me(), Request::Create(item.clone(), false)).await), Some((hash, 5)));
-        assert_eq!(metadata(run(&Name::orange_me(), Request::Create(other.clone(), false)).await), Some((hash, 5)));
-        assert_eq!(private(run(&Name::orange_me(), Request::Create(other, true)).await), Some(item.clone().into_inner()));
-        assert_eq!(private(run(&Name::orange_me(), Request::Read(key.public_key(), true)).await), Some(item.clone().into_inner()));
-        assert_eq!(metadata(run(&Name::orange_me(), Request::Read(key.public_key(), false)).await), Some((hash, 5)));
-        assert_eq!(metadata(run(&Name::orange_me(), Request::Create(KeySigned::new(&key, b"goodbye".to_vec()), false)).await), Some((hash, 5)));
+    async fn create() {
+        let server = Secret::new();
+        let server_name = server.name();
+        let mut resolver = Resolver::start();
+        let identity = resolver.resolve(server_name, None).await;
+        let mut storage = Storage::start(&server);
+
+        let file_key = SecretKey::new();
+        let content = b"my file contents".to_vec();
+
+        if let Response::Create(signature, timestamp) = storage.request(Request::Create(KeySigned::new(&file_key, content.clone()))).await.recv().await.unwrap() {
+            signature.verify(&identity, &[], Id::hash(&(file_key.public_key(), timestamp, Id::hash(&content)))).unwrap();
+        } else {panic!("Unexpected Response");}
     }
 
-  //#[tokio::test]
-  //async fn test_public() {
-  //    let secret = Secret::new();
-  //    let name = secret.name();
-  //    let missive = Missive(Id::hash("Contract"), b"payload".to_vec(), SecretKey::new());
-  //    let signed = Signed::new(&secret, missive).unwrap();
-  //    let iid = Missive::instance_id(&signed);
-  //    let md = Metadata::new(&serde_json::to_vec(&signed).unwrap());
-  //    assert_eq!(metadata(run(&Name::orange_me(), Request::Publish(signed)).await), Some((md.hash, md.len)));
-  //}
-
     #[tokio::test]
-    async fn test_inbox() {
-        let secret = Secret::new();
-        let name = secret.name();
-        let item = b"hello bob".to_vec();
-        let hash = Id::hash(&item);
-        let time = (Compare::GreaterOrEqual, 0);
-        assert_eq!(inbox(run(&Name::orange_me(), Request::Receive(Signed::new(&secret, time).unwrap())).await), Some(vec![]));
-        assert_eq!(metadata(run(&Name::orange_me(), Request::Send(name, item.clone())).await), Some((hash, 9)));
-        assert_eq!(inbox(run(&Name::orange_me(), Request::Receive(Signed::new(&secret, time).unwrap())).await), Some(vec![item.clone()]));
-        assert_eq!(metadata(run(&Name::orange_me(), Request::Send(name, item.clone())).await), Some((hash, 9)));
-        assert_eq!(inbox(run(&Name::orange_me(), Request::Receive(Signed::new(&secret, time).unwrap())).await), Some(vec![item.clone(), item]));
+    async fn inbox() {
+        let server = Secret::new();
+        let server_name = server.name();
+        let mut resolver = Resolver::start();
+        let identity = resolver.resolve(server_name, None).await;
+        let mut storage = Storage::start(&server);
+
+        let bob = Secret::new();
+        let bob_name = bob.name();
+
+        let content = b"my file contents".to_vec();
+
+        let timestamp = if let Response::Create(signature, timestamp) = storage.request(Request::Send(bob_name, content.clone())).await.recv().await.unwrap() {
+            signature.verify(&identity, &[], Id::hash(&(bob_name, timestamp, &content))).unwrap();
+            timestamp
+        } else {panic!("Unexpected Response");};
+
+        let request = storage.request(Request::Receive(Signed::new(&bob, (Compare::Greater, 0)))).await;
+        if let Response::Inbox(received) = request.recv().await.unwrap() {
+            for (signature, time, content) in received {
+                signature.verify(&identity, &[], Id::hash(&(bob_name, timestamp, &content))).unwrap();
+            }
+        } else {panic!("Unexpected Response");}
     }
 }
