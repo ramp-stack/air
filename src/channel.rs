@@ -1,17 +1,19 @@
 use serde::{Serialize, Deserialize};
 
-use crate::names::{secp256k1::{Signed as KeySigned, SecretKey, Encrypted as KeyEncrypted}, Resolver, Signed, Secret, Name, Id, now};
-use crate::{Purser, Request, Response};
-
-use std::collections::BTreeMap;
+use crate::names::{secp256k1::{Signed as KeySigned, SecretKey, Encrypted as KeyEncrypted}, Encrypted, Resolver, Signed, Secret, Name, Id, now};
+use crate::storage::{Compare, Request, Response};
+use crate::contract::Location;
+use crate::server::Purser;
 
 use crossfire::{MAsyncTx, AsyncTx, AsyncRx, MTx, mpsc, spsc};
 use tokio::spawn;
 
 pub const CHANNEL: &str = "CHANNEL";
 
+pub type Data = Option<(Name, Vec<u8>)>;
+
 #[derive(Debug)]
-pub struct Stream(Channel, AsyncRx<spsc::List<(Channel, Option<(Name, Vec<u8>)>)>>);
+pub struct Stream(Channel, AsyncRx<spsc::List<(Channel, Data)>>);
 impl Stream {
     pub fn channel(&self) -> &Channel {&self.0}
     pub async fn read(&mut self) -> (u64, Option<(Name, Vec<u8>)>) {
@@ -20,16 +22,16 @@ impl Stream {
         (self.0.timestamp, data)
     }
 
-    pub async fn read_all(&mut self) -> BTreeMap<u64, (Name, Vec<u8>)> {
-        let mut results = BTreeMap::new();
-        while let Ok((channel, data)) = self.1.try_recv() {
-            self.0 = channel;
-            if let Some(data) = data {
-                results.insert(self.0.timestamp, data);
-            }
-        }
-        results
-    }
+  //pub async fn read_all(&mut self) -> BTreeMap<u64, (Name, Vec<u8>)> {
+  //    let mut results = BTreeMap::new();
+  //    while let Ok((channel, data)) = self.1.try_recv() {
+  //        self.0 = channel;
+  //        if let Some(data) = data {
+  //            results.insert(self.0.timestamp, data);
+  //        }
+  //    }
+  //    results
+  //}
 }
 
 #[derive(Clone, Debug)]
@@ -38,21 +40,6 @@ impl Sink {
     pub async fn write(&self, data: Vec<u8>) {self.0.send(data).await.unwrap()}
     pub fn write_sync(&self, data: Vec<u8>) {MTx::from(self.0.clone()).send(data).unwrap()}
 }
-
-///A Channel Handle is not Clone but the Sink returned from .split() is.
-#[derive(Debug)]
-pub struct Handle(Stream, Sink);
-impl Handle {
-    pub fn split(self) -> (Stream, Sink) {(self.0, self.1)}
-    pub fn channel(&self) -> &Channel {self.0.channel()}
-    pub async fn write(&mut self, data: Vec<u8>) {self.1.write(data).await}
-    pub async fn read(&mut self) -> (u64, Option<(Name, Vec<u8>)>) {self.0.read().await}
-    pub async fn read_all(&mut self) -> BTreeMap<u64, (Name, Vec<u8>)> {self.0.read_all().await}
-}
-
-//I need a channel type similar to a set where I read all the entries before I try to write a new
-//entry to insure at most only one instance of an item exists in the channel.
-//This would be used for storage purposes, keeping track of contracts or instances/locations.
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Copy, Debug, Default)]
 pub struct Channel {
@@ -67,7 +54,7 @@ impl Channel {
 
     ///It is assumed that the channels path is equal to the path of the secret
     ///Its up to you to ensure the secret is at the correct path for this channel
-    pub fn start(mut self, mut resolver: Resolver, purser: Purser, secret: &Secret) -> Handle {
+    pub fn start(mut self, mut resolver: Resolver, purser: Purser, secret: &Secret) -> (Stream, Sink) {
         let secret = secret.derive(&[Id::hash(CHANNEL)]);
         let (write, rx): (MAsyncTx<_>, AsyncRx<_>) = mpsc::build(mpsc::List::new());
         let (tx, read): (AsyncTx<_>, AsyncRx<_>) = spsc::build(spsc::List::new());
@@ -142,7 +129,7 @@ impl Channel {
                 }
             }
         });
-        Handle(Stream(channel, read), Sink(write))
+        (Stream(channel, read), Sink(write))
     }
 }
 
@@ -158,23 +145,77 @@ mod test {
 
         let resolver = Resolver::start();
         let purser = Purser::start(resolver.clone());
-        let mut handle = Channel::new(key).start(resolver.clone(), purser.clone(), &secret);
+        let (mut stream, sink) = Channel::new(key).start(resolver.clone(), purser.clone(), &secret);
 
         let content = b"hello".to_vec();
-        handle.write(content.clone()).await;
-        let (timestamp, data) = handle.read().await;
-        assert_eq!(handle.channel(), &Channel{key, index: 1, timestamp});
+        sink.write(content.clone()).await;
+        let (timestamp, data) = stream.read().await;
+        assert_eq!(stream.channel(), &Channel{key, index: 1, timestamp});
         assert_eq!(data, Some((name, content.clone())));
 
         let content2 = b"goodbye".to_vec();
-        handle.write(content2.clone()).await;
-        let (timestamp2, data2) = handle.read().await;
-        assert_eq!(handle.channel(), &Channel{key, index: 2, timestamp: timestamp2});
+        sink.write(content2.clone()).await;
+        let (timestamp2, data2) = stream.read().await;
+        assert_eq!(stream.channel(), &Channel{key, index: 2, timestamp: timestamp2});
         assert_eq!(data2, Some((name, content2.clone())));
+    }
+}
 
-        let mut handle = Channel::new(key).start(resolver, purser, &secret);
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        let r = handle.read_all().await;
-        assert_eq!(r, BTreeMap::from([(timestamp, (name, content)), (timestamp2, (name, content2))]));
+#[derive(Debug)]
+pub struct InboxHandler(Inbox, AsyncRx<spsc::List<(u64, Option<Location>)>>);
+impl InboxHandler {
+    pub fn inbox(&self) -> &Inbox {&self.0}
+
+    pub async fn read(&mut self) -> (u64, Option<Location>) {
+        let (time, data) = self.1.recv().await.unwrap();
+        self.0.0 = time;
+        (time, data)
+    }
+
+  //pub async fn read_all(&mut self) -> BTreeMap<u64, Location> {
+  //    let mut results = BTreeMap::new();
+  //    while let Ok((time, data)) = self.1.try_recv() {
+  //        self.0.0 = time;
+  //        if let Some(data) = data {
+  //            results.insert(time, data);
+  //        }
+  //    }
+  //    results
+  //}
+
+    pub async fn send(purser: Purser, mut resolver: Resolver, name: Name, location: Location) {
+        let identity = resolver.resolve(name, None).await;
+        let home = *identity.servers().first().unwrap();
+        let conn = purser.connect(home).await.unwrap();
+        //Verify receipet
+        conn.send(Request::Send(name, postcard::to_allocvec(&identity.encrypt(&[], postcard::to_allocvec(&location).unwrap())).unwrap())).await;
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
+pub struct Inbox(u64);
+impl Inbox {
+    pub fn start(mut self, mut resolver: Resolver, purser: Purser, secret: Secret) -> InboxHandler {
+        let (tx, rx): (AsyncTx<_>, _) = spsc::build(spsc::List::new());
+
+        spawn(async move { loop {
+            let identity = resolver.resolve(secret.name(), None).await;
+            let home = *identity.servers().first().unwrap();
+            let conn = purser.connect(home).await.unwrap();
+            match conn.send(Request::Receive(Signed::new(&secret, (Compare::Greater, self.0)))).await {
+                Response::Inbox(received) => {
+                    let home_identity = resolver.resolve(home, None).await;
+                    for (signature, timestamp, data) in received {
+                        if signature.verify(&home_identity, &[], Id::hash(&(secret.name(), timestamp, &data))).is_ok() && timestamp > self.0 {
+                            self.0 = timestamp;
+                            let data = postcard::from_bytes::<Encrypted>(&data).ok().and_then(|d| postcard::from_bytes::<Location>(&secret.decrypt(d).ok()?).ok());
+                            tx.send((timestamp, data)).await.unwrap();
+                        } else {panic!("Bad Air Server");}
+                    }
+                },
+                response => {panic!("Bad Air Server: {response:?}");}
+            }
+        }});
+        InboxHandler(self, rx)
     }
 }

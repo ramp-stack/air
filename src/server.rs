@@ -107,7 +107,6 @@ impl Purser {
             tokio::select! {
                 Ok(responder) = srx.recv() => {
                     pending.insert(index, responder);
-                    println!("responder: {index}");
                     index += 1;
                 }
                 Some(ws_result) = read.next() => {
@@ -139,13 +138,11 @@ impl Chandler {
 
         let listener = TcpListener::bind("0.0.0.0:5702").await.unwrap();
         while let Ok((stream, _)) = listener.accept().await {
-            println!("new stream");
             spawn(chandler.clone().upgrade(stream));
         }
     }
 
     async fn upgrade(mut self, stream: TcpStream) {
-        println!("handling");
         let mut public = None;
         #[allow(clippy::result_large_err)]
         match accept_hdr_async(stream, |req: &TungRequest, response: TungResponse| {
@@ -178,14 +175,12 @@ impl Chandler {
             tokio::select! {
                 biased;
                 Some(Ok((index, response))) = futures.next() => {
-                    println!("response");
                     let _ = write.send(Message::Binary(postcard::to_allocvec(&sink.encrypt(postcard::to_allocvec(&(index, response)).unwrap())).unwrap().into())).await;
                 },
                 Some(ws_result) = read.next() => {
                     match ws_result {
                         Ok(message) => match message {
                             Message::Binary(payload) => {
-                                println!("request");
                                 let request = postcard::from_bytes(&drain.decrypt(postcard::from_bytes(&payload).unwrap()).unwrap()).unwrap();
                                 let srx = self.storage.request(request).await;
                                 futures.push(Box::pin(async move {srx.recv().await.map(|r| (index, r))}) as _);

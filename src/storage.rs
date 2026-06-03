@@ -234,7 +234,7 @@ mod test {
 
         let request = storage.request(Request::Receive(Signed::new(&bob, (Compare::Greater, 0)))).await;
         if let Response::Inbox(received) = request.recv().await.unwrap() {
-            for (signature, time, content) in received {
+            for (signature, _, content) in received {
                 signature.verify(&identity, &[], Id::hash(&(bob_name, timestamp, &content))).unwrap();
             }
         } else {panic!("Unexpected Response");}

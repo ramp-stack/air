@@ -1,123 +1,105 @@
 pub mod names;
+pub use names::{Secret, Name};
 
 mod storage;
-pub use storage::{Request, Response, Compare};
 
 mod server;
-pub use server::{Chandler, Purser, Connection};
-
-mod inbox;
-pub use inbox::{Inbox, InboxHandler};
+pub use server::Chandler;
 
 mod channel;
-pub use channel::Channel;
-
-pub mod substance;
 
 pub mod contract;
-
-pub mod instance;
-
-pub mod air;
-pub use air::Air;
+pub use contract::{Contract, Reactant, Reactants, Air, Instance, Guard};
 
 #[cfg(test)]
 mod test {
-    use crate::{Purser, Air};
-    use crate::names::{Name, Id, Secret, Resolver};
-    use crate::substance::{Substance, Beaker};
-    use crate::contract::{Contract, Reactant, Contracts, Reactants};
-
+    use crate::{Air, Contract, Reactant, Reactants, Instance};
+    use crate::names::{Name, Id, Secret};
     use serde::{Serialize, Deserialize};
-
     use std::collections::BTreeMap;
-    use std::path::{PathBuf, Path};
     use std::convert::Infallible;
-
-    #[derive(Serialize, Deserialize, Hash, Clone)]
-    pub struct ChatRoom;
-    impl ChatRoom {
-        pub fn new(_name: &str) -> Self {ChatRoom}
-    }
-    impl Contract for ChatRoom {
-        fn id() -> Id {Id::hash("ChatRoom2.5")}
-
-        fn init(self, signer: &Name, _timestamp: u64) -> Substance {Substance::Map(BTreeMap::from([
-            ("name".to_string(), Substance::String("myroom".to_string())),
-            ("author".to_string(), Substance::String(signer.to_string())),
-            ("messages".to_string(), Substance::Seq(im::Vector::new()))
-        ]).into())}
-
-        fn routes() -> BTreeMap<PathBuf, Reactants> {
-            BTreeMap::from([
-                (PathBuf::from("/name"), Reactants::default().add::<ChangeName>()),
-                (PathBuf::from("/messages"), Reactants::default().add::<SendMessage>())
-            ])
-        }
+    
+    #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+    pub struct Message {
+        author: Name,
+        timestamp: u64,
+        body: String,
+        id: Id
     }
 
-    #[derive(Serialize, Deserialize)]
-    pub struct ChangeName(String);
-    impl Reactant for ChangeName {
-        type Error = Infallible;
+    #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+    pub struct Room {
+        author: Name,
+        name: String,
+        messages: BTreeMap<u64, Message>
+    }
+    impl Contract for Room {
+        type Init = String;
 
-        fn apply<B: Beaker>(self, _path: &Path, signer: &Name, _timestamp: u64, substance: &mut B) -> Result<(), Self::Error> {
-            if substance.query("/author") == Ok(Substance::String(signer.to_string())) {
-                let _ = substance.insert("/name", Substance::String(self.0));
+        fn id() -> Id {Id::hash("Room")}
+
+        fn init(init: Self::Init, signer: Name, _timestamp: u64) -> Self {
+            Room {
+                author: signer,
+                name: init, 
+                messages: BTreeMap::new()
             }
-            Ok(())
+        }
+
+        fn reactants() -> Reactants<Room> {
+            Reactants::default().add::<SendMessage>().add::<EditMessage>()
         }
     }
 
-    #[derive(Serialize, Deserialize)]
-    pub struct SendMessage(String);
-    impl Reactant for SendMessage {
-        type Error = Infallible;
+    #[allow(unused)]
+    #[derive(Debug)]
+    pub struct MessageExists(Id);
+    impl std::error::Error for MessageExists {}
+    impl std::fmt::Display for MessageExists {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {write!(f, "{:?}", self)}
+    }
 
-        fn apply<B: Beaker>(self, _path: &Path, signer: &Name, _timestamp: u64, substance: &mut B) -> Result<(), Self::Error> {
-            let _ = substance.insert("/messages/-", Substance::Map(BTreeMap::from([
-                ("author".to_string(), Substance::String(signer.to_string())),
-                ("body".to_string(), Substance::String(self.0)),
-            ]).into()));
-            Ok(())
+    #[derive(Serialize, Deserialize, Debug)]
+    pub struct SendMessage(Id, String);
+    impl Reactant<Room> for SendMessage {
+        type Ok = Id;
+        type Err = MessageExists;
+
+        fn id() -> Id {Id::hash("SendMessage")}
+
+        fn apply(self, room: &mut Room, signer: Name, timestamp: u64) -> Result<Self::Ok, Self::Err> {
+            if room.messages.values().any(|m| m.id == self.0) {Err(MessageExists(self.0))?}
+            room.messages.entry(timestamp).or_insert(Message{author: signer, timestamp, body: self.1, id: self.0});
+            Ok(self.0)
         }
     }
 
+    #[derive(Serialize, Deserialize, Debug)]
+    pub struct EditMessage(Id, String);
+    impl Reactant<Room> for EditMessage {
+        type Ok = bool;
+        type Err = Infallible;
+
+        fn id() -> Id {Id::hash("EditMessage")}
+
+        fn apply(self, room: &mut Room, _signer: Name, _timestamp: u64) -> Result<Self::Ok, Self::Err> {
+            Ok(room.messages.values_mut().find(|m| m.id == self.0).map(|m| {m.body = self.1; true}).unwrap_or_default())
+        }
+    }
 
     #[tokio::test]
     async fn test() {
-        let resolver = Resolver::start();
-        let purser = Purser::start(resolver.clone());
-        let air = Air::start(resolver.clone(), purser.clone(), Contracts::default().add::<ChatRoom>()).unwrap();
+        let air = tokio::task::spawn_blocking(|| {
+            let secret = Secret::new();
+            let air = Air::start(secret);
 
-        let friend_air = Air::start(resolver, purser, Contracts::default().add::<ChatRoom>()).unwrap();
-        let my_friend = friend_air.me();
+            let room: Instance<Room> = air.create::<Room>("MyRoom".to_string());
+            let id = room.apply(SendMessage(Id::random(), "Hi Bob".to_string())).unwrap();
+            assert!(room.apply(EditMessage(id, "GoodBye Bob".to_string())).unwrap());
+            air
+        }).await.unwrap();
 
-        let id = air.create(ChatRoom::new("my_room")).unwrap();
-        println!("SHARING");
-        air.share(id, my_friend).unwrap();
-        println!("SHARED");
-        air.send(id, "/messages", SendMessage("Hello".to_string())).unwrap();
-
-        let model = Substance::Map(BTreeMap::from([
-            ("name".to_string(), Substance::String("myroom".to_string())),
-            ("author".to_string(), Substance::String(air.me().to_string())),
-            ("messages".to_string(), Substance::Seq(vec![
-                Substance::Map(BTreeMap::from([
-                    ("author".to_string(), Substance::String(air.me().to_string())),
-                    ("body".to_string(), Substance::String("Hello".to_string())),
-                ]).into())
-            ].into()))
-        ]).into());
-
-        assert_eq!(air.get(&id).unwrap(), None);
-        assert_eq!(air.get_pending(&id).unwrap(), model.clone());
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-
-        assert_eq!(air.get(&id).unwrap(), Some(model.clone()));
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-        assert_eq!(friend_air.get(&id).unwrap(), Some(model));
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        air.list::<Room>().into_iter().for_each(|i| assert_eq!(*i.confirmed().unwrap(), *i.pending()));
     }
 }
