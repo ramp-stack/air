@@ -178,6 +178,7 @@ pub struct Context {
 }
 
 impl Context {
+    fn me(&self) -> Name {self.secret.name()}
     fn get<C: Contract>(&self, location: Location, init: Option<C::Init>) -> Instance<C> {
         let c_id = C::id();
         let id = Id::hash(&location);
