@@ -9,7 +9,7 @@ pub use server::Chandler;
 mod channel;
 
 pub mod contract;
-pub use contract::{Contract, Reactant, Reactants, Air, Instance, Guard};
+pub use contract::{Contract, Reactant, Reactants, Air, Instance, Guard, Context};
 
 #[cfg(test)]
 mod test {

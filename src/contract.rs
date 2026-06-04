@@ -168,6 +168,7 @@ impl<C: Contract> Instance<C> {
     }
 }
 
+#[derive(Clone)]
 pub struct Context {
     secret: Secret,
     instances: ArcLock<BTreeMap<Id, BTreeMap<Id, AnyInstance>>>,
