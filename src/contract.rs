@@ -16,7 +16,8 @@ use serde::{Serialize, Deserialize};
 
 use crossfire::{MAsyncTx, AsyncRx, mpsc};
 use tokio::spawn;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::{watch, broadcast};
 
 use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
@@ -31,8 +32,9 @@ enum Request {
 }
 
 type PBFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+type GetUpdate = Box<dyn Fn(Id) -> Option<Box<dyn Any>> + Send + Sync>;
 type AnyInstance = Arc<Box<dyn Any + Send + Sync>>;
-type ReactantApply<C> = Box<dyn Fn(&[u8], &mut C, Name, u64) -> bool + Sync + Send>;
+type ReactantApply<C> = Box<dyn Fn(&[u8], &mut C, Name, u64) -> Option<Update> + Sync + Send>;
 type SerializedReactant = (Id, Vec<u8>);
 
 pub trait Contract: Serialize + for<'a> Deserialize<'a> + Send + Sync + Clone + std::fmt::Debug + 'static {
@@ -45,7 +47,7 @@ pub trait Contract: Serialize + for<'a> Deserialize<'a> + Send + Sync + Clone + 
 }
 
 pub trait Reactant<C: Contract>: Serialize + for<'a> Deserialize<'a> + std::fmt::Debug + 'static {
-    type Ok;
+    type Ok: 'static + Sync + Send + Clone;
     type Err: std::error::Error;
 
     fn id() -> Id;
@@ -61,6 +63,16 @@ impl<'a, C> std::ops::Deref for Guard<'a, C> {
 }
 
 #[derive(Clone)]
+pub struct Update(Id, Arc<GetUpdate>);
+impl Update {
+    pub fn as_reactant<C: Contract, R: Reactant<C>>(&self) -> Option<R::Ok> {
+        (self.1)(R::id()).map(|a| *a.downcast::<R::Ok>().unwrap())
+    }
+}
+impl std::fmt::Debug for Update {fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_tuple("Update").field(&self.0).finish()
+}}
+
 pub struct Instance<C: Contract>{
     id: Id,
     sink: Sink,
@@ -72,7 +84,24 @@ pub struct Instance<C: Contract>{
     confirmed: Arc<ArcSwap<Option<C>>>,//This will only be written to by the instance
     queue: Arc<Mutex<VecDeque<SerializedReactant>>>,
     pending: Arc<ArcSwap<Option<C>>>,
+    pending_updates: (watch::Sender<()>, watch::Receiver<()>),
+    updates: broadcast::Receiver<Update>,
 }
+
+impl<C: Contract> Clone for Instance<C> {fn clone(&self) -> Self {Instance{
+    id: self.id,
+    sink: self.sink.clone(),
+    name: self.name,
+    purser: self.purser.clone(),
+    resolver: self.resolver.clone(),
+    location: self.location,
+    reactants: self.reactants.clone(),
+    confirmed: self.confirmed.clone(),
+    queue: self.queue.clone(),
+    pending: self.pending.clone(),
+    pending_updates: self.pending_updates.clone(),
+    updates: self.updates.resubscribe(),
+}}}
 impl<C: Contract> std::fmt::Debug for Instance<C> {fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("Instance").field("id", &self.id).field("confirmed", &self.confirmed).field("pending", &self.pending).finish()
 }}
@@ -93,8 +122,10 @@ impl<C: Contract> Instance<C> {
         let confirmed = Arc::new(ArcSwap::from(Arc::new(contract.clone())));
         let queue = Arc::new(Mutex::new(VecDeque::new()));
         let pending = Arc::new(ArcSwap::from(Arc::new(contract.or(init.map(|i| C::init(i, secret.name(), now()))))));
-        let instance = Instance{name, sink, purser: purser.clone(), resolver: resolver.clone(), id: Id::hash(&location), location, reactants, confirmed, queue, pending};
-        spawn(instance.clone().run(cache, stream));
+        let pending_updates = watch::channel(());
+        let (sender, updates) = broadcast::channel(1000);
+        let instance = Instance{name, sink, purser: purser.clone(), resolver: resolver.clone(), id: Id::hash(&location), location, reactants, confirmed, queue, pending, pending_updates, updates};
+        spawn(instance.clone().run(cache, stream, sender));
         instance
     }
 
@@ -102,34 +133,55 @@ impl<C: Contract> Instance<C> {
         spawn(InboxHandler::send(self.purser.clone(), self.resolver.clone(), name, self.location));
     }
 
-    pub fn pending(&self) -> Guard<'_, C> {
+    pub fn is_pending_updated(&mut self) -> bool {
+        let r = self.pending_updates.1.has_changed().unwrap_or(false);
+        self.pending_updates.1.mark_unchanged();
+        r
+    }
+    
+    pub fn pending(&mut self) -> Guard<'_, C> {
+        self.pending_updates.1.mark_unchanged();
         Guard(PhantomData::<fn(&'_ ())>, self.pending.load().clone())
     }
 
+    //pub fn is_confirmed_updated(&self) -> bool {}
+    pub async fn listen_confirmed(&mut self) -> Update {
+        self.updates.recv().await.unwrap()
+    }
     pub fn confirmed(&self) -> Option<Guard<'_, C>> {
         let arc = self.confirmed.load().clone();
         arc.is_some().then_some(Guard(PhantomData::<fn(&'_ ())>, arc))
     }
 
-    pub fn apply<R: Reactant<C>>(&self, reactant: R) -> Result<R::Ok, R::Err> {
+    pub fn apply<R: Reactant<C>>(&mut self, reactant: R) -> Result<R::Ok, R::Err> {
+        let arc = self.queue.clone();
+        let mut queue = arc.blocking_lock();
+        self.apply_inner(reactant, &mut queue)
+    }
+    pub async fn apply_async<R: Reactant<C>>(&mut self, reactant: R) -> Result<R::Ok, R::Err> {
+        let arc = self.queue.clone();
+        let mut queue = arc.lock().await;
+        self.apply_inner(reactant, &mut queue)
+    }
+
+    fn apply_inner<R: Reactant<C>>(&mut self, reactant: R, queue: &mut MutexGuard<'_, VecDeque<SerializedReactant>>) -> Result<R::Ok, R::Err> {
         let id = self.reactants.index::<R>().unwrap_or_else(|| panic!("
             The given reactant was not found in its contract,
             Add it to the contract in Contract::reactants(): {:?}
         ", reactant));
+        let mut pending = self.pending.load_full().as_ref().clone().expect("Cannot apply reactant to an uninitialized contract");
         let bytes = postcard::to_allocvec(&reactant).unwrap();
         self.sink.write_sync(postcard::to_allocvec(&(id, &bytes)).unwrap());
-
-        let mut pending = self.pending.load_full().as_ref().clone().expect("Cannot apply reactant to an uninitialized contract");
-        let mut queue = self.queue.blocking_lock();
         queue.push_back((id, bytes));
         let r = reactant.apply(&mut pending, self.name, now())?;
         self.pending.store(Arc::new(Some(pending)));
+        self.pending_updates.0.send(()).unwrap();
+        self.pending_updates.1.mark_unchanged();
         Ok(r)
     }
 
     async fn store(&mut self, confirmed: C, reactant: Option<Id>) {
         let mut pending = confirmed.clone();
-        self.confirmed.store(Arc::new(Some(confirmed)));
         let mut queue = self.queue.lock().await;
         if let Some(id) = reactant
         && queue.front().map(|(i, _)| i == &id).unwrap_or_default() {
@@ -138,10 +190,12 @@ impl<C: Contract> Instance<C> {
         for (id, bytes) in queue.iter() {
             self.reactants.apply(id, bytes, &mut pending, self.name, now());
         }
+        self.confirmed.store(Arc::new(Some(confirmed)));
         self.pending.store(Arc::new(Some(pending)));
+        self.pending_updates.0.send(()).unwrap();
     }
 
-    async fn run(mut self, mut cache: Cache, mut stream: Stream) {
+    async fn run(mut self, mut cache: Cache, mut stream: Stream, sender: broadcast::Sender<Update>) {
         loop {
             let (time, namedata) = stream.read().await;
             if let Some((name, data)) = namedata
@@ -157,8 +211,9 @@ impl<C: Contract> Instance<C> {
                     },
                     Some(contract) => {
                         let mut contract = contract.clone();
-                        if self.reactants.apply(&id, &bytes, &mut contract, name, time) {
+                        if let Some(update) = self.reactants.apply(&id, &bytes, &mut contract, name, time) {
                             self.store(contract, Some(id)).await;
+                            sender.send(update).unwrap();
                         }
                     }
                 }
@@ -337,24 +392,25 @@ impl<C: Contract> std::fmt::Debug for Reactants<C> {fn fmt(&self, f: &mut std::f
 impl<C: Contract> Default for Reactants<C> {fn default() -> Self {Reactants(BTreeMap::default())}}
 impl<C: Contract> Reactants<C> {
     pub fn add<R: Reactant<C>>(mut self) -> Self {
-        self.0.insert(R::id(), (TypeId::of::<R>(), std::any::type_name::<R>().to_string(), Box::new(|bytes: &[u8], model: &mut C, signer: Name, timestamp: u64| {
+        let id = R::id();
+        self.0.insert(id, (TypeId::of::<R>(), std::any::type_name::<R>().to_string(), Box::new(move |bytes: &[u8], model: &mut C, signer: Name, timestamp: u64| {
             match postcard::from_bytes::<R>(bytes) {
                 Ok(r) => {
                     let mut pending = model.clone();
                     match r.apply(&mut pending, signer, timestamp) {
-                        Ok(_) => {
+                        Ok(ok) => {
                             *model = pending;
-                            true
+                            Some(Update(id, Arc::new(Box::new(move |oid: Id| (oid == id).then(|| Box::new(ok.clone()) as Box<dyn Any>)))))
                         },
                         Err(e) => {
                             println!("Invalid Reactant: {e:?}");
-                            false
+                            None
                         }
                     }
                 },
                 Err(e) => {
                     println!("Invalid Reactant: {e:?}");
-                    false
+                    None
                 }
             }
         })));
@@ -366,10 +422,10 @@ impl<C: Contract> Reactants<C> {
         self.0.iter().find_map(|(id, (ty, _, _))| (*ty == ty_id).then_some(*id))
     }
 
-    fn apply(&self, id: &Id, bytes: &[u8], model: &mut C, signer: Name, timestamp: u64) -> bool {
+    fn apply(&self, id: &Id, bytes: &[u8], model: &mut C, signer: Name, timestamp: u64) -> Option<Update> {
         match self.0.get(id) {
             Some((_, _, reactant)) => {reactant(bytes, model, signer, timestamp)},
-            None => {println!("No Reactant With Id: {:?}", id); false}
+            None => {println!("No Reactant With Id: {:?}", id); None}
         }
     }
 }

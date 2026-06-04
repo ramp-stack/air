@@ -93,13 +93,23 @@ mod test {
             let secret = Secret::new();
             let air = Air::start(secret);
 
-            let room: Instance<Room> = air.create::<Room>("MyRoom".to_string());
+            let mut room: Instance<Room> = air.create::<Room>("MyRoom".to_string());
+            let mut other_instance = room.clone();
             let id = room.apply(SendMessage(Id::random(), "Hi Bob".to_string())).unwrap();
-            assert!(room.apply(EditMessage(id, "GoodBye Bob".to_string())).unwrap());
+            assert!(other_instance.is_pending_updated());
+            assert!(!other_instance.is_pending_updated());
+            assert!(other_instance.apply(EditMessage(id, "GoodBye Bob".to_string())).unwrap());
+            assert!(room.is_pending_updated());
             air
         }).await.unwrap();
 
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        air.list::<Room>().into_iter().for_each(|i| assert_eq!(*i.confirmed().unwrap(), *i.pending()));
+        air.list::<Room>().into_iter().for_each(|mut i| assert_eq!(*i.confirmed().unwrap(), *i.pending()));
+
+        let mut room = air.list::<Room>().pop().unwrap();
+        let id = room.apply_async(SendMessage(Id::random(), "Hi Alice".to_string())).await.unwrap();
+
+        let update = room.listen_confirmed().await;
+        assert_eq!(id, update.as_reactant::<Room, SendMessage>().unwrap())
     }
 }
