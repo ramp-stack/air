@@ -178,7 +178,20 @@ pub struct Context {
 }
 
 impl Context {
-    fn me(&self) -> Name {self.secret.name()}
+    pub fn me(&self) -> Name {self.secret.name()}
+    pub fn create<C: Contract>(&self, init: C::Init) -> Instance<C> {
+        let location = Location::new::<C>(&self.secret, &init);
+        self.get::<C>(location, Some(init))
+    }
+
+
+    pub fn list<C: Contract>(&self) -> Vec<Instance<C>> {
+        self.instances.load().get(&C::id()).map(|map| map.values().filter_map(|i| {
+            let instance = i.downcast_ref::<Instance<C>>().unwrap();
+            instance.pending.load().as_ref().as_ref().map(|_| instance.clone())
+        }).collect()).unwrap_or_default()
+    }
+
     fn get<C: Contract>(&self, location: Location, init: Option<C::Init>) -> Instance<C> {
         let c_id = C::id();
         let id = Id::hash(&location);
@@ -200,18 +213,7 @@ impl Context {
         }
     }
 
-    pub fn create<C: Contract>(&self, init: C::Init) -> Instance<C> {
-        let location = Location::new::<C>(&self.secret, &init);
-        self.get::<C>(location, Some(init))
-    }
 
-
-    pub fn list<C: Contract>(&self) -> Vec<Instance<C>> {
-        self.instances.load().get(&C::id()).map(|map| map.values().filter_map(|i| {
-            let instance = i.downcast_ref::<Instance<C>>().unwrap();
-            instance.pending.load().as_ref().as_ref().map(|_| instance.clone())
-        }).collect()).unwrap_or_default()
-    }
 }
 
 ///Keeps track of my Contracts and their locations for recovery, (Scanning my inbox, creating new
