@@ -10,6 +10,8 @@ use std::str::FromStr;
 use std::hash::Hash;
 use std::fmt::Debug;
 
+use tokio::runtime::Handle;
+
 mod fschacha20poly1305;
 pub mod secp256k1;
 
@@ -166,12 +168,12 @@ impl Identity {
     pub fn get(&self, key: &str) -> Option<&String> {self.data.get(key)}
 }
 
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Debug)]
 pub struct Resolver();
 impl Resolver {
     pub fn start() -> Self {Resolver()}
 
-    pub async fn resolve(&mut self, name: Name, _timestamp: Option<u64>) -> Identity {
+    pub async fn resolve(&self, name: Name, _timestamp: Option<u64>) -> Identity {
         if name == Name::orange_me() {
             Identity{name, url: vec![ORANGEME_URL.to_string()], servers: vec![], data: HashMap::new()}
         } else {
