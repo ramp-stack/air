@@ -1,19 +1,15 @@
-use crate::names::{Id, Secret, Resolver, Name, secp256k1::SecretKey, now};
+use crate::names::{Id, Secret, Name, secp256k1::SecretKey, now};
 
 use crate::channel::{Inbox, InboxHandler, Sink, Stream, Channel, Data};
 use crate::cache::Cache;
-use crate::server::Purser;
 use crate::Handle;
 
 use std::collections::{HashSet, BTreeMap, VecDeque};
-use std::path::Path;
 use std::hash::Hash;
 use std::any::TypeId;
 use std::sync::Arc;
 use std::pin::Pin;
 use std::any::Any;
-use std::marker::PhantomData;
-use std::cell::RefCell;
 use std::fmt::Debug;
 use std::hash::Hasher;
 
@@ -21,16 +17,10 @@ use serde::{Serialize, Deserialize};
 
 use crossfire::{MAsyncTx, AsyncRx, mpsc};
 use tokio::spawn;
-use tokio::sync::{Mutex, MutexGuard};
-use tokio::sync::{watch, broadcast};
 
 use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, OpenFlags, Error};
-use crate::ams::{Ams, Ref, RefMut};
-
-use arc_swap::ArcSwap;
-use arc_swap::strategy::DefaultStrategy;
+use crate::ams::{Ams, Ref};
 
 type PBFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 type GetUpdate = Box<dyn Fn() -> Box<dyn Any> + Send + Sync>;
@@ -87,11 +77,10 @@ impl<C: Contract> std::fmt::Debug for Instance<C> {fn fmt(&self, f: &mut std::fm
 impl<C: Contract> Instance<C> {
     fn start(handle: Handle, location: Location, init: Option<C::Init>) -> Self {
         let id = Id::hash(&location);
-        let name = handle.name;
         let cache = Cache::new(format!("{}/{}/{}", handle.name, C::id(), id)).unwrap();
         let secret = handle.secret.derive(&[C::id(), id]);
         let (channel, contract) = cache.get::<(Channel, Option<C>)>("instance").unwrap().unwrap_or((Channel::new(location.key), None));
-        let (stream, sink) = channel.start(handle.clone());
+        let (stream, sink) = channel.start(handle.clone(), secret);
         if let Some(init) = init.as_ref() {
             sink.write_sync(postcard::to_allocvec(&(id, postcard::to_allocvec(init).unwrap())).unwrap());
         }
@@ -119,6 +108,9 @@ impl<C: Contract> Instance<C> {
 
     pub fn confirmed_has_update(&self) -> bool {
         self.confirmed.has_update()
+    }
+    pub fn get_confirmed_update(&mut self) -> Option<Update> {
+        self.confirmed.get_update()
     }
     pub async fn listen_confirmed(&mut self) -> Update {
         self.confirmed.listen().await
@@ -248,7 +240,7 @@ pub struct Manager {
 impl Manager {
     pub fn start(handle: crate::Handle) -> Context {
         let name = handle.name;
-        let cache = Cache::new(format!("./{name}.db")).unwrap();
+        let cache = Cache::new(format!("./{name}/{name}.db")).unwrap();
         let root = cache.get::<Root>("root").unwrap().unwrap_or_default();
 
         let (tx, rx) = mpsc::build(mpsc::List::new());
@@ -262,7 +254,7 @@ impl Manager {
         spawn(async move {
             let futures = FuturesUnordered::new();
             let contracts = root.contracts.iter().map(|(id, (channel, _))| {
-                let (mut stream, sink) = channel.start(context.handle.clone());
+                let (mut stream, sink) = channel.start(context.handle.clone(), context.handle.secret.clone());
                 let id = *id;
                 futures.push(Box::pin(async move {
                     let (time, namedata) = stream.read().await;
@@ -280,7 +272,7 @@ impl Manager {
         self.root.contracts.entry(id).or_insert_with(|| {
             let secret = self.context.handle.secret.derive(&[id]);
             let channel = Channel::new(secret.harden());
-            let (mut stream, sink) = channel.start(self.context.handle.clone());
+            let (mut stream, sink) = channel.start(self.context.handle.clone(), secret);
             self.contracts.insert(id, (None, sink));
             self.futures.push(Box::pin(async move {
                 let (time, namedata) = stream.read().await;
@@ -290,13 +282,14 @@ impl Manager {
         })
     }
 
-    async fn add(&mut self, location: Location, post: bool) {
+    async fn add(&mut self, location: Location, post_local: bool, store: bool) {
         let entry = self.contract(location.contract_id);
         if !entry.1.insert(location) {
             let (_, sink) = self.contracts.get(&location.contract_id).unwrap();
-            sink.write(postcard::to_allocvec(&location).unwrap()).await;
+            println!("Write Contract {:?}", location);
+            if store {sink.write(postcard::to_allocvec(&location).unwrap()).await;}
             let (receiver, _) = self.contracts.get(&location.contract_id).unwrap();
-            if post && let Some(builder) = receiver.as_ref() {
+            if post_local && let Some(builder) = receiver.as_ref() {
                 (builder.0)(location).await;
             }
         }
@@ -313,11 +306,11 @@ impl Manager {
                         }
                         self.contracts.get_mut(&id).unwrap().0 = Some(builder);
                     },
-                    Request::New(location) => {self.add(location, false).await;}
+                    Request::New(location) => {self.add(location, false, true).await;}
                 },
                 (_, location) = self.inbox.read() => {
                     self.root.inbox = *self.inbox.inbox();
-                    if let Some(location) = location.and_then(|l| postcard::from_bytes(&l).ok()) {self.add(location, true).await}
+                    if let Some(location) = location.and_then(|l| postcard::from_bytes(&l).ok()) {self.add(location, true, true).await}
                 },
                 Some((id, mut stream, _, namedata)) = self.futures.next() => {
                     self.root.contracts.get_mut(&id).unwrap().0 = *stream.channel();
@@ -325,7 +318,7 @@ impl Manager {
                     if let Some((_, data)) = namedata 
                     && let Ok((key, contract_hash)) = postcard::from_bytes::<(SecretKey, Id)>(&data) {
                         let location = Location{key, contract_id: id, contract_hash};
-                        self.add(location, true).await;
+                        self.add(location, true, false).await;
                     }
 
                     self.futures.push(Box::pin(async move {
@@ -353,7 +346,6 @@ impl<C: Contract> ErasedReactant<C> {
     }
     fn serialize(&self) -> Vec<u8> {postcard::to_allocvec(&(&self.1, &self.2)).unwrap()}
     fn apply(&self, model: &mut C, signer: Name, timestamp: u64) -> Update {(self.0)(model, signer, timestamp)}
-    fn id(&self) -> Id {self.1}
 }
 impl<C: Contract> Hash for ErasedReactant<C> {
     fn hash<H: Hasher>(&self, state: &mut H) {self.1.hash(state); self.2.hash(state);}
@@ -378,10 +370,10 @@ impl<C: Contract> Reactants<C> {
         self
     } 
 
-    fn id<R: Reactant<C> + 'static>(&self) -> Option<Id> {
-        let ty_id = TypeId::of::<R>();
-        self.0.iter().find_map(|(id, (ty, _, _))| (*ty == ty_id).then_some(*id))
-    }
+  //fn id<R: Reactant<C> + 'static>(&self) -> Option<Id> {
+  //    let ty_id = TypeId::of::<R>();
+  //    self.0.iter().find_map(|(id, (ty, _, _))| (*ty == ty_id).then_some(*id))
+  //}
 
     fn deserialize(&self, id: &Id, bytes: Vec<u8>) -> Option<ErasedReactant<C>> {
         match self.0.get(id) {

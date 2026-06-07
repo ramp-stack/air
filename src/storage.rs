@@ -57,11 +57,11 @@ impl Storage {
 
     pub async fn request(&mut self, request: Request) -> AsyncRx<spsc::One<Response>> {
         let (stx, srx) = spsc::build(spsc::One::new());
-        self.0.send((request, stx)).await.unwrap();
+        let _ = self.0.send((request, stx)).await;
         srx
     }
 
-    async fn run(mut resolver: Resolver, secret: Secret, rx: AsyncRx<mpsc::List<(Request, Responder)>>) {
+    async fn run(resolver: Resolver, secret: Secret, rx: AsyncRx<mpsc::List<(Request, Responder)>>) {
         let mut subscriptions = HashMap::<PublicKey, Vec<Responder>>::new();
         let mut subscriptions_inbox = HashMap::<Name, Vec<Responder>>::new();
         let connection = Connection::open("STORAGE.db").unwrap();
@@ -111,15 +111,15 @@ impl Storage {
                                 if let Some(responders) = subscriptions.remove(&signed.key) {
                                     let response = Response::Read(result.0.clone(), result.1, Some((result.2, result.3)));
                                     for responder in responders {
-                                        responder.send(response.clone()).await.unwrap();
+                                        let _ = responder.send(response.clone()).await;
                                     }
                                 }
-                                responder.send(Response::Create(result.0, result.1)).await.unwrap()
+                                let _ = responder.send(Response::Create(result.0, result.1)).await;
                             } else {
-                                responder.send(Response::Read(result.0, result.1, Some((result.2, result.3)))).await.unwrap()
+                                let _ = responder.send(Response::Read(result.0, result.1, Some((result.2, result.3)))).await;
                             }
                         },
-                        Err(e) => responder.send(Response::InvalidSignature(e.to_string())).await.unwrap(),
+                        Err(e) => {let _ = responder.send(Response::InvalidSignature(e.to_string())).await;},
                     }
                 },
                 Request::Read(key, subscribe) => {
@@ -134,14 +134,14 @@ impl Storage {
                             ))
                         ))
                     ).optional().unwrap() {
-                        responder.send(read).await.unwrap()
+                        let _ = responder.send(read).await;
                     } else {
                         if subscribe {
                             subscriptions.entry(key).or_default().push(responder);
                         } else {
                             let timestamp = now();
                             let id = Id::hash(&timestamp);
-                            responder.send(Response::Read(secret.sign(id), timestamp, None)).await.unwrap()
+                            let _ = responder.send(Response::Read(secret.sign(id), timestamp, None)).await;
                         }
                     }
                 },
@@ -157,11 +157,11 @@ impl Storage {
                             payload,
                         ],
                     ).unwrap();
-                    responder.send(Response::Create(signature.clone(), timestamp)).await.unwrap();
+                    let _ = responder.send(Response::Create(signature.clone(), timestamp)).await;
                     if let Some(responders) = subscriptions_inbox.remove(&recipient) {
                         let response = Response::Inbox(vec![(signature, timestamp, payload)]);
                         for responder in responders {
-                            responder.send(response.clone()).await.unwrap();
+                            let _ = responder.send(response.clone()).await;
                         }
                     }
                 },
@@ -182,10 +182,10 @@ impl Storage {
                             if results.is_empty() {
                                 subscriptions_inbox.entry(signed.signer).or_default().push(responder);
                             } else {
-                                responder.send(Response::Inbox(results)).await.unwrap();
+                                let _ = responder.send(Response::Inbox(results)).await;
                             }
                         },
-                        Err(e) => responder.send(Response::InvalidSignature(e.to_string())).await.unwrap()
+                        Err(e) => {let _ = responder.send(Response::InvalidSignature(e.to_string())).await;}
                     }
                 }
             }

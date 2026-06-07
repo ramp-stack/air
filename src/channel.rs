@@ -1,12 +1,10 @@
 use serde::{Serialize, Deserialize};
 
-use crate::names::{secp256k1::{Signed as KeySigned, SecretKey, Encrypted as KeyEncrypted}, Encrypted, Resolver, Signed, Secret, Name, Id, now};
+use crate::names::{secp256k1::{Signed as KeySigned, SecretKey, Encrypted as KeyEncrypted}, Encrypted, Secret, Signed, Name, Id, now};
 use crate::storage::{Compare, Request, Response};
-use crate::server::Purser;
 use crate::Handle;
 
 use crossfire::{MAsyncTx, AsyncTx, AsyncRx, MTx, mpsc, spsc};
-use tokio::spawn;
 
 pub const CHANNEL: &str = "CHANNEL";
 
@@ -43,8 +41,8 @@ impl Channel {
 
     ///It is assumed that the channels path is equal to the path of the secret
     ///Its up to you to ensure the secret is at the correct path for this channel
-    pub fn start(mut self, handle: Handle) -> (Stream, Sink) {
-        let secret = handle.secret.derive(&[Id::hash(CHANNEL)]);
+    pub fn start(mut self, handle: Handle, secret: Secret) -> (Stream, Sink) {
+        let secret = secret.derive(&[Id::hash(CHANNEL)]);
         let (write, rx): (MAsyncTx<_>, AsyncRx<_>) = mpsc::build(mpsc::List::new());
         let (tx, read): (AsyncTx<_>, AsyncRx<_>) = spsc::build(spsc::List::new());
 
@@ -133,9 +131,9 @@ mod test {
         let name = secret.name();
 
         let (handle, remote) = crate::runtime::Handle::new();
-        let handle = Handle::new(handle, secret);
+        let handle = Handle::new(handle, secret.clone());
 
-        let (mut stream, sink) = Channel::new(key).start(handle.clone());
+        let (mut stream, sink) = Channel::new(key).start(handle.clone(), secret);
 
         handle.handle.block_on(async {
             let content = b"hello".to_vec();
@@ -164,7 +162,7 @@ impl InboxHandler {
         (time, data)
     }
 
-    pub async fn send(handle: Handle, name: Name, location: Vec<u8>) {
+    pub fn send(handle: Handle, name: Name, location: Vec<u8>) {
         handle.handle.spawn(async move {
             let identity = handle.resolver.resolve(name, None).await;
             let home = *identity.servers().first().unwrap();

@@ -57,7 +57,7 @@ impl Purser {
         rx.recv().await.unwrap()
     }
 
-    async fn run(mut resolver: Resolver, rx: AsyncRx<mpsc::List<Open>>) {
+    async fn run(resolver: Resolver, rx: AsyncRx<mpsc::List<Open>>) {
         let mut open_connections = HashMap::<Name, Connection>::new();
         while let Ok((name, responder)) = rx.recv().await {
             //TODO: Do timeout based cleanup after a connection isnt used

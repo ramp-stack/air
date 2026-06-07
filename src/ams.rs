@@ -4,7 +4,7 @@ use std::fmt::Debug;
 
 use tokio::sync::broadcast;
 
-use std::sync::{Mutex, MutexGuard};
+use std::sync::Mutex;
 
 use arc_swap::ArcSwap;
 
@@ -37,21 +37,21 @@ impl<'a, T: Send + Sync> Ref<'a, T> {
     }}
 }
 
-pub struct RefMut<'a, T, U>(MutexGuard<'a, ()>, T, &'a ArcSwap<T>, &'a broadcast::Sender<U>);
-impl<'a, T, U: Debug> RefMut<'a, T, U> {
-    ///If commit is not called then the changes made will be discarded
-    pub fn commit(self, update: U) {
-        self.2.store(Arc::new(self.1));
-        self.3.send(update).unwrap();
-    }
-}
-impl<'a, T, U> std::ops::Deref for RefMut<'a, T, U> {
-    type Target = T;
-    fn deref(&self) -> &T {&self.1}
-}
-impl<'a, T, U> std::ops::DerefMut for RefMut<'a, T, U> {
-    fn deref_mut(&mut self) -> &mut T {&mut self.1}
-}
+//  pub struct RefMut<'a, T, U>(MutexGuard<'a, ()>, T, &'a ArcSwap<T>, &'a broadcast::Sender<U>);
+//  impl<'a, T, U: Debug> RefMut<'a, T, U> {
+//      ///If commit is not called then the changes made will be discarded
+//      pub fn commit(self, update: U) {
+//          self.2.store(Arc::new(self.1));
+//          self.3.send(update).unwrap();
+//      }
+//  }
+//  impl<'a, T, U> std::ops::Deref for RefMut<'a, T, U> {
+//      type Target = T;
+//      fn deref(&self) -> &T {&self.1}
+//  }
+//  impl<'a, T, U> std::ops::DerefMut for RefMut<'a, T, U> {
+//      fn deref_mut(&mut self) -> &mut T {&mut self.1}
+//  }
 
 ///This is an extension of the arc_swap which allows locking via tokio::sync::Mutex to preform
 ///concurrent writes keeping the reads lockless. And provides a broadcast system for updates.
@@ -79,9 +79,9 @@ impl<T: Clone + Send + Sync, U: Clone + Debug + Send + Sync> Ams<T, U> {
         self.1.recv().await.unwrap()
     }
 
-    pub fn send(&self, update: U) {
-        self.0.2.send(update).unwrap();
-    }
+  //pub fn send(&self, update: U) {
+  //    self.0.2.send(update).unwrap();
+  //}
 
     ///Warning: Only use this if there is a single writer thread and you want to avoid sending a message,
     ///otherwise use lock/commit to avoid mismatch between update messages and updates themselves

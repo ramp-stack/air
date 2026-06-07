@@ -10,8 +10,6 @@ use std::str::FromStr;
 use std::hash::Hash;
 use std::fmt::Debug;
 
-use tokio::runtime::Handle;
-
 mod fschacha20poly1305;
 pub mod secp256k1;
 

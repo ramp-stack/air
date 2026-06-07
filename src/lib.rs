@@ -21,7 +21,7 @@ struct Handle{
 }
 impl Handle {
     pub fn new(handle: runtime::Handle, secret: Secret) -> Self {
-        let guard = handle.handle.enter();
+        let _guard = handle.handle.enter();
         let resolver = names::Resolver::start();
         let purser = server::Purser::start(resolver.clone());
         Handle{handle, resolver, purser, name: secret.name(), secret}
@@ -40,8 +40,11 @@ use std::any::TypeId;
 use std::collections::BTreeMap;
 use std::pin::Pin;
 
-pub struct Services(BTreeMap<TypeId, Box<dyn FnOnce(runtime::Handle, Context) -> Pin<Box<dyn Future<Output = ()> + Send>>>>);
+type ErasedService = Box<dyn FnOnce(runtime::Handle, Context) -> Pin<Box<dyn Future<Output = ()> + Send>>>;
+#[derive(Default)]
+pub struct Services(BTreeMap<TypeId, ErasedService>);
 impl Services {
+    #[allow(clippy::should_implement_trait)]
     pub fn add<S: Service>(mut self, mut service: S) -> Self {
         self.0.insert(TypeId::of::<S>(), Box::new(move |mut handle: runtime::Handle, mut ctx: Context| {
             Box::pin(async move { loop {
@@ -76,7 +79,7 @@ impl Air {
         handle.block_on(server::Chandler::start(secret))
     }
 
-    pub fn start_services(&self, mut services: Services) {
+    pub fn start_services(&self, services: Services) {
         for (_, service) in services.0 {
             self.0.spawn(service(self.0.clone(), self.2.clone()));
         }
@@ -210,6 +213,7 @@ mod test {
 
         let mut room = air.list::<Room>().pop().unwrap();
         let id = room.apply(SendMessage(Id::random(), "Hi Alice".to_string())).unwrap();
+        loop {}
 
       //let update = room.get_confirmed_update().unwrap();
       //assert_eq!(id, update.as_reactant::<Room, SendMessage>().unwrap().unwrap())
