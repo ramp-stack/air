@@ -82,7 +82,7 @@ impl<C: Contract> Instance<C> {
         let (channel, contract) = cache.get::<(Channel, Option<C>)>("instance").unwrap().unwrap_or((Channel::new(location.key), None));
         let (stream, sink) = channel.start(handle.clone(), secret);
         if let Some(init) = init.as_ref() {
-            sink.write_sync(postcard::to_allocvec(&(id, postcard::to_allocvec(init).unwrap())).unwrap());
+            sink.write_sync(postcard::to_allocvec(&(location.contract_hash, postcard::to_allocvec(init).unwrap())).unwrap());
         }
         let reactants = Arc::new(C::reactants());
         let confirmed = Ams::new(contract.clone());
@@ -142,7 +142,7 @@ impl<C: Contract> Instance<C> {
                     if id == self.id && let Ok(init) = postcard::from_bytes(&bytes) {
                         self.confirmed.store(Some(C::init(init, name, time)));
                     } else {
-                        println!("Invalid Contract Init");
+                        println!("Invalid Contract Init: {:?}", id);
                     }
                 } else if let Some(reactant) = self.reactants.deserialize(&id, bytes) {
                     self.pending.lock(|pending: &mut (VecDeque<ErasedReactant<C>>, Option<C>)| {
@@ -162,7 +162,7 @@ impl<C: Contract> Instance<C> {
                     });
                 }
             }
-            cache.insert("channel", stream.channel()).unwrap();
+            cache.insert("instance", &(&stream.channel(), &*self.confirmed.load())).unwrap();
         }
     }
 }
@@ -192,11 +192,21 @@ impl Context {
 
     pub fn list<C: Contract>(&mut self) -> Vec<Instance<C>> {
         self.instances.load().get(&C::id()).map(|map| map.values().filter_map(|i| {
+            println!("instance");
             let mut instance = i.as_contract::<C>().unwrap();
             if instance.pending.load().1.is_some() {
                 Some(instance.clone())
             } else {None}
         }).collect()).unwrap_or_default()
+    }
+
+    ///To Listen to multiple contract instance creations simply clone the context
+    pub async fn listen<C: Contract>(&mut self) -> Instance<C> {
+        loop {
+            if let Some(i) = self.instances.listen().await.as_contract::<C>() {
+                return i;
+            }
+        }
     }
 
     pub fn create<C: Contract>(&mut self, init: C::Init) -> Instance<C> {
@@ -284,9 +294,8 @@ impl Manager {
 
     async fn add(&mut self, location: Location, post_local: bool, store: bool) {
         let entry = self.contract(location.contract_id);
-        if !entry.1.insert(location) {
+        if entry.1.insert(location) {
             let (_, sink) = self.contracts.get(&location.contract_id).unwrap();
-            println!("Write Contract {:?}", location);
             if store {sink.write(postcard::to_allocvec(&location).unwrap()).await;}
             let (receiver, _) = self.contracts.get(&location.contract_id).unwrap();
             if post_local && let Some(builder) = receiver.as_ref() {
@@ -316,7 +325,7 @@ impl Manager {
                     self.root.contracts.get_mut(&id).unwrap().0 = *stream.channel();
 
                     if let Some((_, data)) = namedata 
-                    && let Ok((key, contract_hash)) = postcard::from_bytes::<(SecretKey, Id)>(&data) {
+                    && let Ok((contract_hash, key)) = postcard::from_bytes::<(Id, SecretKey)>(&data) {
                         let location = Location{key, contract_id: id, contract_hash};
                         self.add(location, true, false).await;
                     }

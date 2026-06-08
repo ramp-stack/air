@@ -58,9 +58,9 @@ impl Channel {
                 let public = key.public_key();
                 match &mut request {
                     Some(_) => {},
-                    none => {*none = rx.try_recv().ok().map(|d: Vec<u8>|
+                    none => {*none = rx.try_recv().ok().map(|d: Vec<u8>|{
                         (d.clone(), postcard::to_allocvec(&Signed::new(&secret, d)).unwrap())
-                    );}
+                    });}
                 }
 
                 if let Some((signature, time, key_sig, payload)) = match request.as_ref() {
@@ -72,7 +72,7 @@ impl Channel {
                             Response::Create(signature, time) => {
                                 let identity = handle.resolver.resolve(server, Some(time)).await;
                                 if signature.verify(&identity, &[], Id::hash(&(public, time, hash))).is_ok() 
-                                && self.timestamp < time && time < now() {
+                                && self.timestamp < time {
                                     self.timestamp = time;
                                     self.index += 1;
                                     tx.send((self, request.take().map(|(d, _)| (secret.name(), d)))).await.unwrap()
@@ -168,6 +168,7 @@ impl InboxHandler {
             let home = *identity.servers().first().unwrap();
             let conn = handle.purser.connect(home).await.unwrap();
             //Verify receipet
+            println!("sending to {:?}", name);
             conn.send(Request::Send(name, postcard::to_allocvec(&identity.encrypt(&[], location)).unwrap())).await;
         });
     }

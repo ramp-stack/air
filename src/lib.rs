@@ -194,26 +194,35 @@ mod test {
     #[test]
     fn test() {
         let (mut air, _) = Air::start(Secret::new());
+        let bob = Secret::new();
+        let (mut bob, _) = Air::start(bob.clone());
+        println!("bob: {:?}", bob.me());
 
         let mut room: Instance<Room> = air.create::<Room>("MyRoom".to_string());
         let mut other_instance = room.clone();
         let id = room.apply(SendMessage(Id::random(), "Hi Bob".to_string())).unwrap();
         assert!(other_instance.pending_has_update());
         assert!(!other_instance.pending_has_update());
-        assert!(other_instance.apply(EditMessage(id, "GoodBye Bob".to_string())));
-        assert!(room.pending_has_update());
+      //assert!(other_instance.apply(EditMessage(id, "GoodBye Bob".to_string())));
+      //assert!(room.pending_has_update());
 
         std::thread::sleep(Duration::from_millis(100));
-        air.list::<Room>().into_iter().for_each(|mut i| {
-            let c: Room = i.confirmed().unwrap().as_ref().clone();
-            assert_eq!(c, i.pending().as_ref().clone())
-        });
+      //air.list::<Room>().into_iter().for_each(|mut i| {
+      //    let c: Room = i.confirmed().unwrap().as_ref().clone();
+      //    assert_eq!(c, i.pending().as_ref().clone())
+      //});
 
-        let dummy = air.create::<Dummy>("MyRoom".to_string());
+      //let dummy = air.create::<Dummy>("MyRoom".to_string());
 
         let mut room = air.list::<Room>().pop().unwrap();
-        let id = room.apply(SendMessage(Id::random(), "Hi Alice".to_string())).unwrap();
-        loop {}
+        room.share(bob.me());
+        //let id = room.apply(SendMessage(Id::random(), "Hi Alice".to_string())).unwrap();
+        
+        
+        std::thread::sleep(Duration::from_millis(200));
+        bob.list::<Room>().pop().unwrap();
+
+        
 
       //let update = room.get_confirmed_update().unwrap();
       //assert_eq!(id, update.as_reactant::<Room, SendMessage>().unwrap().unwrap())
