@@ -82,12 +82,12 @@ impl<C: Contract> Instance<C> {
         let (channel, contract) = cache.get::<(Channel, Option<C>)>("instance").unwrap().unwrap_or((Channel::new(location.key), None));
         let (stream, sink) = channel.start(handle.clone(), secret);
         if let Some(init) = init.as_ref() {
-            sink.write_sync(postcard::to_allocvec(&(location.contract_hash, postcard::to_allocvec(init).unwrap())).unwrap());
+            sink.write_sync(postcard::to_allocvec(&(id, postcard::to_allocvec(init).unwrap())).unwrap());
         }
         let reactants = Arc::new(C::reactants());
         let confirmed = Ams::new(contract.clone());
         let pending = Ams::new((VecDeque::new(), contract.or(init.map(|i| C::init(i, handle.name, now())))));
-        let instance = Instance{sink, handle: handle.clone(), id: Id::hash(&location), location, reactants, confirmed, pending};
+        let instance = Instance{sink, handle: handle.clone(), id, location, reactants, confirmed, pending};
         handle.handle.spawn(instance.clone().run(cache, stream));
         instance
     }
@@ -134,6 +134,7 @@ impl<C: Contract> Instance<C> {
     }
 
     async fn run(mut self, mut cache: Cache, mut stream: Stream) {
+        println!("running");
         loop {
             let (time, namedata) = stream.read().await;
             if let Some((name, data)) = namedata
@@ -142,7 +143,7 @@ impl<C: Contract> Instance<C> {
                     if id == self.id && let Ok(init) = postcard::from_bytes(&bytes) {
                         self.confirmed.store(Some(C::init(init, name, time)));
                     } else {
-                        println!("Invalid Contract Init: {:?}", id);
+                        println!("Invalid Contract Init");
                     }
                 } else if let Some(reactant) = self.reactants.deserialize(&id, bytes) {
                     self.pending.lock(|pending: &mut (VecDeque<ErasedReactant<C>>, Option<C>)| {
@@ -190,14 +191,25 @@ pub struct Context {
 impl Context {
     pub fn me(&self) -> Name {self.handle.name}
 
+    pub fn register<C: Contract>(&self) {
+        let all = self.instances.clone();
+        self.tx.try_send(Request::Register(C::id(), InstanceBuilder::new::<C>(self.handle.clone(), all))).unwrap();
+    }
+
     pub fn list<C: Contract>(&mut self) -> Vec<Instance<C>> {
-        self.instances.load().get(&C::id()).map(|map| map.values().filter_map(|i| {
-            println!("instance");
-            let mut instance = i.as_contract::<C>().unwrap();
-            if instance.pending.load().1.is_some() {
-                Some(instance.clone())
-            } else {None}
-        }).collect()).unwrap_or_default()
+        let all = self.instances.clone();
+        match self.instances.load().get(&C::id()) {
+            None => {
+                self.tx.try_send(Request::Register(C::id(), InstanceBuilder::new::<C>(self.handle.clone(), all))).unwrap();
+                Vec::new()
+            },
+            Some(map) => map.values().filter_map(|i| {
+                let mut instance = i.as_contract::<C>().unwrap();
+                if instance.pending.load().1.is_some() {
+                    Some(instance.clone())
+                } else {None}
+            }).collect()
+        }
     }
 
     ///To Listen to multiple contract instance creations simply clone the context
@@ -405,11 +417,11 @@ impl InstanceBuilder {
             Box::pin(async move {
                 let c_id = C::id();
                 let id = Id::hash(&location);
-                if !instances.load().get(&c_id).unwrap().contains_key(&id) {
+                if !instances.load().get(&c_id).map(|g| g.contains_key(&id)).unwrap_or_default() {
                     instances.lock(|instances: &mut Instances| 
-                        instances.get_mut(&c_id).unwrap().entry(id).or_insert_with(||
+                        instances.entry(c_id).or_default().entry(id).or_insert_with(|| {
                             DynInstance(c_id, id, Arc::new(Box::new(Instance::<C>::start(handle.clone(), location, None))))
-                        ).clone()
+                        }).clone()
                     );
                 }
             })

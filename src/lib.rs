@@ -220,8 +220,10 @@ mod test {
         
         
         std::thread::sleep(Duration::from_millis(200));
-        bob.list::<Room>().pop().unwrap();
+        bob.list::<Room>().pop();
 
+        std::thread::sleep(Duration::from_millis(200));
+        bob.list::<Room>().pop().unwrap();
         
 
       //let update = room.get_confirmed_update().unwrap();
