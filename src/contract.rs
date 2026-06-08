@@ -145,6 +145,8 @@ impl<C: Contract> Instance<C> {
                     } else {
                         println!("Invalid Contract Init");
                     }
+                } else if id == self.id {
+                    println!("tried to init contract twice");
                 } else if let Some(reactant) = self.reactants.deserialize(&id, bytes) {
                     self.pending.lock(|pending: &mut (VecDeque<ErasedReactant<C>>, Option<C>)| {
                         self.confirmed.lock(|confirmed: &mut Option<C>| {
