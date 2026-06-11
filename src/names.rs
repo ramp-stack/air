@@ -274,7 +274,7 @@ mod test {
     async fn encryption() {
         let secret = Secret::new();
         let name = secret.name();
-        let mut resolver = Resolver::start();
+        let resolver = Resolver::start();
         let identity = resolver.resolve(name, None).await;
 
         let m = b"hello".to_vec();
@@ -287,7 +287,7 @@ mod test {
         let secret = Secret::new();
         let name = secret.name();
 
-        let mut resolver = Resolver::start();
+        let resolver = Resolver::start();
         let identity = resolver.resolve(name, None).await;
 
         let path = &[Id::random()];

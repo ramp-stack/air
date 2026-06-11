@@ -1,8 +1,8 @@
 use serde::{Serialize, Deserialize};
 
-use crate::names::{secp256k1::{Signed as KeySigned, SecretKey, Encrypted as KeyEncrypted}, Encrypted, Secret, Signed, Name, Id, now};
+use crate::names::{secp256k1::{Signed as KeySigned, SecretKey, Encrypted as KeyEncrypted}, Encrypted, Secret, Signed, Name, Id};
 use crate::storage::{Compare, Request, Response};
-use crate::Handle;
+use crate::Air;
 
 use crossfire::{MAsyncTx, AsyncTx, AsyncRx, MTx, mpsc, spsc};
 
@@ -41,16 +41,16 @@ impl Channel {
 
     ///It is assumed that the channels path is equal to the path of the secret
     ///Its up to you to ensure the secret is at the correct path for this channel
-    pub fn start(mut self, handle: Handle, secret: Secret) -> (Stream, Sink) {
+    pub fn start(mut self, air: Air, secret: Secret) -> (Stream, Sink) {
         let secret = secret.derive(&[Id::hash(CHANNEL)]);
         let (write, rx): (MAsyncTx<_>, AsyncRx<_>) = mpsc::build(mpsc::List::new());
         let (tx, read): (AsyncTx<_>, AsyncRx<_>) = spsc::build(spsc::List::new());
 
         let channel = self;
-        handle.handle.spawn(async move {
+        air.handle.spawn(async move {
             let server = Name::orange_me();
             let key = self.key.derive(&[Id::hash(&server)]);
-            let connection = handle.purser.connect(server).await.unwrap();
+            let connection = air.purser.connect(server).await.unwrap();
 
             let mut request: Option<(Vec<u8>, Vec<u8>)> = None;
             loop {
@@ -70,7 +70,7 @@ impl Channel {
                         let response = connection.send(Request::Create(KeySigned::new(&key, encrypted))).await;
                         match response{
                             Response::Create(signature, time) => {
-                                let identity = handle.resolver.resolve(server, Some(time)).await;
+                                let identity = air.resolver.resolve(server, Some(time)).await;
                                 if signature.verify(&identity, &[], Id::hash(&(public, time, hash))).is_ok() 
                                 && self.timestamp < time {
                                     self.timestamp = time;
@@ -99,13 +99,13 @@ impl Channel {
                 } {
                     self.index += 1;
                     let hash = Id::hash(&payload);
-                    let identity = handle.resolver.resolve(server, Some(time)).await;
+                    let identity = air.resolver.resolve(server, Some(time)).await;
                     if signature.verify(&identity, &[], Id::hash(&(public, time, hash))).is_ok()
                     && key_sig.verify(&public, hash).is_ok() {
                         let result = if time > self.timestamp {
                             self.timestamp = time;
                             if let Some(signed) = postcard::from_bytes::<KeyEncrypted>(&payload).ok().and_then(|e| key.decrypt(e).ok().and_then(|d| postcard::from_bytes::<Signed<Vec<u8>>>(&d).ok())) {
-                                let identity = handle.resolver.resolve(signed.signer, Some(time)).await;
+                                let identity = air.resolver.resolve(signed.signer, Some(time)).await;
                                 if signed.verify(&identity, secret.path()).is_ok() {
                                     Some((signed.signer, signed.payload))
                                 } else {println!("bad signature"); None}
@@ -130,12 +130,11 @@ mod test {
         let key = secret.harden();
         let name = secret.name();
 
-        let (handle, remote) = crate::runtime::Handle::new();
-        let handle = Handle::new(handle, secret.clone());
+        let air = crate::Air::new(secret.clone());
 
-        let (mut stream, sink) = Channel::new(key).start(handle.clone(), secret);
+        let (mut stream, sink) = Channel::new(key).start(air.clone(), secret);
 
-        handle.handle.block_on(async {
+        air.handle.block_on(async {
             let content = b"hello".to_vec();
             sink.write(content.clone()).await;
             let (timestamp, data) = stream.read().await;
@@ -162,13 +161,11 @@ impl InboxHandler {
         (time, data)
     }
 
-    pub fn send(handle: Handle, name: Name, location: Vec<u8>) {
-        handle.handle.spawn(async move {
-            let identity = handle.resolver.resolve(name, None).await;
+    pub fn send(air: Air, name: Name, location: Vec<u8>) {
+        air.handle.spawn(async move {
+            let identity = air.resolver.resolve(name, None).await;
             let home = *identity.servers().first().unwrap();
-            let conn = handle.purser.connect(home).await.unwrap();
-            //Verify receipet
-            println!("sending to {:?}", name);
+            let conn = air.purser.connect(home).await.unwrap();
             conn.send(Request::Send(name, postcard::to_allocvec(&identity.encrypt(&[], location)).unwrap())).await;
         });
     }
@@ -177,20 +174,20 @@ impl InboxHandler {
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
 pub struct Inbox(u64);
 impl Inbox {
-    pub fn start(mut self, handle: Handle) -> InboxHandler {
+    pub fn start(mut self, air: Air) -> InboxHandler {
         let (tx, rx): (AsyncTx<_>, _) = spsc::build(spsc::List::new());
 
-        handle.handle.spawn(async move { loop {
-            let identity = handle.resolver.resolve(handle.name, None).await;
+        air.handle.spawn(async move { loop {
+            let identity = air.resolver.resolve(air.name, None).await;
             let home = *identity.servers().first().unwrap();
-            let conn = handle.purser.connect(home).await.unwrap();
-            match conn.send(Request::Receive(Signed::new(&handle.secret, (Compare::Greater, self.0)))).await {
+            let conn = air.purser.connect(home).await.unwrap();
+            match conn.send(Request::Receive(Signed::new(&air.secret, (Compare::Greater, self.0)))).await {
                 Response::Inbox(received) => {
-                    let home_identity = handle.resolver.resolve(home, None).await;
+                    let home_identity = air.resolver.resolve(home, None).await;
                     for (signature, timestamp, data) in received {
-                        if signature.verify(&home_identity, &[], Id::hash(&(handle.name, timestamp, &data))).is_ok() && timestamp > self.0 {
+                        if signature.verify(&home_identity, &[], Id::hash(&(air.name, timestamp, &data))).is_ok() && timestamp > self.0 {
                             self.0 = timestamp;
-                            let data = postcard::from_bytes::<Encrypted>(&data).ok().and_then(|d| handle.secret.decrypt(d).ok());
+                            let data = postcard::from_bytes::<Encrypted>(&data).ok().and_then(|d| air.secret.decrypt(d).ok());
                             tx.send((timestamp, data)).await.unwrap();
                         } else {panic!("Bad Air Server");}
                     }

@@ -202,7 +202,7 @@ mod test {
     async fn create() {
         let server = Secret::new();
         let server_name = server.name();
-        let mut resolver = Resolver::start();
+        let resolver = Resolver::start();
         let identity = resolver.resolve(server_name, None).await;
         let mut storage = Storage::start(&server);
 
@@ -218,7 +218,7 @@ mod test {
     async fn inbox() {
         let server = Secret::new();
         let server_name = server.name();
-        let mut resolver = Resolver::start();
+        let resolver = Resolver::start();
         let identity = resolver.resolve(server_name, None).await;
         let mut storage = Storage::start(&server);
 
