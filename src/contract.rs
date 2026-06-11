@@ -239,15 +239,9 @@ impl Context {
         self.instances.listen().await
     }
 
-  //pub async fn get_event(&mut self) -> Option<Event> {
-  //    //Pull all new instances from instances and store receivers in instance_updates
-  //    //Listen on all receivers including for new instances
-  //    loop {
-  //        if let Some(i) = self.instances.listen().await.as_contract::<C>() {
-  //            return i;
-  //        }
-  //    }
-  //}
+    pub async fn get_new_instance(&mut self) -> Option<DynInstance> {
+        self.instances.get_update()
+    }
 
     pub fn create<C: Contract>(&mut self, init: C::Init) -> Instance<C> {
         let c_id = C::id();
