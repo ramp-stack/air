@@ -29,16 +29,24 @@ use crate::names::{Error, Resolver, Name, Sink, Drain};
 type S = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type Open = (Name, AsyncTx<spsc::One<Result<Connection, Error>>>);
 type Outgoing = (Vec<u8>, Responder);
-type Responder = AsyncTx<spsc::One<Response>>;
+type Responder = AsyncTx<spsc::Array<Response>>;
+type RReceiver = AsyncRx<spsc::Array<Response>>;
 type PBFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+
+pub struct Receiver(AsyncRx<spsc::Array<Response>>);
+impl Receiver {
+    pub async fn recv(&mut self) -> Response {
+        self.0.recv().await.unwrap()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Connection(MAsyncTx<mpsc::List<Outgoing>>);
 impl Connection {
-    pub async fn send(&self, request: Request) -> Response {
-        let (tx, rx): (_, AsyncRx<_>) = spsc::build(spsc::One::new());
+    pub async fn send(&self, request: Request) -> Receiver {
+        let (tx, rx): (_, AsyncRx<_>) = spsc::build(spsc::Array::new(request.max_responses()));
         self.0.send((postcard::to_allocvec(&request).unwrap(), tx)).await.unwrap();
-        rx.recv().await.unwrap()
+        Receiver(rx)
     }
 }
 
@@ -92,6 +100,7 @@ impl Purser {
 
     async fn write(mut sink: Sink, rx: AsyncRx<mpsc::List<Outgoing>>, stx: AsyncTx<mpsc::List<Responder>>, mut write: SplitSink<S, Message>) {
         while let Ok((request, responder)) = rx.recv().await {
+            
             let _ = stx.send(responder).await;
             //TODO: Again be more resilant to bad connections
             write.send(Message::Binary(postcard::to_allocvec(&sink.encrypt(request)).unwrap().into())).await.unwrap();
@@ -114,13 +123,15 @@ impl Purser {
                     match ws_result.unwrap() {
                         Message::Binary(payload) => {
                             let (index, response): (u64, Response) = postcard::from_bytes(&drain.decrypt(postcard::from_bytes(&payload).unwrap()).unwrap()).unwrap();
-                            let _ = pending.remove(&(index as usize)).unwrap().send(response).await;
+                            let _ = pending.get_mut(&(index as usize)).unwrap().send(response).await;
                         },
                         m => panic!("Unexpected Message: {m:?}")
                     }
                 }
                 else => break,
             }
+
+            pending.retain(|_, responder| responder.get_tx_count() > 0);
         }
     }
 }
@@ -169,13 +180,16 @@ impl Chandler {
         let (mut write, mut read) = stream.split();
         let (mut sink, mut drain) = encryption.split();
         let mut index: usize = 0;
-        let mut futures: FuturesUnordered<PBFut<Result<(usize, Response), crossfire::RecvError>>> = FuturesUnordered::new();
+        let mut futures: FuturesUnordered<PBFut<(usize, Response, RReceiver)>> = FuturesUnordered::new();
 
         loop {
             tokio::select! {
                 biased;
-                Some(Ok((index, response))) = futures.next() => {
+                Some((index, response, receiver)) = futures.next() => {
                     let _ = write.send(Message::Binary(postcard::to_allocvec(&sink.encrypt(postcard::to_allocvec(&(index, response)).unwrap())).unwrap().into())).await;
+                    if receiver.get_tx_count() > 0 {
+                        futures.push(Box::pin(async move {(index, receiver.recv().await.unwrap(), receiver)}) as _);
+                    }
                 },
                 Some(ws_result) = read.next() => {
                     match ws_result {
@@ -183,7 +197,7 @@ impl Chandler {
                             Message::Binary(payload) => {
                                 let request = postcard::from_bytes(&drain.decrypt(postcard::from_bytes(&payload).unwrap()).unwrap()).unwrap();
                                 let srx = self.storage.request(request).await;
-                                futures.push(Box::pin(async move {srx.recv().await.map(|r| (index, r))}) as _);
+                                futures.push(Box::pin(async move {(index, srx.recv().await.unwrap(), srx)}) as _);
                                 index += 1;
                             },
                             Message::Close(_) => {

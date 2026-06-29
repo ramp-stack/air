@@ -36,7 +36,7 @@ pub enum Error {
 impl std::error::Error for Error {}
 impl std::fmt::Display for Error {fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {write!(f, "{self:?}")}}
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Copy)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Copy, Default)]
 #[derive(serde_with::SerializeDisplay)]
 #[derive(serde_with::DeserializeFromStr)]
 pub struct Id([u8; 32]);

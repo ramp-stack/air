@@ -32,6 +32,13 @@ pub enum Request{
     Receive(Signed<Time>),
 }
 
+impl Request {
+    pub fn max_responses(&self) -> usize {match self {
+        Self::Read(_, true) => 2,
+        _ => 1
+    }}
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 pub enum Response {
     Create(Signature, u64),
@@ -43,7 +50,7 @@ pub enum Response {
     InvalidSignature(String),
 }
 
-type Responder = AsyncTx<spsc::One<Response>>;
+type Responder = AsyncTx<spsc::Array<Response>>;
 
 #[derive(Clone)]
 pub struct Storage(MAsyncTx<mpsc::List<(Request, Responder)>>);
@@ -55,8 +62,8 @@ impl Storage {
         Storage(tx)
     }
 
-    pub async fn request(&mut self, request: Request) -> AsyncRx<spsc::One<Response>> {
-        let (stx, srx) = spsc::build(spsc::One::new());
+    pub async fn request(&mut self, request: Request) -> AsyncRx<spsc::Array<Response>> {
+        let (stx, srx) = spsc::build(spsc::Array::new(request.max_responses()));
         let _ = self.0.send((request, stx)).await;
         srx
     }
@@ -136,12 +143,11 @@ impl Storage {
                     ).optional().unwrap() {
                         let _ = responder.send(read).await;
                     } else {
+                        let timestamp = now();
+                        let id = Id::hash(&(key, timestamp, Id::MIN));
+                        let _ = responder.send(Response::Read(secret.sign(id), timestamp, None)).await;
                         if subscribe {
                             subscriptions.entry(key).or_default().push(responder);
-                        } else {
-                            let timestamp = now();
-                            let id = Id::hash(&timestamp);
-                            let _ = responder.send(Response::Read(secret.sign(id), timestamp, None)).await;
                         }
                     }
                 },

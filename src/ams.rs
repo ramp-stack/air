@@ -1,40 +1,58 @@
 use std::sync::Arc;
-use std::marker::PhantomData;
 use std::fmt::Debug;
 
 use std::sync::Mutex;
+use std::sync::MutexGuard;
 
 use arc_swap::ArcSwap;
 use postage::broadcast::{channel, Sender, Receiver};
 use postage::prelude::{Sink, Stream};
 
-pub enum Ref<'a, T> {
-    Arc(PhantomData::<fn(&'a ())>, Arc<T>),
-    Map(PhantomData::<fn(&'a ())>, Box<dyn Fn() -> &'a T + Send + Sync + 'a>)
+pub enum Ref<T> {
+    Arc(Arc<T>),
+    Map(Box<dyn for<'a> Fn(&'a ()) -> &'a T + Send + Sync>)
 }
-impl<'a, T> AsRef<T> for Ref<'a, T> {fn as_ref(&self) -> &T {self}}
-impl<'a, T: Debug> std::fmt::Debug for Ref<'a, T> {fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<T> AsRef<T> for Ref<T> {fn as_ref(&self) -> &T {self}}
+impl<T: Debug> std::fmt::Debug for Ref<T> {fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     (**self).fmt(f)
 }}
 
-impl<'a, T> std::ops::Deref for Ref<'a, T> {
+impl<T> std::ops::Deref for Ref<T> {
     type Target = T;
     fn deref(&self) -> &T {match self {
-        Self::Arc(_, arc) => arc.as_ref(),
-        Self::Map(_, f) => f()
+        Self::Arc(arc) => arc.as_ref(),
+        Self::Map(f) => f(&())
     }}
 }
-impl<'a, T: Send + Sync> Ref<'a, T> {
-    pub fn map<R>(self, access: impl for<'b> Fn(&'b T) -> &'b R + Sync + Send + 'a) -> Ref<'a, R> {match self {
-        Ref::Arc(p, a) => Ref::Map(p, Box::new(move || {
+impl<T: Send + Sync + 'static> Ref<T> {
+    pub fn map<R>(self, access: impl for<'a> Fn(&'a T) -> &'a R + Sync + Send + 'static) -> Ref<R> {match self {
+        Ref::Arc(a) => Ref::Map(Box::new(move |_: &()| {
             let r: &R = access(a.as_ref());
             unsafe { &*(r as *const R) }
         })),
-        Ref::Map(p, f) => Ref::Map(p, Box::new(move || {
-            let r: &R = access(f());
+        Ref::Map(f) => Ref::Map(Box::new(move |t: &()| {
+            let r: &R = access(f(t));
             unsafe { &*(r as *const R) }
+            
         })),
     }}
+}
+
+pub struct RefMut<'a, T, U>(MutexGuard<'a, Sender<U>>, T, &'a ArcSwap<T>);
+impl<'a, T, U: Clone + Debug> RefMut<'a, T, U> {
+    ///If commit is not called then the changes made will be discarded
+    pub fn commit(mut self, update: U) {
+        self.2.store(Arc::new(self.1));
+        self.0.try_send(update).unwrap();
+        drop(self.0);
+    }
+}
+impl<'a, T, U> std::ops::Deref for RefMut<'a, T, U> {
+    type Target = T;
+    fn deref(&self) -> &T {&self.1}
+}
+impl<'a, T, U> std::ops::DerefMut for RefMut<'a, T, U> {
+    fn deref_mut(&mut self) -> &mut T {&mut self.1}
 }
 
 ///This is an extension of the arc_swap which allows locking via tokio::sync::Mutex to preform
@@ -46,19 +64,22 @@ impl<'a, T: Send + Sync> Ref<'a, T> {
 ///structures from im or im_rc are recommended for large sets where writes are often smaller than half of
 ///the total structure.
 #[derive(Debug, Clone)]
-pub struct Ams<T: Clone + Send + Sync, U: Clone + Debug + Send + Sync>(Arc<(Mutex<()>, ArcSwap<T>)>, Sender<U>, Receiver<U>);
-impl<T: Clone + Send + Sync, U: Clone + Debug + Send + Sync> Ams<T, U> {
+pub struct Ams<T: Clone + Send + Sync, U: Clone + Debug + Send + Sync>(Arc<(Mutex<Sender<U>>, ArcSwap<T>)>, Receiver<U>);
+impl<T: Clone + Send + Sync, U: Clone + Debug + Send + Sync> PartialEq for Ams<T, U> {
+    fn eq(&self, other: &Self) -> bool {Arc::ptr_eq(&self.0, &other.0)}
+}
+impl<T: Clone + Send + Sync + 'static, U: Clone + Debug + Send + Sync> Ams<T, U> {
     pub fn new(init: T) -> Self {
         let (tx, rx) = channel(10000);
-        Ams(Arc::new((Mutex::new(()), ArcSwap::from(Arc::new(init)))), tx, rx)
+        Ams(Arc::new((Mutex::new(tx), ArcSwap::from(Arc::new(init)))), rx)
     }
 
-    pub fn clear_updates(&mut self) {self.2 = self.1.subscribe();}
-    pub fn get_update(&mut self) -> Option<U> {self.2.try_recv().ok()}
+    pub fn clear_updates(&mut self) {self.1 = self.0.0.lock().unwrap().subscribe();}
+    pub fn get_update(&mut self) -> Option<U> {self.1.try_recv().ok()}
 
     #[allow(clippy::await_holding_refcell_ref)]
     pub async fn listen(&mut self) -> U {
-        self.2.recv().await.unwrap()
+        self.1.recv().await.unwrap()
     }
 
     ///Warning: Only use this if there is a single writer thread and you want to avoid sending a message,
@@ -67,36 +88,17 @@ impl<T: Clone + Send + Sync, U: Clone + Debug + Send + Sync> Ams<T, U> {
         self.0.1.store(Arc::new(new));
     }
 
-    pub fn try_lock<E>(&mut self, callback: impl FnOnce(&mut T) -> Result<U, E>, clear: bool) -> Result<U, E> {
-        let _lock = self.0.0.lock().unwrap(); 
-        let mut t = self.0.1.load_full().as_ref().clone();
-        let update = callback(&mut t)?;
-        self.1.try_send(update.clone()).unwrap();
-        self.0.1.store(Arc::new(t));
-        if clear {self.2 = self.1.subscribe();}
-        Ok(update)
+    pub fn lock(&self) -> RefMut<'_, T, U> {
+        let guard = self.0.0.lock().unwrap(); 
+        RefMut(guard, self.0.1.load_full().as_ref().clone(), &self.0.1)
     }
 
-    pub fn lock(&mut self, callback: impl FnOnce(&mut T) -> U, clear: bool) -> U {
-        let _lock = self.0.0.lock().unwrap(); 
-        let mut t = self.0.1.load_full().as_ref().clone();
-        let update = callback(&mut t);
-        self.1.try_send(update.clone()).unwrap();
-        self.0.1.store(Arc::new(t));
-        if clear {self.2 = self.1.subscribe();}
-        update
-    }
+    pub fn load(&self) -> Ref<T> {Ref::Arc(self.0.1.load_full().clone())}
 
-    ///We reset update channel to head before reading, its possible an update will occure
-    ///between clearing the updates and reading the latest version
-    pub fn load(&self) -> Ref<'_, T> {
-        Ref::Arc(PhantomData::<fn(&'_ ())>, self.0.1.load_full().clone())
-    }
-
-    pub fn load_partial<'a, C: Sync>(&'a self, access: impl for<'b> Fn(&'b T) -> &'b C + Sync + Send + 'a) -> Ref<'a, C> {
-        let guard = self.0.1.load();
-        Ref::Map(PhantomData::<fn(&'a ())>, Box::new(move || {
-            let r: &C = access(&**guard);
+    pub fn load_partial<C: Sync>(&self, access: impl for<'a> Fn(&'a T) -> &'a C + Sync + Send + 'static) -> Ref<C> {
+        let arc = self.0.1.load_full().clone();
+        Ref::Map(Box::new(move |_: &()| {
+            let r: &C = access(arc.as_ref());
             unsafe { &*(r as *const C) }
         }))
     }

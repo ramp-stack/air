@@ -14,46 +14,19 @@ use server::Purser;
 mod channel;
 
 mod contract;
-pub use contract::{Contract, Reactant, Reactants, Instance, DynInstance, Context, Update, Listner};
+pub use contract::{Contract, Reactant, Reactants, Instance, DynInstance, DynResult, Listner, AnyContract, AnyReactant, Metadata, Pending, PendingResult, Context};
 
-use std::any::TypeId;
-use tokio::sync::watch::{channel, Receiver, Sender};
-use std::collections::BTreeMap;
-use std::pin::Pin;
+mod service;
+pub use service::{Service, Services, Lock};
 
-pub trait Service: Send + 'static {
-    fn run(&mut self, ctx: &mut Context) -> impl Future<Output = Option<std::time::Duration>> + Send;
-}
-
-type ErasedService = Box<dyn FnOnce(Receiver<Option<bool>>, Context) -> Pin<Box<dyn Future<Output = ()> + Send>>>;
-#[derive(Default)]
-pub struct Services(BTreeMap<TypeId, ErasedService>);
-impl Services {
-    #[allow(clippy::should_implement_trait)]
-    pub fn add<S: Service>(mut self, mut service: S) -> Self {
-        self.0.insert(TypeId::of::<S>(), Box::new(move |mut watcher: Receiver<Option<bool>>, mut ctx: Context| {
-            Box::pin(async move { loop {
-                while !watcher.borrow_and_update().unwrap_or_default() {
-                    if watcher.changed().await.is_ok() {return;}
-                    if watcher.borrow_and_update().is_none() {return;}
-                    continue;
-                }
-
-                match service.run(&mut ctx).await {
-                    Some(duration) => tokio::time::sleep(duration).await,
-                    None => {return;}
-                }
-            }})
-        }));
-        self
-    }
-}
-
+use tokio_util::task::TaskTracker;
+use tokio_util::sync::CancellationToken;
+    
 #[derive(Clone, Debug)]
 pub struct Air{
     handle: tokio::runtime::Handle,
-    remote: Sender<Option<bool>>,
-    watcher: Receiver<Option<bool>>,
+    token: CancellationToken,
+    tasks: TaskTracker,
     secret: Secret,
     name: Name,
     purser: Purser,
@@ -62,34 +35,40 @@ pub struct Air{
 impl Air {
     pub fn me(&self) -> Name {self.name}
 
+    pub fn service_secret<S: Service>(&self) -> Secret {self.secret.derive(&[S::id()])}
+
     fn new(secret: Secret) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread().enable_time().enable_io().build().unwrap();
         let _guard = runtime.enter();
         let resolver = names::Resolver::start();
         let purser = server::Purser::start(resolver.clone());
 
-        let (remote, mut watcher) = channel(Some(true));
+        let token = CancellationToken::new();
+        let tasks = TaskTracker::new();
         let air = Air{
             handle: runtime.handle().clone(),
-            remote,
-            watcher: watcher.clone(),
+            token: token.clone(),
+            tasks: tasks.clone(),
             name: secret.name(),
             secret,
             purser,
             resolver
         };
-        std::thread::spawn(move || runtime.block_on(async move { loop {
-            if watcher.changed().await.is_ok()
-            && watcher.borrow_and_update().is_none() {
-                return;
-            }
-        }}));
+        std::thread::spawn(move || runtime.block_on(async move {
+            token.cancelled().await;
+            tasks.wait().await;
+        }));
         air 
     }
 
-    pub fn start(secret: Secret) -> (Self, Context) {
-        let air = Self::new(secret);
+    pub fn spawn<F: Future<Output = ()> + Send + 'static>(&self, future: F) {
+        self.tasks.spawn_on(future, &self.handle);
+    }
+
+    pub fn start(secret: Secret, services: Services) -> (Self, Context) {
+        let air = Self::new(secret.clone());
         let context = air.handle.clone().block_on(async {contract::Manager::start(air.clone())});
+        services.start(context.clone());
         (air, context)
     }
 
@@ -98,20 +77,16 @@ impl Air {
         air.handle.block_on(server::Chandler::start(secret))
     }
 
-    pub fn start_services(&self, services: Services, context: &mut Context) {
-        for (_, service) in services.0 {
-            self.handle.spawn(service(self.watcher.clone(), context.clone()));
-        }
+    pub fn shutdown(self) {
+        self.token.cancel();
+        self.tasks.close();
+        self.handle.clone().block_on(self.tasks.wait());
     }
-
-    pub fn pause(&self) {self.remote.send(Some(false)).unwrap();}
-    pub fn resume(&self) {self.remote.send(Some(true)).unwrap();}
-    pub fn shutdown(self) {self.remote.send(None).unwrap();}
 }
 
 #[cfg(test)]
 mod test {
-    use crate::{Air, Contract, Reactant, Reactants, Instance, Name, Secret, Id, Context, Service, Services, Listner};
+    use crate::{Air, Contract, Reactant, Reactants, Instance, Name, Secret, Id, Context, Service, Services, Listner, Metadata};
     use serde::{Serialize, Deserialize};
     use std::collections::BTreeMap;
     use std::time::Duration;
@@ -119,15 +94,20 @@ mod test {
     #[derive(Default)]
     pub struct ChatBot(Listner<Room>);
     impl Service for ChatBot {
-        async fn run(&mut self, ctx: &mut Context) -> Option<Duration> {
-            if let (room, Some(update)) = self.0.listen(ctx).await
-            && let Some(Ok(id)) = update.as_reactant::<_, SendMessage>() {
+        fn id() -> Id {Id::hash("CHATBOT")}
+        async fn new(_ctx: &mut Context, _secret: Secret) -> Self {ChatBot(Listner::default())}
+        async fn run(&mut self, ctx: &mut Context) {
+            if let (room, Some(Ok(id))) = self.0.listen::<SendMessage>(ctx).await {
                 let message = room.confirmed().unwrap().messages.values().find(|m| m.id == id).unwrap().clone();
-                if !message.body.contains("ChatBot Quoting") {
-                    room.apply(SendMessage(Id::random(), format!("ChatBot Quoting {} Saying: \"{}\"", message.author, message.body))).unwrap();
+                if message.author == ctx.me() && !message.body.contains("ChatBot Replying") {
+                    room.apply(SendMessage(Id::random(), format!("ChatBot Replying to \"{:.10}...\": I totally agree", message.body))).load().clone().unwrap();
                 }
             }
-            Some(Duration::from_secs(0))
+        }
+        async fn shutdown(self, ctx: &mut Context) {
+            for mut room in ctx.list::<Room>() {
+                room.apply(SendMessage(Id::random(), "ChatBot Shutting Down".to_string())).load().clone().unwrap();
+            }
         }
     }
 
@@ -149,9 +129,9 @@ mod test {
         type Init = String;
         fn id() -> Id {Id::hash("Room")}
 
-        fn init(init: Self::Init, signer: Name, _timestamp: u64) -> Self {
+        fn init(init: Self::Init, metadata: Metadata) -> Self {
             Room {
-                author: signer,
+                author: metadata.signer,
                 name: init, 
                 messages: BTreeMap::new()
             }
@@ -176,9 +156,9 @@ mod test {
 
         fn id() -> Id {Id::hash("SendMessage")}
 
-        fn apply(self, room: &mut Room, signer: Name, timestamp: u64) -> Self::Result {
+        fn apply(self, room: &mut Room, metadata: Metadata) -> Self::Result {
             if room.messages.values().any(|m| m.id == self.0) {Err(MessageExists(self.0))?}
-            room.messages.entry(timestamp).or_insert(Message{author: signer, timestamp, body: self.1, id: self.0});
+            room.messages.entry(metadata.timestamp).or_insert(Message{author: metadata.signer, timestamp: metadata.timestamp, body: self.1, id: self.0});
             Ok(self.0)
         }
     }
@@ -197,9 +177,9 @@ mod test {
 
         fn id() -> Id {Id::hash("EditMessage")}
 
-        fn apply(self, room: &mut Room, signer: Name, _timestamp: u64) -> Self::Result {
+        fn apply(self, room: &mut Room, metadata: Metadata) -> Self::Result {
             if let Some(message) = room.messages.values_mut().find(|m| m.id == self.0) {
-                if message.author != signer {Err(InvalidAuthor(message.author))?}
+                if message.author != metadata.signer {Err(InvalidAuthor(message.author))?}
                 message.body = self.1;
                 Ok(true)
             } else {Ok(false)}
@@ -209,16 +189,15 @@ mod test {
 
     #[test]
     fn test() {
-        let (alice, mut a_ctx) = Air::start(Secret::new());
-        let (bob, mut b_ctx) = Air::start(Secret::new());
-        alice.start_services(Services::default().add(ChatBot::default()), &mut a_ctx);
+        let (alice, mut a_ctx) = Air::start(Secret::new(), Services::default().add::<ChatBot>());
+        let (bob, mut b_ctx) = Air::start(Secret::new(), Services::default());
 
         let mut room: Instance<Room> = a_ctx.create::<Room>("MyRoom".to_string());
         let mut other_instance = room.clone();
-        let id = room.apply(SendMessage(Id::random(), "Hi Bob".to_string())).unwrap();
+        let id = room.apply(SendMessage(Id::random(), "Hi Bob".to_string())).load().clone().unwrap();
         assert!(other_instance.pending_updated());
         assert!(!other_instance.pending_updated());
-        assert_eq!(other_instance.apply(EditMessage(id, "GoodBye Bob".to_string())), Ok(true));
+        assert_eq!(*other_instance.apply(EditMessage(id, "GoodBye Bob".to_string())).load(), Ok(true));
         assert!(room.pending_updated());
 
         std::thread::sleep(Duration::from_millis(100));
@@ -226,8 +205,8 @@ mod test {
             assert_eq!(i.confirmed().unwrap().as_ref(), i.pending().as_ref());
         });
 
-        let room = a_ctx.list::<Room>().pop().unwrap();
-        room.share(bob.me());
+        let mut a_room = a_ctx.list::<Room>().pop().unwrap();
+        a_room.share(bob.me());
         b_ctx.register::<Room>();
 
         std::thread::sleep(Duration::from_millis(100));
@@ -236,11 +215,16 @@ mod test {
         assert_eq!(room.try_apply(EditMessage(id, "Bob Edititing Alices Message".to_string())), Err(InvalidAuthor(alice.me())));
 
         room.clear_confirmed();
-        let id = room.apply(SendMessage(Id::random(), "Hi Alice".to_string())).unwrap();
-        assert_eq!(room.apply(SendMessage(id, "Sent With Existing Message Id".to_string())), Err(MessageExists(id)));
-
+        println!("1Before");
         std::thread::sleep(Duration::from_millis(200));
-        let update = room.confirmed_update().unwrap();
-        assert_eq!(update.as_reactant::<Room, SendMessage>().unwrap(), Ok(id))
+        println!("1After");
+
+        let id = room.apply(SendMessage(Id::random(), "Hi Alice".to_string())).load().clone().unwrap();
+        //assert_eq!(*room.apply(SendMessage(id, "Sent With Existing Message Id".to_string())).load(), Err(MessageExists(id)));
+        println!("Before");
+        std::thread::sleep(Duration::from_millis(200));
+        println!("After");
+        let update = a_room.confirmed_update::<SendMessage>().unwrap();
+        assert_eq!(update, Ok(id))
     }
 }

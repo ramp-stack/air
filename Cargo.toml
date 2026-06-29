@@ -32,6 +32,7 @@ axum = {version="0.8.9", features=["ws"]}
 im = {version="15.1.0", features=["serde"]}
 arc-swap = {version="1.9.1", features=["serde"]}
 postage = "0.5.0"
+tokio-util = {version="0.7.18", features=["rt"]}
 
 [features]
 default = ["stream"]
