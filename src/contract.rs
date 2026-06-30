@@ -9,7 +9,6 @@ use std::hash::Hash;
 use std::any::TypeId;
 use std::sync::Arc;
 use std::pin::Pin;
-use std::task::Poll;
 use std::any::Any;
 use std::fmt::Debug;
 use std::hash::Hasher;
@@ -101,19 +100,19 @@ impl std::fmt::Debug for DynResult {fn fmt(&self, f: &mut std::fmt::Formatter<'_
     f.debug_tuple("DynResult").field(&self.0).finish()
 }}
 
-pub enum PendingResult<O: Debug + Clone + Sync + Send + 'static, E: Debug + Clone + Sync + Send + 'static> {
-    Ok(Pending<Result<O, E>>),
-    Err(E)
-}
-impl<O: Debug + Clone + Sync + Send + 'static, E: Debug + Clone + Sync + Send + 'static> Future for PendingResult<O, E> {
-    type Output = Result<O, E>;
-    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        unsafe { match &mut *self.get_unchecked_mut() {
-            Self::Ok(pending) => Pin::new_unchecked(pending).poll(cx),
-            Self::Err(err) => Poll::Ready(Err(err.clone())),
-        }}
+#[derive(Clone)]
+pub struct DynInstance(Id, Id, Arc<Box<dyn Any + Send + Sync>>);
+impl DynInstance {
+    fn new<C: Contract>(instance: Instance<C>) -> Self {
+        DynInstance(C::id(), instance.id, Arc::new(Box::new(instance)))
+    }
+    pub fn as_contract<C: Contract>(&self) -> Option<Instance<C>> {
+        (self.0 == C::id()).then(|| self.2.downcast_ref::<Instance<C>>().unwrap().clone())
     }
 }
+impl Debug for DynInstance {fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("Instance").field("contract_id", &self.0).field("id", &self.1).finish()
+}}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pending<R: Debug + Clone + Sync + Send + 'static>(Ams<(R, bool), bool>);
@@ -123,6 +122,13 @@ impl<R: Debug + Clone + Sync + Send + 'static> Pending<R> {
     pub fn is_confirmed(&self) -> bool {self.0.load().1}
     pub fn load(&self) -> Ref<R> {self.0.load_partial(|r: &(R, bool)| &r.0)}
     pub fn get_update(&mut self) -> Option<bool> {self.0.get_update()}
+    pub async fn confirmed(mut self) -> Ref<R> {
+        loop {
+            if self.0.listen().await {
+                break self.load()
+            }
+        }
+    }
 
     fn update(&mut self, result: R, confirmed: bool) {
         let mut lock = self.0.lock();
@@ -130,16 +136,16 @@ impl<R: Debug + Clone + Sync + Send + 'static> Pending<R> {
         lock.commit(confirmed);
     }
 }
-impl<R: Debug + Clone + Sync + Send + 'static> Future for Pending<R> {
-    type Output = R;
-    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        {
-            let fut = self.0.listen();
-            tokio::pin!(fut);
-            if matches!(fut.as_mut().poll(cx), Poll::Pending) {return Poll::Pending;}
-        }
-        Poll::Ready(self.load().clone())
-    }
+
+pub enum PendingResult<O: Debug + Clone + Sync + Send + 'static, E: Debug + Clone + Sync + Send + 'static> {
+    Ok(Pending<Result<O, E>>),
+    Err(E)
+}
+impl<O: Debug + Clone + Sync + Send + 'static, E: Debug + Clone + Sync + Send + 'static> PendingResult<O, E> {
+    pub async fn confirmed(self) -> Result<O, E> {match self {
+        Self::Ok(pending) => pending.confirmed().await.clone(),
+        Self::Err(e) => Err(e)
+    }}
 }
 
 type Queue<C> = VecDeque<(Id, ErasedReactant<C>)>;
@@ -320,36 +326,12 @@ impl<C: Contract> Instance<C> {
         }
     }
 
-    pub async fn wait_for_initialized(&mut self) -> Ref<C> {
+    pub async fn initialize(&mut self) -> Ref<C> {
         loop { if *self.head.load() {break;} self.head.listen().await;}
         self.confirmed().unwrap()
     }
 }
-//  impl<C: Contract> Future for Instance<C> {
-//      type Output = Ref<'_, C>;
-//      fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-//          {
-//              let fut = self.0.listen();
-//              tokio::pin!(fut);
-//              if matches!(fut.as_mut().poll(cx), Poll::Pending) {return Poll::Pending;}
-//          }
-//          Poll::Ready(self.load().clone())
-//      }
-//  }
 
-#[derive(Clone)]
-pub struct DynInstance(Id, Id, Arc<Box<dyn Any + Send + Sync>>);
-impl DynInstance {
-    fn new<C: Contract>(instance: Instance<C>) -> Self {
-        DynInstance(C::id(), instance.id, Arc::new(Box::new(instance)))
-    }
-    pub fn as_contract<C: Contract>(&self) -> Option<Instance<C>> {
-        (self.0 == C::id()).then(|| self.2.downcast_ref::<Instance<C>>().unwrap().clone())
-    }
-}
-impl Debug for DynInstance {fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.debug_struct("Instance").field("contract_id", &self.0).field("id", &self.1).finish()
-}}
 
 type Instances = BTreeMap<Id, BTreeMap<Id, DynInstance>>;
 
@@ -387,8 +369,12 @@ impl Context {
         }
     }
 
-    pub async fn listen(&mut self) -> DynInstance {
-        self.instances.listen().await
+    pub async fn listen<C: Contract>(&mut self) -> Instance<C> {
+        loop {
+            if let Some(c) = self.instances.listen().await.as_contract::<C>() {
+                break c;
+            }
+        }
     }
 
     pub async fn get_new_instance(&mut self) -> Option<DynInstance> {
@@ -405,15 +391,17 @@ impl Context {
             None => {
                 let all = self.instances.clone();
                 let mut instances = self.instances.lock();
+                let mut commit = false;
                 let instance = instances.entry(c_id).or_insert_with(|| {
                     self.tx.try_send(Request::Register(c_id, InstanceBuilder::new::<C>(self.air.clone(), all))).unwrap();
                     BTreeMap::default()
                 }).entry(id).or_insert_with(|| {
+                    commit = true;
                     let instance = Instance::<C>::start(self.air.clone(), location, Some(init));
                     self.tx.try_send(Request::New(location)).unwrap();
                     DynInstance::new(instance)
                 }).clone();
-                instances.commit(instance.clone());
+                if commit { instances.commit(instance.clone());}
                 instance.as_contract::<C>().unwrap()
             }
         }
@@ -558,33 +546,6 @@ impl<C: Contract> Reactants<C> {
     }
 }
 
-pub struct Listner<C: Contract>(BTreeMap<Id, Instance<C>>);
-impl<C: Contract> Listner<C> {
-    pub async fn listen<R: Reactant<C>>(&mut self, contracts: &mut Context) -> (&mut Instance<C>, Option<R::Result>) {
-        if self.0.is_empty() && let Some(room) = contracts.listen().await.as_contract::<C>() {
-            (self.0.entry(room.id()).or_insert(room), None)
-        } else { loop {
-            let mut pending = self.0.values_mut().map(|instance| async {
-                (instance.listen_confirmed::<R>().await, instance.id())
-            }).collect::<FuturesUnordered<_>>();
-
-            tokio::select! { biased;
-                instance = contracts.listen() => {
-                    drop(pending);
-                    if let Some(room) = instance.as_contract::<C>() {
-                        break (self.0.entry(room.id()).or_insert(room), None)
-                    }
-                },
-                Some((update, id)) = pending.next() => {
-                    drop(pending);
-                    break (self.0.get_mut(&id).unwrap(), Some(update));
-                },
-            }
-        }}
-    }
-}
-impl<C: Contract> Default for Listner<C> {fn default() -> Self {Self(BTreeMap::default())}}
-
 struct InstanceBuilder(Box<dyn Fn(Location) -> PBFut<()> + Send + Sync>);
 impl InstanceBuilder {
     pub fn new<C: Contract>(air: Air, instances: Ams<Instances, DynInstance>) -> Self {
@@ -596,10 +557,12 @@ impl InstanceBuilder {
                 let id = Id::hash(&location);
                 if !instances.load().get(&c_id).map(|g| g.contains_key(&id)).unwrap_or_default() {
                     let mut instances = instances.lock();
+                    let mut commit = false;
                     let instance = instances.entry(c_id).or_default().entry(id).or_insert_with(|| {
+                        commit = true;
                         DynInstance::new(Instance::<C>::start(air.clone(), location, None))
                     }).clone();
-                    instances.commit(instance);
+                    if commit {instances.commit(instance);}
                 }
             })
         }))
@@ -648,8 +611,7 @@ impl Location {
     pub fn new<C: Contract>(secret: &Secret, init: &C::Init) -> Self {
         let c_id = C::id();
         let hash = Id::hash(&init);
-        let secret = secret.derive(&[c_id, hash]);
-        let key = secret.harden();
+        let key = secret.derive(&[c_id, hash]).harden();
         Location{key, contract_id: c_id, contract_hash: hash}
     }
 }

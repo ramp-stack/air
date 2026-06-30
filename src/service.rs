@@ -18,17 +18,17 @@ impl Services {
     #[allow(clippy::should_implement_trait)]
     pub fn add<S: Service>(mut self) -> Self {
         self.0.insert(TypeId::of::<S>(), (S::id(), Box::new(move |mut ctx: Context, secret: Secret| Box::pin(async move { 
-            let mut service = S::new(&mut ctx, secret).await;
             let token = ctx.air.token.clone();
-            loop {
-                tokio::select! {
+            tokio::select! {
+                mut service = S::new(&mut ctx, secret) => loop {tokio::select! {
                     biased;
                     _ = token.cancelled() => {
                         service.shutdown(&mut ctx).await;
                         break;
                     }
                     _ = service.run(&mut ctx) => {}
-                }
+                }},
+                _ = token.cancelled() => {}
             }
         }))));
         self
@@ -46,90 +46,64 @@ impl Services {
 
 use crate::{Metadata, Reactant, Contract, Reactants, Instance, names::now};
 use serde::{Serialize, Deserialize};
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, Sleep, Duration};
 
 pub const LOCK: u64 = 20_000_000_000;//20 seconds
 pub const MARGIN: u64 = 10_000_000_000;//10 seconds
 
-pub struct Lock<S>(Option<S>, Instance<ServiceLock>, Id, Secret);
+pub struct Lock<S>(S, Instance<ServiceLock>, Id, Secret, Option<Pin<Box<Sleep>>>);
 impl<S: Service> Lock<S> {
-    async fn remaining(instance: &mut Instance<ServiceLock>, my_id: Id) -> u64 {
-        let current = instance.wait_for_initialized().await;
-        let remaining = (current.1+LOCK).saturating_sub(now()+MARGIN);
-        if current.0 == my_id {remaining} else {0}
-    }
-
-    async fn obtain(instance: &mut Instance<ServiceLock>, my_id: Id) -> (u64, bool) {
+    async fn obtain(instance: &mut Instance<ServiceLock>, my_id: Id, remaining: &mut Option<Pin<Box<Sleep>>>) -> bool {
         let mut clear = false;
-        let remaining = Self::remaining(instance, my_id).await;
-        println!("Obtaining");
-        if remaining > 0 {
-            println!("Still Hav: {:?}: {}", remaining / 1_000_000, my_id);
-            (remaining, clear)
-        } else { loop {
-            match instance.try_apply(Obtain(my_id)).await {
+        if remaining.as_ref().map(|r| r.is_elapsed()).unwrap_or(true) {loop {
+            match instance.try_apply(Obtain(my_id)).confirmed().await {
                 Ok(time) => {
-                    let remaining = (time+LOCK).saturating_sub(now()+MARGIN);
-                    println!("Obtained: {:?}: {}", remaining / 1_000_000, my_id);
-                    break (remaining, clear);
+                    *remaining = Some(Box::pin(sleep(Duration::from_nanos((time+LOCK).saturating_sub(now()+MARGIN)))));
+                    break
                 },
                 Err(wait) => {
-                    println!("I don't have or lost the lock");
                     clear = true;
-                    let sleep = sleep(Duration::from_nanos(wait));
                     tokio::select!{
-                        _ = sleep => {},
+                        _ = sleep(Duration::from_nanos(wait)) => {},
                         Ok(_) = instance.listen_confirmed::<Release>() => {}
                     }
                 }
             }
         }}
+        clear
     }
 }
 impl<S: Service> Service for Lock<S> {
     fn id() -> Id {Id::hash(&format!("Lock<{}>", S::id()))}
     async fn new(ctx: &mut Context, secret: Secret) -> Self {
-        Lock(None, ctx.create(S::id()), Id::random(), secret)
+        let my_id = Id::random();
+        let mut lock = ctx.create(S::id());
+        let mut remaining = None;
+        let _ = Self::obtain(&mut lock, my_id, &mut remaining).await;
+        let service = S::new(ctx, secret.clone()).await;
+        Lock(service, lock, my_id, secret, remaining)
     }
   
     async fn run(&mut self, ctx: &mut Context) {
-        println!("Running");
-        let (mut remaining, _) = Self::obtain(&mut self.1, self.2).await;
-        if self.0.is_none() {self.0 = Some(S::new(ctx, self.3.clone()).await);}
-        let mut fut = Some(Box::pin(self.0.as_mut().unwrap().run(ctx)));
-        println!("Running as {}: with: {remaining}", self.2);
-        loop { tokio::select! {
-            _ = fut.as_mut().unwrap() => break,
-            _ = sleep(Duration::from_nanos(remaining)) => {
-                println!("Renewing Lock During Run");
-                let (r, c) = Self::obtain(&mut self.1, self.2).await;
-                remaining = r;
-                if c {
-                    drop(fut);
-                    self.0 = Some(S::new(ctx, self.3.clone()).await);
-                    fut = Some(Box::pin(self.0.as_mut().unwrap().run(ctx)));
-                }
+        let mut fut = Box::pin(self.0.run(ctx));
+        loop {
+            if tokio::select! {
+                _ = &mut fut => {break},
+                _ = self.4.as_mut().unwrap() => {true},
+                r = self.1.listen_confirmed::<Release>() => {r.is_ok()}
+            } && Self::obtain(&mut self.1, self.2, &mut self.4).await {
+                drop(fut);
+                self.0 = S::new(ctx, self.3.clone()).await;
+                fut = Box::pin(self.0.run(ctx));
             }
-            Ok(_) = self.1.listen_confirmed::<Release>() => {
-                println!("Try Obtaining lock after release");
-                let (r, c) = Self::obtain(&mut self.1, self.2).await;
-                remaining = r;
-                if c {
-                    drop(fut);
-                    self.0 = Some(S::new(ctx, self.3.clone()).await);
-                    fut = Some(Box::pin(self.0.as_mut().unwrap().run(ctx)));
-                }
-            }
-        }}
+        }
     }
 
     async fn shutdown(mut self, ctx: &mut Context) {
-        let remaining = Self::remaining(&mut self.1, self.2).await;
-        println!("shutdown_info: {:?}: {}", remaining / 1_000_000, self.2);
-        if remaining > 0 {
-            self.0.unwrap().shutdown(ctx).await;
+        if self.4.map(|r| !r.is_elapsed()).unwrap_or_default() {
+            self.0.shutdown(ctx).await;
         }
-        let _ = self.1.apply(Release(self.2)).await;
+        let _ = self.1.apply(Release(self.2)).confirmed().await;
     }
 }
 
@@ -156,7 +130,9 @@ impl Reactant<ServiceLock> for Obtain {
                 *id = self.0;
                 Ok(*time)
             },
-            ServiceLock(_, time) => Err(*time+LOCK - metadata.timestamp)
+            ServiceLock(_, time) => {
+                Err(*time+LOCK - metadata.timestamp)
+            }
         }
     }
 }

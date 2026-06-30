@@ -14,7 +14,7 @@ use server::Purser;
 mod channel;
 
 mod contract;
-pub use contract::{Contract, Reactant, Reactants, Instance, DynInstance, DynResult, Listner, AnyContract, AnyReactant, Metadata, Pending, PendingResult, Context};
+pub use contract::{Contract, Reactant, Reactants, Instance, DynInstance, DynResult, AnyContract, AnyReactant, Metadata, Pending, PendingResult, Context};
 
 mod service;
 pub use service::{Service, Services, Lock};
