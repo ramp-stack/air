@@ -5,8 +5,8 @@ use std::sync::Mutex;
 use std::sync::MutexGuard;
 
 use arc_swap::ArcSwap;
-use postage::broadcast::{channel, Sender, Receiver};
-use postage::prelude::{Sink, Stream};
+use tokio::sync::broadcast::{channel, Sender, Receiver};
+//use postage::prelude::{Sink, Stream};
 
 pub enum Ref<T> {
     Arc(Arc<T>),
@@ -41,9 +41,14 @@ impl<T: Send + Sync + 'static> Ref<T> {
 pub struct RefMut<'a, T, U>(MutexGuard<'a, Sender<U>>, T, &'a ArcSwap<T>);
 impl<'a, T, U: Clone + Debug> RefMut<'a, T, U> {
     ///If commit is not called then the changes made will be discarded
-    pub fn commit(mut self, update: U) {
+    pub fn commit(self, update: U) {
         self.2.store(Arc::new(self.1));
-        self.0.try_send(update).unwrap();
+        self.0.send(update).unwrap();
+        drop(self.0);
+    }
+
+    pub fn commit_silent(self) {
+        self.2.store(Arc::new(self.1));
         drop(self.0);
     }
 }
@@ -55,6 +60,7 @@ impl<'a, T, U> std::ops::DerefMut for RefMut<'a, T, U> {
     fn deref_mut(&mut self) -> &mut T {&mut self.1}
 }
 
+///If I send an update then clone the instance should I never receive the event I commited
 ///This is an extension of the arc_swap which allows locking via tokio::sync::Mutex to preform
 ///concurrent writes keeping the reads lockless. And provides a broadcast system for updates.
 ///
@@ -63,8 +69,11 @@ impl<'a, T, U> std::ops::DerefMut for RefMut<'a, T, U> {
 ///not blocking reads. This could have a lot of over head if T::clone() is expensive. Using
 ///structures from im or im_rc are recommended for large sets where writes are often smaller than half of
 ///the total structure.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Ams<T: Clone + Send + Sync, U: Clone + Debug + Send + Sync>(Arc<(Mutex<Sender<U>>, ArcSwap<T>)>, Receiver<U>);
+impl<T: Clone + Send + Sync, U: Clone + Debug + Send + Sync> Clone for Ams<T, U> {fn clone(&self) -> Self {
+    Ams(self.0.clone(), self.1.resubscribe())
+}}
 impl<T: Clone + Send + Sync, U: Clone + Debug + Send + Sync> PartialEq for Ams<T, U> {
     fn eq(&self, other: &Self) -> bool {Arc::ptr_eq(&self.0, &other.0)}
 }
@@ -74,7 +83,7 @@ impl<T: Clone + Send + Sync + 'static, U: Clone + Debug + Send + Sync> Ams<T, U>
         Ams(Arc::new((Mutex::new(tx), ArcSwap::from(Arc::new(init)))), rx)
     }
 
-    pub fn clear_updates(&mut self) {self.1 = self.0.0.lock().unwrap().subscribe();}
+    pub fn clear_updates(&mut self) {self.1 = self.1.resubscribe();}
     pub fn get_update(&mut self) -> Option<U> {self.1.try_recv().ok()}
 
     #[allow(clippy::await_holding_refcell_ref)]

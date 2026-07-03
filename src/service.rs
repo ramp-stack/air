@@ -18,7 +18,7 @@ impl Services {
     #[allow(clippy::should_implement_trait)]
     pub fn add<S: Service>(mut self) -> Self {
         self.0.insert(TypeId::of::<S>(), (S::id(), Box::new(move |mut ctx: Context, secret: Secret| Box::pin(async move { 
-            let token = ctx.air.token.clone();
+            let token = ctx.1.token.clone();
             tokio::select! {
                 mut service = S::new(&mut ctx, secret) => loop {tokio::select! {
                     biased;
@@ -35,10 +35,10 @@ impl Services {
     }
 
     pub(crate) fn start(self, context: Context) {
-        context.air.handle.clone().spawn(async move {
-            let s_key = context.air.secret.derive(&[Id::hash("SERVICES")]);
+        context.1.handle.clone().spawn(async move {
+            let s_key = context.1.secret.derive(&[Id::hash("SERVICES")]);
             for (_, (service_id, service)) in self.0 {
-                context.air.spawn(service(context.clone(), s_key.derive(&[service_id])));
+                context.1.spawn(service(context.clone(), s_key.derive(&[service_id])));
             }
         });
     }
@@ -63,10 +63,12 @@ impl<S: Service> Lock<S> {
                 },
                 Err(wait) => {
                     clear = true;
-                    tokio::select!{
-                        _ = sleep(Duration::from_nanos(wait)) => {},
-                        Ok(_) = instance.listen_confirmed::<Release>() => {}
-                    }
+                    loop {tokio::select!{
+                        _ = sleep(Duration::from_nanos(wait)) => {break},
+                        output = instance.listen_confirmed() => {
+                            if output.downcast::<Release>().map(|r| r.is_ok()).unwrap_or_default() {break}
+                        }
+                    }}
                 }
             }
         }}
@@ -90,7 +92,9 @@ impl<S: Service> Service for Lock<S> {
             if tokio::select! {
                 _ = &mut fut => {break},
                 _ = self.4.as_mut().unwrap() => {true},
-                r = self.1.listen_confirmed::<Release>() => {r.is_ok()}
+                output = self.1.listen_confirmed() => {
+                    output.downcast::<Release>().map(|r| r.is_ok()).unwrap_or_default()
+                }
             } && Self::obtain(&mut self.1, self.2, &mut self.4).await {
                 drop(fut);
                 self.0 = S::new(ctx, self.3.clone()).await;
@@ -122,8 +126,8 @@ impl Contract for ServiceLock {
 struct Obtain(Id);
 impl Reactant<ServiceLock> for Obtain {
     fn id() -> Id {Id::hash("Obtain")}
-    type Result = Result<u64, u64>;
-    fn apply(self, lock: &mut ServiceLock, metadata: Metadata) -> Self::Result {
+    type Output = Result<u64, u64>;
+    fn apply(self, lock: &mut ServiceLock, metadata: Metadata) -> Self::Output {
         match lock {
             ServiceLock(id, time) if *id == self.0 || *time+LOCK < metadata.timestamp => {
                 *time = metadata.timestamp;
@@ -141,8 +145,8 @@ impl Reactant<ServiceLock> for Obtain {
 struct Release(Id);
 impl Reactant<ServiceLock> for Release {
     fn id() -> Id {Id::hash("Release")}
-    type Result = Result<Id, Id>;
-    fn apply(self, lock: &mut ServiceLock, _metadata: Metadata) -> Self::Result {
+    type Output = Result<Id, Id>;
+    fn apply(self, lock: &mut ServiceLock, _metadata: Metadata) -> Self::Output {
         if lock.0 == self.0 {
             lock.1 = 0;
             Ok(lock.0)

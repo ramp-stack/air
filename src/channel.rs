@@ -29,8 +29,16 @@ impl Stream {
 #[derive(Clone, Debug)]
 pub struct Sink(MAsyncTx<spsc::List<(Id, Vec<u8>)>>);
 impl Sink {
-    pub async fn write(&self, rid: Id, data: Vec<u8>) {self.0.send((rid, data)).await.unwrap()}
-    pub fn write_sync(&self, rid: Id, data: Vec<u8>) {self.0.clone().try_send((rid, data)).unwrap()}
+    pub async fn write(&self, data: Vec<u8>) -> Id {
+        let id = Id::random();
+        self.0.send((id, data)).await.unwrap();
+        id
+    }
+    pub fn write_sync(&self, data: Vec<u8>) -> Id {
+        let id = Id::random();
+        self.0.clone().try_send((id, data)).unwrap();
+        id
+    }
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Copy, Debug, Default)]

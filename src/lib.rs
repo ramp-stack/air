@@ -14,13 +14,24 @@ use server::Purser;
 mod channel;
 
 mod contract;
-pub use contract::{Contract, Reactant, Reactants, Instance, DynInstance, DynResult, AnyContract, AnyReactant, Metadata, Pending, PendingResult, Context};
+pub use contract::{Contract, Reactant, Reactants, Instance, AnyInstance, AnyOutput, Metadata, Pending, PendingResult, Instances};
 
 mod service;
 pub use service::{Service, Services, Lock};
 
 use tokio_util::task::TaskTracker;
 use tokio_util::sync::CancellationToken;
+
+#[derive(Clone)]
+pub struct Context(Instances, Air);
+impl Context {
+    pub fn me(&self) -> Name {self.1.name}
+    pub fn service_secret<S: Service>(&self) -> Secret {self.1.service_secret::<S>()}
+    pub fn register<C: Contract>(&self) {self.0.register::<C>()}
+    pub fn create<C: Contract>(&self, init: C::Init) -> Instance<C> {self.0.create(init)}
+    pub fn list<C: Contract>(&self) -> Vec<Instance<C>> {self.0.list::<C>()}
+    pub fn instances(&self) -> Instances {self.0.clone()}
+}
     
 #[derive(Clone, Debug)]
 pub struct Air{
@@ -67,7 +78,8 @@ impl Air {
 
     pub fn start(secret: Secret, services: Services) -> (Self, Context) {
         let air = Self::new(secret.clone());
-        let context = air.handle.clone().block_on(async {contract::Manager::start(air.clone())});
+        let instances = air.handle.clone().block_on(async {contract::Manager::start(air.clone())});
+        let context = Context(instances, air.clone());
         services.start(context.clone());
         (air, context)
     }
