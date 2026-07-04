@@ -4,7 +4,8 @@ use crate::channel::{Inbox, InboxHandler, Sink, Stream, Channel, Event};
 use crate::cache::Cache;
 use crate::Air;
 
-use std::collections::{HashSet, BTreeMap, VecDeque, btree_map::Entry};
+use std::collections::{HashSet, HashMap, BTreeMap, VecDeque, btree_map::Entry};
+use std::marker::PhantomData;
 use std::hash::Hash;
 use std::any::TypeId;
 use std::sync::Arc;
@@ -27,7 +28,7 @@ pub trait Contract: Serialize + for<'a> Deserialize<'a> + Send + Sync + Clone + 
 }
 
 pub trait Reactant<C: Contract>: Serialize + for<'a> Deserialize<'a> + Debug + Clone + Send + Sync + 'static {
-    type Output: Clone + Clone + Send + Sync + 'static;
+    type Output: Debug + Clone + Send + Sync + 'static;
 
     fn id() -> Id;
 
@@ -58,7 +59,6 @@ impl<C: Contract> Reactants<C> {
     fn apply(&self, id: &Id, reactant: Vec<u8>, contract: &mut C, metadata: Metadata) -> Option<AnyOutput<C>> {
         match self.0.get(id) {
             Some((_, _, apply)) => (apply)(reactant, contract, metadata),
-            None if *id == C::id() => {println!("Tried to Init Contract Again"); None}
             None => {println!("Unknown Reactant {:?}", id); None}
         }
     }
@@ -78,12 +78,13 @@ impl AnyInstance {
 }
 
 #[derive(Clone)]
-pub struct AnyOutput<C: Contract>(Arc<Box<dyn Fn() -> Box<dyn Any + Send + Sync> + Send + Sync>>, std::marker::PhantomData<C>);
-impl<C: Contract> Debug for AnyOutput<C> {fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {f.debug_struct("AnyOutput").finish()}}
+pub struct AnyOutput<C: Contract>(Arc<Box<dyn Fn() -> Box<dyn Any + Send + Sync> + Send + Sync>>, PhantomData<C>, String);
+impl<C: Contract> Debug for AnyOutput<C> {fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {f.debug_tuple("AnyOutput").field(&self.2).finish()}}
 
 impl<C: Contract> AnyOutput<C> {
     pub fn new<R: Reactant<C>>(output: R::Output) -> Self {
-        AnyOutput(Arc::new(Box::new(move || Box::new(output.clone()))), std::marker::PhantomData::<C>)
+        let debug = format!("{:?}", output);
+        AnyOutput(Arc::new(Box::new(move || Box::new(output.clone()))), PhantomData::<C>, debug)
     }
     pub fn downcast<R: Reactant<C>>(&self) -> Option<R::Output> {
         (self.0)().downcast::<R::Output>().ok().map(|o| *o)
@@ -182,10 +183,6 @@ impl<C: Contract> Instance<C> {
         InboxHandler::send(self.air.clone(), name, postcard::to_allocvec(&self.location).unwrap());
     }
 
-  //pub fn clear_confirmed(&mut self) { self.confirmed.clear_updates(); }
-  //pub fn clear_pending(&mut self) { self.pending.clear_updates(); }
-  //pub fn clear_updates(&mut self) { self.clear_confirmed(); self.clear_pending(); }
-
     pub fn confirmed_update(&mut self) -> Option<AnyOutput<C>> {
         self.confirmed.get_update()
     }
@@ -194,7 +191,7 @@ impl<C: Contract> Instance<C> {
         self.confirmed.listen().await
     }
 
-    pub fn confirmed(&self) -> Ref<C> {
+    pub fn load_confirmed(&self) -> Ref<C> {
         self.confirmed.load_partial(|c| c.as_ref().unwrap())
     }
 
@@ -208,7 +205,7 @@ impl<C: Contract> Instance<C> {
         self.pending.listen().await
     }
 
-    pub fn pending(&self) -> Ref<C> {
+    pub fn load_pending(&self) -> Ref<C> {
         self.pending.load_partial(|i| i.1.as_ref().unwrap())
     }
 
@@ -261,6 +258,8 @@ impl<C: Contract> Instance<C> {
                             } else {
                                 println!("Invalid Contract Init");
                             }
+                        } else if id == self.id {
+                            println!("Found Contract Init Again(ignoring)");
                         } else {
                             let mut pending = self.pending.lock();
                             let mut confirmed = self.confirmed.lock();
@@ -299,8 +298,8 @@ impl<C: Contract> Instance<C> {
 type Builder = Arc<Box<dyn Fn(Location) -> AnyInstance + Send + Sync>>;
 
 #[derive(Clone)]
-pub struct Instances(Ams<BTreeMap<Id, BTreeMap<Id, AnyInstance>>, AnyInstance>, Ams<BTreeMap<Id, Builder>, Id>, Air);
-impl Instances {
+pub struct Contracts(Ams<BTreeMap<Id, BTreeMap<Id, AnyInstance>>, AnyInstance>, Ams<BTreeMap<Id, Builder>, Id>, Air);
+impl Contracts {
     pub fn register<C: Contract>(&self) {
         let c_id = C::id();
         let air = self.2.clone();
@@ -338,14 +337,14 @@ impl Instances {
 
     fn build(&self, location: Location) -> Option<AnyInstance> {
         let id = Id::hash(&location);
-        match self.0.load().get(&location.contract_id)?.get(&id) {
+        match self.0.load().get(&location.contract_id).and_then(|i| i.get(&id)) {
             Some(instance) => Some(instance.clone()),
             None => {
                 let mut instances = self.0.lock();
-                match instances.get_mut(&location.contract_id)?.entry(id) {
+                match instances.entry(location.contract_id).or_default().entry(id) {
                     Entry::Occupied(occ) => Some(occ.get().clone()),
                     Entry::Vacant(vac) => {
-                        let instance = (self.1.load().get(&location.contract_id).unwrap())(location);
+                        let instance = (self.1.load().get(&location.contract_id)?)(location);
                         vac.insert(instance.clone());
                         instances.commit(instance.clone());
                         Some(instance) 
@@ -355,29 +354,50 @@ impl Instances {
         }
     }
 
-    pub fn list<C: Contract>(&self) -> Vec<Instance<C>> {
+    pub fn list<C: Contract>(&self) -> HashMap<Id, Instance<C>> {
         match self.0.load().get(&C::id()) {
             None => {
                 self.register::<C>();
-                Vec::new()
+                HashMap::new()
             },
-            Some(instances) => instances.values().filter_map(|i| {
+            Some(instances) => instances.iter().filter_map(|(id, i)| {
                 let instance = i.downcast::<C>().unwrap();
                 if instance.pending.load().1.is_some() {
-                    Some(instance.clone())
+                    Some((*id, instance.clone()))
                 } else {None}
             }).collect()
         }
     }
 
-    pub async fn listen(&mut self) -> AnyInstance {self.0.listen().await}
-    pub fn get_next(&mut self) -> Option<AnyInstance> {self.0.get_update()}
+    
+}
+
+#[derive(Clone)]
+pub struct Instances<C: Contract>(Contracts, PhantomData::<C>);
+impl<C: Contract> Instances<C> {
+    pub(crate) fn new(contracts: &Contracts) -> Self {
+        contracts.register::<C>();
+        Instances(contracts.clone(), PhantomData::<C>)
+    }
+    pub fn create(&self, init: C::Init) -> Instance<C> {self.0.create::<C>(init)}
+    pub fn list(&self) -> HashMap<Id, Instance<C>> {self.0.list::<C>()}
+    pub async fn listen(&mut self) -> Instance<C> {
+        loop {if let Some(instance) = self.0.0.listen().await.downcast() {
+            break instance;
+        }}
+    }
+    pub fn get_next(&mut self) -> Option<Instance<C>> {
+        loop {match self.0.0.get_update() {
+            None => {break None;},
+            Some(instance) => {if let Some(instance) = instance.downcast() {break Some(instance);}}
+        }}
+    }
 }
 
 ///Keeps track of my Context and their locations for recovery, (Scanning my inbox, creating new
 ///channels, storing and listening for new instances. Air never touches a contract Init
 pub struct Manager {
-    instances: Instances,
+    contracts: Contracts,
     cache: Cache,
     root: Root,
     inbox: InboxHandler,
@@ -386,16 +406,16 @@ pub struct Manager {
 }
 
 impl Manager {
-    pub fn start(air: Air) -> Instances {
+    pub fn start(air: Air) -> Contracts {
         let cache = Cache::new(format!("./{}/{}.db", air.name, air.name)).unwrap();
         let root = cache.get::<Root>("root").unwrap().unwrap_or_default();
 
         let inbox = root.inbox.start(air.clone());
-        let instances = Instances(Ams::new(BTreeMap::new()), Ams::new(BTreeMap::new()), air.clone());
-        let i = instances.clone();
+        let contracts = Contracts(Ams::new(BTreeMap::new()), Ams::new(BTreeMap::new()), air.clone());
+        let i = contracts.clone();
 
         air.handle.clone().spawn(async move {
-            let mut manager = Manager{sinks: BTreeMap::new(), cache, root, inbox, joinset: JoinSet::new(), instances};
+            let mut manager = Manager{sinks: BTreeMap::new(), cache, root, inbox, joinset: JoinSet::new(), contracts};
             let keys = manager.root.contracts.keys().copied().collect::<Vec<_>>();
             for id in keys {
                 manager.register(id);
@@ -407,7 +427,7 @@ impl Manager {
 
     fn register(&mut self, id: Id) -> &mut HashSet<Location> {
         &mut self.root.contracts.entry(id).or_insert_with(|| {
-            let air = self.instances.2.clone();
+            let air = self.contracts.2.clone();
             let secret = air.secret.derive(&[id]);
             let channel = Channel::new(secret.harden());
             let (mut stream, sink) = channel.start(air, secret);
@@ -431,17 +451,17 @@ impl Manager {
     async fn run(mut self) {
         loop {
             tokio::select!{ biased;
-                c_id = self.instances.1.listen() => {
+                c_id = self.contracts.1.listen() => {
                     for location in self.register(c_id).iter().copied().collect::<Vec<_>>() { 
-                        self.instances.build(location).expect("False Register");
+                        self.contracts.build(location).expect("False Register");
                     }
                 },
-                instance = self.instances.0.listen() => {self.store(instance.1, true).await},
+                instance = self.contracts.0.listen() => {self.store(instance.1, true).await},
                 (_, location) = self.inbox.read() => {
                     self.root.inbox = *self.inbox.inbox();
                     if let Some(location) = location.and_then(|l| postcard::from_bytes(&l).ok()) {
                         self.store(location, true).await;
-                        self.instances.build(location);
+                        self.contracts.build(location);
                     }
                 },
                 Some(Ok((id, mut stream, _, event))) = self.joinset.join_next() => {
@@ -451,7 +471,7 @@ impl Manager {
                     && let Ok((contract_hash, key)) = postcard::from_bytes::<(Id, SecretKey)>(&data) {
                         let location = Location{key, contract_id: id, contract_hash};
                         self.store(location, false).await;
-                        self.instances.build(location);
+                        self.contracts.build(location);
                     }
 
                     self.joinset.spawn(async move {

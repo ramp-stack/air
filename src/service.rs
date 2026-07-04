@@ -79,7 +79,7 @@ impl<S: Service> Service for Lock<S> {
     fn id() -> Id {Id::hash(&format!("Lock<{}>", S::id()))}
     async fn new(ctx: &mut Context, secret: Secret) -> Self {
         let my_id = Id::random();
-        let mut lock = ctx.create(S::id());
+        let mut lock = ctx.instances().create(S::id());
         let mut remaining = None;
         let _ = Self::obtain(&mut lock, my_id, &mut remaining).await;
         let service = S::new(ctx, secret.clone()).await;

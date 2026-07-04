@@ -23,14 +23,11 @@ use tokio_util::task::TaskTracker;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
-pub struct Context(Instances, Air);
+pub struct Context(contract::Contracts, Air);
 impl Context {
     pub fn me(&self) -> Name {self.1.name}
     pub fn service_secret<S: Service>(&self) -> Secret {self.1.service_secret::<S>()}
-    pub fn register<C: Contract>(&self) {self.0.register::<C>()}
-    pub fn create<C: Contract>(&self, init: C::Init) -> Instance<C> {self.0.create(init)}
-    pub fn list<C: Contract>(&self) -> Vec<Instance<C>> {self.0.list::<C>()}
-    pub fn instances(&self) -> Instances {self.0.clone()}
+    pub fn instances<C: Contract>(&self) -> Instances<C> {Instances::new(&self.0)}
 }
     
 #[derive(Clone, Debug)]

@@ -39,6 +39,9 @@ impl<T: Send + Sync + 'static> Ref<T> {
 }
 
 pub struct RefMut<'a, T, U>(MutexGuard<'a, Sender<U>>, T, &'a ArcSwap<T>);
+impl<'a, T: Debug, U: Clone + Debug> std::fmt::Debug for RefMut<'a, T, U> {fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    self.1.fmt(f)
+}}
 impl<'a, T, U: Clone + Debug> RefMut<'a, T, U> {
     ///If commit is not called then the changes made will be discarded
     pub fn commit(self, update: U) {
@@ -69,6 +72,9 @@ impl<'a, T, U> std::ops::DerefMut for RefMut<'a, T, U> {
 ///not blocking reads. This could have a lot of over head if T::clone() is expensive. Using
 ///structures from im or im_rc are recommended for large sets where writes are often smaller than half of
 ///the total structure.
+///
+///TODO: Don't emit an update when I commit
+///      When I load clear the updates atomicaly
 #[derive(Debug)]
 pub struct Ams<T: Clone + Send + Sync, U: Clone + Debug + Send + Sync>(Arc<(Mutex<Sender<U>>, ArcSwap<T>)>, Receiver<U>);
 impl<T: Clone + Send + Sync, U: Clone + Debug + Send + Sync> Clone for Ams<T, U> {fn clone(&self) -> Self {
@@ -86,7 +92,6 @@ impl<T: Clone + Send + Sync + 'static, U: Clone + Debug + Send + Sync> Ams<T, U>
     pub fn clear_updates(&mut self) {self.1 = self.1.resubscribe();}
     pub fn get_update(&mut self) -> Option<U> {self.1.try_recv().ok()}
 
-    #[allow(clippy::await_holding_refcell_ref)]
     pub async fn listen(&mut self) -> U {
         self.1.recv().await.unwrap()
     }
