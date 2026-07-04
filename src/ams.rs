@@ -8,7 +8,8 @@ use arc_swap::ArcSwap;
 
 pub enum Ref<T> {
     Arc(Arc<(T, u32)>),
-    Map(Box<dyn for<'a> Fn(&'a ()) -> &'a T + Send + Sync>)
+    #[allow(clippy::type_complexity)]
+    Map(Arc<Box<dyn for<'a> Fn(&'a ()) -> &'a T + Send + Sync>>)
 }
 impl<T> AsRef<T> for Ref<T> {fn as_ref(&self) -> &T {self}}
 impl<T: Debug> std::fmt::Debug for Ref<T> {fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -23,16 +24,21 @@ impl<T> std::ops::Deref for Ref<T> {
     }}
 }
 impl<T: Send + Sync + 'static> Ref<T> {
+    #[allow(clippy::should_implement_trait)]
+    pub fn clone(s: &Self) -> Self {match s {
+        Ref::Arc(a) => Ref::Arc(a.clone()),
+        Ref::Map(f) => Ref::Map(f.clone()),
+    }}
     pub fn map<R>(self, access: impl for<'a> Fn(&'a T) -> &'a R + Sync + Send + 'static) -> Ref<R> {match self {
-        Ref::Arc(a) => Ref::Map(Box::new(move |_: &()| {
+        Ref::Arc(a) => Ref::Map(Arc::new(Box::new(move |_: &()| {
             let r: &R = access(&a.as_ref().0);
             unsafe { &*(r as *const R) }
-        })),
-        Ref::Map(f) => Ref::Map(Box::new(move |t: &()| {
+        }))),
+        Ref::Map(f) => Ref::Map(Arc::new(Box::new(move |t: &()| {
             let r: &R = access(f(t));
             unsafe { &*(r as *const R) }
             
-        })),
+        }))),
     }}
 }
 
@@ -121,10 +127,10 @@ impl<T: Clone + Send + Sync + 'static, U: Clone + Debug + Send + Sync> Ams<T, U>
 
     pub fn load_partial<C: Sync>(&mut self, access: impl for<'a> Fn(&'a T) -> &'a C + Sync + Send + 'static) -> Ref<C> {
         let arc = self.load_inner();
-        Ref::Map(Box::new(move |_: &()| {
+        Ref::Map(Arc::new(Box::new(move |_: &()| {
             let r: &C = access(&arc.as_ref().0);
             unsafe { &*(r as *const C) }
-        }))
+        })))
     }
 
     fn load_inner(&mut self) -> Arc<(T, u32)> {

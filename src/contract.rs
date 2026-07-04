@@ -370,9 +370,10 @@ impl Contracts {
     }
 }
 
-pub enum Update<C: Contract> {New, Pending, Confirmed(AnyOutput<C>)}
+pub enum Update<C: Contract> {NewInstance, Pending, Confirmed(AnyOutput<C>)}
 
 pub struct Instances<C: Contract>(Contracts, HashMap<Id, Instance<C>>);
+impl<C: Contract> Debug for Instances<C> {fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {f.debug_tuple("Instances").field(&self.1).finish()}}
 impl<C: Contract> Instances<C> {
     pub(crate) fn new(contracts: Contracts) -> Self {
         contracts.register::<C>();
@@ -394,7 +395,7 @@ impl<C: Contract> Instances<C> {
                     drop(set);
                     if let Some(instance) = instance.downcast::<C>() {
                         let instance = self.1.entry(instance.id()).or_insert(instance);
-                        return (instance, Update::New);
+                        return (instance, Update::NewInstance);
                     }
                 },
                 Some((id, update)) = set.next() => {
@@ -409,7 +410,7 @@ impl<C: Contract> Instances<C> {
         match self.0.0.get_update() {
             Some(instance) => instance.downcast::<C>().map(|instance| {
                 let instance = self.1.entry(instance.id()).or_insert(instance);
-                (instance, Update::New)
+                (instance, Update::NewInstance)
             }),
             None => self.1.values_mut().find_map(|i| i.get_update().map(|u| (i, u)))
         }
@@ -456,18 +457,21 @@ impl Manager {
     }
 
     fn register(&mut self, id: Id) -> &mut HashSet<Location> {
-        &mut self.root.contracts.entry(id).or_insert_with(|| {
-            let air = self.contracts.2.clone();
-            let secret = air.secret.derive(&[id]);
+        let air = self.contracts.2.clone();
+        let secret = air.secret.derive(&[id]);
+        let entry = self.root.contracts.entry(id).or_insert_with(|| {
             let channel = Channel::new(secret.harden());
-            let (mut stream, sink) = channel.start(air, secret);
-            self.sinks.insert(id, sink);
+            (channel, HashSet::default())
+        });
+        self.sinks.entry(id).or_insert_with(|| {
+            let (mut stream, sink) = entry.0.start(air, secret);
             self.joinset.spawn(async move {
                 let (time, namedata) = stream.read().await;
                 (id, stream, time, namedata)
             });
-            (channel, HashSet::default())
-        }).1
+            sink
+        });
+        &mut entry.1
     }
 
     async fn store(&mut self, location: Location, write: bool) {
