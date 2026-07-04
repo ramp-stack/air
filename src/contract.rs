@@ -372,7 +372,6 @@ impl Contracts {
 
 pub enum Update<C: Contract> {New, Pending, Confirmed(AnyOutput<C>)}
 
-#[derive(Clone)]
 pub struct Instances<C: Contract>(Contracts, HashMap<Id, Instance<C>>);
 impl<C: Contract> Instances<C> {
     pub(crate) fn new(contracts: Contracts) -> Self {
