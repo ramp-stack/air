@@ -56,6 +56,7 @@ impl<S: Service> Lock<S> {
     async fn obtain(instance: &mut Instance<ServiceLock>, my_id: Id, remaining: &mut Option<Pin<Box<Sleep>>>) -> bool {
         let mut clear = false;
         if remaining.as_ref().map(|r| r.is_elapsed()).unwrap_or(true) {loop {
+            println!("applying obtain");
             match instance.try_apply(Obtain(my_id)).confirmed().await {
                 Ok(time) => {
                     *remaining = Some(Box::pin(sleep(Duration::from_nanos((time+LOCK).saturating_sub(now()+MARGIN)))));
@@ -63,6 +64,7 @@ impl<S: Service> Lock<S> {
                 },
                 Err(wait) => {
                     clear = true;
+                    println!("waiting to unlock: {:?}", wait);
                     loop {tokio::select!{
                         _ = sleep(Duration::from_nanos(wait)) => {break},
                         output = instance.listen_confirmed() => {
@@ -79,9 +81,11 @@ impl<S: Service> Service for Lock<S> {
     fn id() -> Id {Id::hash(&format!("Lock<{}>", S::id()))}
     async fn new(ctx: &mut Context, secret: Secret) -> Self {
         let my_id = Id::random();
-        let mut lock = ctx.instances().create(S::id());
+        let mut lock = ctx.create(S::id());
         let mut remaining = None;
+        println!("obtaining lock");
         let _ = Self::obtain(&mut lock, my_id, &mut remaining).await;
+        println!("obtained lock");
         let service = S::new(ctx, secret.clone()).await;
         Lock(service, lock, my_id, secret, remaining)
     }

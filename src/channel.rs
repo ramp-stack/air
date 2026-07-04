@@ -143,50 +143,6 @@ impl Channel {
     }
 }
 
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn channel() {
-        let secret = Secret::new();
-        let key = secret.harden();
-        let name = secret.name();
-
-        let air = crate::Air::new(secret.clone());
-
-        let (mut stream, sink) = Channel::new(key).start(air.clone(), secret);
-
-        air.handle.block_on(async {
-            let content = b"hello".to_vec();
-            let rid = Id::random();
-            sink.write(rid, content.clone()).await;
-            let (timestamp, data) = stream.read().await;
-            assert_eq!(stream.channel(), &Channel{key, index: 1, timestamp});
-            assert_eq!(data, Event::Data(name, content.clone(), Some(rid)));
-
-            let content2 = b"goodbye".to_vec();
-            let rid = Id::random();
-            sink.write(rid, content2.clone()).await;
-            let (timestamp2, data2) = stream.read().await;
-            assert_eq!(stream.channel(), &Channel{key, index: 2, timestamp: timestamp2});
-            assert_eq!(data2, Event::Data(name, content2.clone(), Some(rid)));
-
-            let rid = Id::random();
-            tokio::spawn(async move {
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                sink.write(rid, b"late".to_vec()).await;
-            });
-
-            let (_, data) = stream.read().await;
-            assert_eq!(data, Event::Head);
-
-            let (_, data) = stream.read().await;
-            assert_eq!(data, Event::Data(name, b"late".to_vec(), Some(rid)));
-        });
-    }
-}
-
 #[derive(Debug)]
 pub struct InboxHandler(Inbox, AsyncRx<spsc::List<(u64, Option<Vec<u8>>)>>);
 impl InboxHandler {
@@ -233,5 +189,48 @@ impl Inbox {
             }
         }});
         InboxHandler(self, rx)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn channel() {
+        let secret = Secret::new();
+        let key = secret.harden();
+        let name = secret.name();
+
+        let air = crate::Air::new(secret.clone());
+
+        let (mut stream, sink) = Channel::new(key).start(air.clone(), secret);
+
+        air.handle.block_on(async {
+            let content = b"hello".to_vec();
+            let rid = sink.write(content.clone()).await;
+            let (timestamp, data) = stream.read().await;
+            assert_eq!(stream.channel(), &Channel{key, index: 1, timestamp});
+            assert_eq!(data, Event::Data(name, content.clone(), Some(rid)));
+
+            let content2 = b"goodbye".to_vec();
+            let rid = sink.write(content2.clone()).await;
+            let (timestamp2, data2) = stream.read().await;
+            assert_eq!(stream.channel(), &Channel{key, index: 2, timestamp: timestamp2});
+            assert_eq!(data2, Event::Data(name, content2.clone(), Some(rid)));
+
+            let write = tokio::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                sink.write(b"late".to_vec()).await
+            });
+
+            let (_, data) = stream.read().await;
+            assert_eq!(data, Event::Head);
+
+            let rid = write.await.unwrap();
+
+            let (_, data) = stream.read().await;
+            assert_eq!(data, Event::Data(name, b"late".to_vec(), Some(rid)));
+        });
     }
 }

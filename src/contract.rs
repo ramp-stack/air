@@ -11,9 +11,11 @@ use std::any::TypeId;
 use std::sync::Arc;
 use std::any::Any;
 use std::fmt::Debug;
+use std::sync::Mutex;
 
 use serde::{Serialize, Deserialize};
 
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use tokio::task::JoinSet;
 
 use crate::ams::{Ams, Ref};
@@ -107,34 +109,33 @@ pub struct Pending<C: Contract, R: Reactant<C>>(Ams<(R::Output, bool), bool>);
 impl<C: Contract, R: Reactant<C>> Pending<C, R> {
     fn new(output: R::Output) -> Self {Pending(Ams::new((output, false)))}
 
-    pub fn is_confirmed(&self) -> bool {self.0.load().1}
-    pub fn load(&self) -> Ref<R::Output> {self.0.load_partial(|r| &r.0)}
+    pub fn is_confirmed(&mut self) -> bool {self.0.load().1}
+    pub fn load(&mut self) -> Ref<R::Output> {self.0.load_partial(|r| &r.0)}
     pub fn get_update(&mut self) -> Option<bool> {self.0.get_update()}
     pub async fn confirmed(mut self) -> Ref<R::Output> {
         loop {if self.0.listen().await {break self.load()}}
     }
 
-    fn update(&self, output: R::Output, confirmed: bool) {
+    fn update(&mut self, output: R::Output, confirmed: bool) {
         let mut lock = self.0.lock();
         *lock = (output, confirmed);
         lock.commit(confirmed);
     }
 }
 
-type GetOutput<C> = Box<dyn Fn(&mut C, Metadata) -> AnyOutput<C> + Send + Sync>;
+type Apply<C> = Box<dyn FnMut(&mut C, Metadata) -> AnyOutput<C> + Send + Sync>;
 
-#[derive(Clone)]
-pub struct PendingReactant<C: Contract>(Id, Arc<GetOutput<C>>);
+pub struct PendingReactant<C: Contract>(Id, Apply<C>);
 impl<C: Contract> Debug for PendingReactant<C> {fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_tuple("PendingReactant").field(&self.0).finish()
 }}
 impl<C: Contract> PendingReactant<C> {
-    pub fn new<R: Reactant<C>>(id: Id, reactant: R, pending: Pending<C, R>) -> Self {
-        PendingReactant(id, Arc::new(Box::new(move |contract: &mut C, metadata: Metadata| {
+    pub fn new<R: Reactant<C>>(id: Id, reactant: R, mut pending: Pending<C, R>) -> Self {
+        PendingReactant(id, Box::new(move |contract: &mut C, metadata: Metadata| {
             let output = reactant.clone().apply(contract, metadata);
             pending.update(output.clone(), metadata.confirmed);
             AnyOutput::new::<R>(output)
-        })))
+        }))
     }
     pub fn apply(&mut self, contract: &mut C, metadata: Metadata) -> AnyOutput<C> {
         (self.1)(contract, metadata)
@@ -149,7 +150,8 @@ pub struct Instance<C: Contract>{
     location: Location,
     reactants: Arc<Reactants<C>>,
     confirmed: Ams<Option<C>, AnyOutput<C>>,
-    pending: Ams<(VecDeque<PendingReactant<C>>, Option<C>), ()>,
+    pending_queue: Arc<Mutex<VecDeque<PendingReactant<C>>>>,
+    pending: Ams<Option<C>, ()>,
     head: Ams<bool, bool>
 }
 
@@ -172,9 +174,10 @@ impl<C: Contract> Instance<C> {
         let contract = contract.or(init.map(|i| C::init(i, Metadata::pending(air.name))));
         let reactants = Arc::new(C::reactants());
         let confirmed = Ams::new(contract.clone());
-        let pending = Ams::new((VecDeque::new(), contract));
+        let pending_queue = Arc::new(Mutex::new(VecDeque::new()));
+        let pending = Ams::new(contract);
         let head = Ams::new(false);
-        let instance = Instance{sink, air: air.clone(), id, location, reactants, confirmed, pending, head};
+        let instance = Instance{sink, air: air.clone(), id, location, reactants, confirmed, pending_queue, pending, head};
         air.handle.spawn(instance.clone().run(cache, stream));
         instance
     }
@@ -183,45 +186,37 @@ impl<C: Contract> Instance<C> {
         InboxHandler::send(self.air.clone(), name, postcard::to_allocvec(&self.location).unwrap());
     }
 
-    pub fn confirmed_update(&mut self) -> Option<AnyOutput<C>> {
-        self.confirmed.get_update()
+    pub fn confirmed_update(&mut self) -> Option<AnyOutput<C>> {self.confirmed.get_update()}
+    pub async fn listen_confirmed(&mut self) -> AnyOutput<C> {self.confirmed.listen().await}
+    pub fn load_confirmed(&mut self) -> Ref<C> {self.confirmed.load_partial(|c| c.as_ref().unwrap())}
+    pub fn pending_updated(&mut self) -> bool {self.pending.get_update().is_some()}
+    pub async fn listen_pending(&mut self) {self.pending.listen().await}
+    pub fn load_pending(&mut self) -> Ref<C> {self.pending.load_partial(|i| i.as_ref().unwrap())}
+
+    pub fn get_update(&mut self) -> Option<Update<C>> {
+        self.confirmed.get_update().map(Update::Confirmed).or(self.pending.get_update().map(|_| Update::Pending))
     }
 
-    pub async fn listen_confirmed(&mut self) -> AnyOutput<C> {
-        self.confirmed.listen().await
+    pub async fn listen(&mut self) -> Update<C> {
+        tokio::select!{
+            output = self.confirmed.listen() => Update::Confirmed(output),
+            _ = self.pending.listen() => Update::Pending
+        }
     }
-
-    pub fn load_confirmed(&self) -> Ref<C> {
-        self.confirmed.load_partial(|c| c.as_ref().unwrap())
-    }
-
-    pub fn pending_updated(&mut self) -> bool {
-        let r = self.pending.get_update().is_some();
-        self.pending.clear_updates();
-        r
-    }
-
-    pub async fn listen_pending(&mut self) {
-        self.pending.listen().await
-    }
-
-    pub fn load_pending(&self) -> Ref<C> {
-        self.pending.load_partial(|i| i.1.as_ref().unwrap())
-    }
-
 
     ///If the outer result is Err the reactant has not been sent and will not update its state in the future
     pub fn try_apply<O: Send + Sync + Clone + Debug, E: Sync + Send + Clone + Debug, R: Reactant<C, Output = Result<O, E>>>(&mut self, reactant: R) -> PendingResult<C, O, E, R> {
         let id = self.reactants.id::<R>().expect("Reactant is not listed in Contract::reactants()");
         let mut pending = self.pending.lock();
+        let mut queue = self.pending_queue.lock().unwrap();
         let metadata = Metadata::pending(self.air.name);
-        match reactant.clone().apply(pending.1.as_mut().unwrap(), metadata) {
+        match reactant.clone().apply(pending.as_mut().unwrap(), metadata) {
             Err(e) => PendingResult::Err(e),
             Ok(output) => {
                 let output = Pending::new(Ok(output));
                 let id = self.sink.write_sync(postcard::to_allocvec(&(id, postcard::to_allocvec(&reactant).unwrap())).unwrap());
                 let reactant = PendingReactant::new(id, reactant, output.clone());
-                pending.0.push_back(reactant);
+                queue.push_back(reactant);
                 pending.commit(());
                 PendingResult::Ok(output)
             }
@@ -231,16 +226,17 @@ impl<C: Contract> Instance<C> {
     pub fn apply<R: Reactant<C>>(&mut self, reactant: R) -> Pending<C, R> {
         let id = self.reactants.id::<R>().expect("Reactant is not listed in Contract::reactants()");
         let mut pending = self.pending.lock();
+        let mut queue = self.pending_queue.lock().unwrap();
         let metadata = Metadata::pending(self.air.name);
-        let output = Pending::new(reactant.clone().apply(pending.1.as_mut().unwrap(), metadata));
+        let output = Pending::new(reactant.clone().apply(pending.as_mut().unwrap(), metadata));
         let id = self.sink.write_sync(postcard::to_allocvec(&(id, postcard::to_allocvec(&reactant).unwrap())).unwrap());
         let reactant = PendingReactant::new(id, reactant, output.clone());
-        pending.0.push_back(reactant);
+        queue.push_back(reactant);
         pending.commit(());
         output
     }
 
-    async fn run(self, mut cache: Cache, mut stream: Stream) {
+    async fn run(mut self, mut cache: Cache, mut stream: Stream) {
         loop {
             let (timestamp, event) = stream.read().await;
             match event {
@@ -254,7 +250,9 @@ impl<C: Contract> Instance<C> {
                         let metadata = Metadata::confirmed(signer, timestamp);
                         if self.confirmed.load().is_none() {
                             if id == self.id && let Ok(init) = postcard::from_bytes(&bytes) {
-                                self.confirmed.store(Some(C::init(init, metadata)));
+                                let mut confirmed = self.confirmed.lock();
+                                *confirmed = Some(C::init(init, metadata));
+                                confirmed.commit_silent();
                             } else {
                                 println!("Invalid Contract Init");
                             }
@@ -262,8 +260,8 @@ impl<C: Contract> Instance<C> {
                             println!("Found Contract Init Again(ignoring)");
                         } else {
                             let mut pending = self.pending.lock();
+                            let mut queue = self.pending_queue.lock().unwrap();
                             let mut confirmed = self.confirmed.lock();
-                            let queue = &mut pending.0;
 
                             let output = if let Some(rid) = rid && queue.front().map(|pending| pending.0 == rid).unwrap_or_default() {
                                 Some(queue.pop_front().unwrap().apply(confirmed.as_mut().unwrap(), metadata))
@@ -272,10 +270,9 @@ impl<C: Contract> Instance<C> {
                             };
 
                             if let Some(output) = output {
-                                pending.1 = confirmed.clone();
-                                let (queue, sub) = &mut *pending;
-                                for pending in &mut *queue {
-                                    pending.apply(sub.as_mut().unwrap(), Metadata::pending(self.air.name));
+                                *pending = confirmed.clone();
+                                for reactant in &mut *queue {
+                                    reactant.apply(pending.as_mut().unwrap(), Metadata::pending(self.air.name));
                                 }
                                 if queue.is_empty() {pending.commit_silent();} else {pending.commit(());}
                                 confirmed.commit(output);
@@ -289,7 +286,7 @@ impl<C: Contract> Instance<C> {
         }
     }
 
-    pub fn is_near_head(&self) -> bool {*self.head.load()}
+    pub fn is_near_head(&mut self) -> bool {*self.head.load()}
     pub async fn head(&mut self) {
         loop { if *self.head.load() {break;} self.head.listen().await;}
     }
@@ -303,8 +300,9 @@ impl Contracts {
     pub fn register<C: Contract>(&self) {
         let c_id = C::id();
         let air = self.2.clone();
-        if !self.1.load().contains_key(&c_id) {
-            let mut builders = self.1.lock();
+        let mut builders = self.1.clone();
+        if !builders.load().contains_key(&c_id) {
+            let mut builders = builders.lock();
             if let Entry::Vacant(vac) = builders.entry(c_id) {
                 vac.insert(Arc::new(Box::new(move |location: Location| AnyInstance::new(Instance::<C>::start(air.clone(), location, None)))));
                 builders.commit(c_id);
@@ -317,10 +315,11 @@ impl Contracts {
         let c_id = C::id();
         let location = Location::new::<C>(&self.2.secret, &init);
         let id = Id::hash(&location);
-        match self.0.load().get(&c_id).and_then(|i| i.get(&id)) {
+        let mut instances = self.0.clone();
+        match instances.load().get(&c_id).and_then(|i| i.get(&id)) {
             Some(instance) => instance.downcast().unwrap(),
             None => {
-                let mut instances = self.0.lock();
+                let mut instances = instances.lock();
                 match instances.entry(c_id).or_default().entry(id) {
                     Entry::Occupied(occ) => occ.get().downcast().unwrap(),
                     Entry::Vacant(vac) => {
@@ -337,14 +336,15 @@ impl Contracts {
 
     fn build(&self, location: Location) -> Option<AnyInstance> {
         let id = Id::hash(&location);
-        match self.0.load().get(&location.contract_id).and_then(|i| i.get(&id)) {
+        let mut instances = self.0.clone();
+        match instances.load().get(&location.contract_id).and_then(|i| i.get(&id)) {
             Some(instance) => Some(instance.clone()),
             None => {
-                let mut instances = self.0.lock();
+                let mut instances = instances.lock();
                 match instances.entry(location.contract_id).or_default().entry(id) {
                     Entry::Occupied(occ) => Some(occ.get().clone()),
                     Entry::Vacant(vac) => {
-                        let instance = (self.1.load().get(&location.contract_id)?)(location);
+                        let instance = (self.1.clone().load().get(&location.contract_id)?)(location);
                         vac.insert(instance.clone());
                         instances.commit(instance.clone());
                         Some(instance) 
@@ -355,43 +355,74 @@ impl Contracts {
     }
 
     pub fn list<C: Contract>(&self) -> HashMap<Id, Instance<C>> {
-        match self.0.load().get(&C::id()) {
+        match self.0.clone().load().get(&C::id()) {
             None => {
                 self.register::<C>();
                 HashMap::new()
             },
             Some(instances) => instances.iter().filter_map(|(id, i)| {
-                let instance = i.downcast::<C>().unwrap();
-                if instance.pending.load().1.is_some() {
+                let mut instance = i.downcast::<C>().unwrap();
+                if instance.pending.load().is_some() {
                     Some((*id, instance.clone()))
                 } else {None}
             }).collect()
         }
     }
-
-    
 }
 
+pub enum Update<C: Contract> {New, Pending, Confirmed(AnyOutput<C>)}
+
 #[derive(Clone)]
-pub struct Instances<C: Contract>(Contracts, PhantomData::<C>);
+pub struct Instances<C: Contract>(Contracts, HashMap<Id, Instance<C>>);
 impl<C: Contract> Instances<C> {
-    pub(crate) fn new(contracts: &Contracts) -> Self {
+    pub(crate) fn new(contracts: Contracts) -> Self {
         contracts.register::<C>();
-        Instances(contracts.clone(), PhantomData::<C>)
+        let instances = contracts.list();
+        Instances(contracts, instances)
     }
-    pub fn create(&self, init: C::Init) -> Instance<C> {self.0.create::<C>(init)}
-    pub fn list(&self) -> HashMap<Id, Instance<C>> {self.0.list::<C>()}
-    pub async fn listen(&mut self) -> Instance<C> {
-        loop {if let Some(instance) = self.0.0.listen().await.downcast() {
-            break instance;
-        }}
+
+    pub fn create(&mut self, init: C::Init) -> &mut Instance<C> {
+        let instance = self.0.create::<C>(init);
+        self.1.entry(instance.id()).or_insert(instance)
     }
-    pub fn get_next(&mut self) -> Option<Instance<C>> {
-        loop {match self.0.0.get_update() {
-            None => {break None;},
-            Some(instance) => {if let Some(instance) = instance.downcast() {break Some(instance);}}
-        }}
+
+    pub async fn listen(&mut self) -> (&mut Instance<C>, Update<C>) {
+        loop {
+            let mut set = self.1.values_mut().map(|i| async {(i.id(), i.listen().await)}).collect::<FuturesUnordered<_>>();
+            let new_instance = self.0.0.listen();
+            tokio::select!{
+                instance = new_instance => {
+                    drop(set);
+                    if let Some(instance) = instance.downcast::<C>() {
+                        let instance = self.1.entry(instance.id()).or_insert(instance);
+                        return (instance, Update::New);
+                    }
+                },
+                Some((id, update)) = set.next() => {
+                    drop(set);
+                    return (self.1.get_mut(&id).unwrap(), update)
+                }
+            }
+        }
     }
+
+    pub fn get_update(&mut self) -> Option<(&mut Instance<C>, Update<C>)> {
+        match self.0.0.get_update() {
+            Some(instance) => instance.downcast::<C>().map(|instance| {
+                let instance = self.1.entry(instance.id()).or_insert(instance);
+                (instance, Update::New)
+            }),
+            None => self.1.values_mut().find_map(|i| i.get_update().map(|u| (i, u)))
+        }
+    }
+}
+
+impl<C: Contract> std::ops::Deref for Instances<C> {
+    type Target = HashMap<Id, Instance<C>>;
+    fn deref(&self) -> &Self::Target {&self.1}
+}
+impl<C: Contract> std::ops::DerefMut for Instances<C> {
+    fn deref_mut(&mut self) -> &mut Self::Target {&mut self.1}
 }
 
 ///Keeps track of my Context and their locations for recovery, (Scanning my inbox, creating new
