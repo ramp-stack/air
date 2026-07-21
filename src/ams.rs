@@ -1,144 +1,147 @@
 use std::sync::Arc;
 use std::fmt::Debug;
+use std::borrow::Borrow;
+use std::ops::Index;
+use std::marker::PhantomData;
 use std::collections::HashSet;
 use std::sync::{MutexGuard, Mutex};
 
-use tokio::sync::broadcast::{channel, Sender, Receiver};
+//use tokio::sync::broadcast::{channel, Sender, Receiver};
+use postage::broadcast::{channel, Sender, Receiver};
+use postage::prelude::{Sink, Stream};
 use arc_swap::ArcSwap;
 
-pub enum Ref<T> {
-    Arc(Arc<(T, u32)>),
-    #[allow(clippy::type_complexity)]
-    Map(Arc<Box<dyn for<'a> Fn(&'a ()) -> &'a T + Send + Sync>>)
-}
-impl<T> AsRef<T> for Ref<T> {fn as_ref(&self) -> &T {self}}
-impl<T: Debug> std::fmt::Debug for Ref<T> {fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    (**self).fmt(f)
-}}
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-impl<T> std::ops::Deref for Ref<T> {
-    type Target = T;
-    fn deref(&self) -> &T {match self {
-        Self::Arc(arc) => &arc.as_ref().0,
-        Self::Map(f) => f(&())
-    }}
+type Inner<T> = (T, u32);
+type Guard<T> = arc_swap::Guard<Arc<Inner<T>>, arc_swap::DefaultStrategy>;
+
+pub enum Ref<'a, T> {
+    Arc(Guard<T>, PhantomData::<&'a ()>),
+    #[allow(clippy::type_complexity)]
+    Map(Arc<Box<dyn for<'b> Fn(&'b ()) -> &'b T + Send + Sync>>, PhantomData::<&'a ()>)
 }
-impl<T: Send + Sync + 'static> Ref<T> {
-    #[allow(clippy::should_implement_trait)]
-    pub fn clone(s: &Self) -> Self {match s {
-        Ref::Arc(a) => Ref::Arc(a.clone()),
-        Ref::Map(f) => Ref::Map(f.clone()),
-    }}
-    pub fn map<R>(self, access: impl for<'a> Fn(&'a T) -> &'a R + Sync + Send + 'static) -> Ref<R> {match self {
-        Ref::Arc(a) => Ref::Map(Arc::new(Box::new(move |_: &()| {
+impl<'a, T: Send + Sync + 'static> Ref<'a, T> {
+    pub fn new(arc: Guard<T>) -> Self {Ref::Arc(arc, PhantomData::<&'a ()>)}
+    pub fn map<R>(self, access: impl for<'b> Fn(&'b T) -> &'b R + Sync + Send + 'static) -> Ref<'a, R> {match self {
+        Ref::Arc(a, p) => Ref::Map(Arc::new(Box::new(move |_: &()| {
             let r: &R = access(&a.as_ref().0);
             unsafe { &*(r as *const R) }
-        }))),
-        Ref::Map(f) => Ref::Map(Arc::new(Box::new(move |t: &()| {
+        })), p),
+        Ref::Map(f, p) => Ref::Map(Arc::new(Box::new(move |t: &()| {
             let r: &R = access(f(t));
             unsafe { &*(r as *const R) }
-            
-        }))),
+        })), p),
     }}
 }
+impl<'a, T> AsRef<T> for Ref<'a, T> {fn as_ref(&self) -> &T {self}}
+impl<'a, T: Debug> Debug for Ref<'a, T> {fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {(**self).fmt(f)}}
+impl<'a, T> std::ops::Deref for Ref<'a, T> {type Target = T; fn deref(&self) -> &T {match self {Self::Arc(arc, _) => &arc.as_ref().0, Self::Map(f, _) => f(&())}}}
+impl<'a, T> Clone for Ref<'a, T> {fn clone(&self) -> Self {match self {Ref::Arc(a, p) => Ref::Arc(Guard::from_inner(Arc::clone(a)), *p), Ref::Map(f, p) => Ref::Map(f.clone(), *p)}}}
 
-pub struct RefMut<'a, T, U>(MutexGuard<'a, (Sender<(U, u32)>, u32)>, T, &'a ArcSwap<(T, u32)>, &'a mut HashSet<u32>);
-impl<'a, T: Debug, U: Clone + Debug> std::fmt::Debug for RefMut<'a, T, U> {fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    self.1.fmt(f)
-}}
+pub struct RefMut<'a, T, U>(T, u32, MutexGuard<'a, ()>, &'a ArcSwap<Inner<T>>, &'a mut Sender<(U, u32)>);
 impl<'a, T, U: Clone + Debug> RefMut<'a, T, U> {
-    ///If commit is not called then the changes made will be discarded
     pub fn commit(mut self, update: U) {
-        self.0.1 += 1;
-        let idx = self.0.1;
-        self.0.0.send((update, idx)).unwrap();
-        self.2.store(Arc::new((self.1, idx)));
-        self.3.insert(idx);
-        drop(self.0);
-    }
-
-    pub fn commit_silent(mut self) {
-        self.0.1 += 1;
-        let idx = self.0.1;
-        self.2.store(Arc::new((self.1, idx)));
-        self.3.insert(idx);
-        drop(self.0);
+        let idx = self.1+1;
+        self.4.try_send((update, idx)).unwrap();
+        self.3.store(Arc::new((self.0, idx)));
+        drop(self.2);
     }
 }
-impl<'a, T, U> std::ops::Deref for RefMut<'a, T, U> {
-    type Target = T;
-    fn deref(&self) -> &T {&self.1}
-}
-impl<'a, T, U> std::ops::DerefMut for RefMut<'a, T, U> {
-    fn deref_mut(&mut self) -> &mut T {&mut self.1}
+impl<'a, T: Debug, U> Debug for RefMut<'a, T, U> {fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {self.0.fmt(f)}}
+impl<'a, T, U> std::ops::Deref for RefMut<'a, T, U> {type Target = T; fn deref(&self) -> &T {&self.0}}
+impl<'a, T, U> std::ops::DerefMut for RefMut<'a, T, U> {fn deref_mut(&mut self) -> &mut T {&mut self.0}}
+
+pub trait Change: Debug + Clone + Send + Sync {
+    fn merge(&mut self, other: Self);
 }
 
-#[derive(Debug)]
-pub struct Ams<T: Clone + Send + Sync, U: Clone + Debug + Send + Sync>{
+impl<C: Debug + Clone + Send + Sync> Change for Vec<C> {
+    fn merge(&mut self, other: Self) {self.extend(other);}
+}
+
+
+//Single writer handle but clonable reader handle
+//Notifications and request/response for reader handle to write thread
+
+#[derive(Clone, Debug)]
+pub struct Shared<T: Clone + Send + Sync, C: Change>{
     #[allow(clippy::type_complexity)]
-    sender: Arc<(Mutex<(Sender<(U, u32)>, u32)>, ArcSwap<(T, u32)>)>,
-    receiver: Receiver<(U, u32)>,
-    sent: HashSet<u32>,
-    seen: u32
+    locker: Arc<Mutex<()>>,
+    shared: Arc<ArcSwap<(T, u32)>>,
+    sender: Sender<(C, u32)>,
+    receiver: Receiver<(C, u32)>,
+    changed: (Option<C>, u32)
 }
-impl<T: Clone + Send + Sync, U: Clone + Debug + Send + Sync> Clone for Ams<T, U> {fn clone(&self) -> Self {
-    Ams{sender: self.sender.clone(), receiver: self.receiver.resubscribe(), sent: self.sent.clone(), seen: self.seen}
-}}
-impl<T: Clone + Send + Sync, U: Clone + Debug + Send + Sync> PartialEq for Ams<T, U> {
-    fn eq(&self, other: &Self) -> bool {Arc::ptr_eq(&self.sender, &other.sender)}
-}
-impl<T: Clone + Send + Sync + 'static, U: Clone + Debug + Send + Sync> Ams<T, U> {
+impl<T: Clone + Send + Sync + 'static, U: Update> Ams<T, U> {
     pub fn new(init: T) -> Self {
-        let (tx, receiver) = channel(10000);
+        let (sender, receiver) = channel(10000);
         Ams{
-            sender: Arc::new((Mutex::new((tx, 0)), ArcSwap::from(Arc::new((init, 0))))),
-            receiver, sent: HashSet::new(), seen: 0
+            locker: Arc::new(Mutex::new(())),
+            shared: Arc::new(ArcSwap::from(Arc::new((init, 0)))),
+            sender,
+            receiver,
+            seen: 0
         }
     }
 
-    pub fn get_update(&mut self) -> Option<U> {
+    pub fn load(&self) -> (Ref<'_, T>, Option<C>) {
+
+    }
+
+    pub fn load_change(&mut self) -> Option<(Ref<'_, T>, U)> {
         loop {
-            let (data, idx) = self.receiver.try_recv().ok()?;
-            if idx > self.seen && !self.sent.contains(&idx) {
-                self.seen = self.seen.max(idx);
-                break Some(data);
-            }
+            let (update, index) = self.receiver.try_recv().ok()?;
+            if index > self.seen {break Some(self.merge(update, index));}
         }
     }
-    pub async fn listen(&mut self) -> U {
+
+    pub async fn load_on_change(&mut self) -> (Ref<'_, T>, U) {
         loop {
-            let (data, idx) = self.receiver.recv().await.unwrap();
-            if idx > self.seen && !self.sent.contains(&idx) {
-                self.seen = self.seen.max(idx);
-                break data;
-            }
+            let (update, index) = self.receiver.recv().await.unwrap();
+            if index > self.seen {break self.merge(update, index);}
         }
     }
 
-    pub fn lock(&mut self) -> RefMut<'_, T, U> {
-        let guard = self.sender.0.lock().unwrap(); 
-        self.receiver = self.receiver.resubscribe();
-        let arc = self.sender.1.load_full().clone();
-        self.seen = arc.1;
-        RefMut(guard, arc.0.clone(), &self.sender.1, &mut self.sent)
+    fn merge(&mut self, mut update: U, mut index: u32) -> (Ref<'_, T>, U) {
+        let guard = self.shared.load();
+        let seen = guard.1;
+        while index < seen {
+            let (u, i) = self.receiver.try_recv().ok().unwrap();
+            index = i;
+            update.merge(u);
+        }
+        (Ref::new(guard), update)
     }
 
-    pub fn load(&mut self) -> Ref<T> {Ref::Arc(self.load_inner())}
-
-    pub fn load_partial<C: Sync>(&mut self, access: impl for<'a> Fn(&'a T) -> &'a C + Sync + Send + 'static) -> Ref<C> {
-        let arc = self.load_inner();
-        Ref::Map(Arc::new(Box::new(move |_: &()| {
-            let r: &C = access(&arc.as_ref().0);
-            unsafe { &*(r as *const C) }
-        })))
+    pub fn lock(&mut self, clear: bool) -> RefMut<'_, T, U> {
+        let guard = self.locker.lock().unwrap(); 
+        let g = self.shared.load();
+        if clear {self.seen = g.1;}
+        RefMut(g.0.clone(), g.1, guard, &self.shared, &mut self.sender)
     }
 
-    fn load_inner(&mut self) -> Arc<(T, u32)> {
-        self.receiver = self.receiver.resubscribe();
-        let arc = self.sender.1.load_full().clone();
-        self.seen = arc.1;
-        arc
+    pub fn load(&self) -> Ref<'_, T> {Ref::new(self.shared.load())}
+    pub fn load_clear(&mut self) -> Ref<'_, T> {
+        let guard = self.shared.load();
+        self.seen = guard.1;
+        Ref::new(guard)
     }
+}
+//  impl<'a, K, V, T: Index<&'a Q> + Extend<(K, V)> + Clone + Send + Sync + 'static, U: Update> Ams<T, U> {
+//      pub fn get_or_insert_with<F: FnOnce() -> V>(key: K, insert_with: F) -> &V {
+//          self.load().
+//      }
+//  }
+
+
+impl<T: Clone + Send + Sync, U: Update> PartialEq for Ams<T, U> {fn eq(&self, other: &Self) -> bool {Arc::ptr_eq(&self.shared, &other.shared)}}
+impl<T: Default + Clone + Send + Sync + 'static, U: Update> Default for Ams<T, U> {fn default() -> Self {Self::new(T::default())}}
+impl<T: Serialize + Clone + Send + Sync, U: Update> Serialize for Ams<T, U> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {self.shared.load().serialize(serializer)}
+}
+impl<'de, T: Deserialize<'de> + Clone + Send + Sync + 'static, U: Update> Deserialize<'de> for Ams<T, U> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {Ok(Ams::new(T::deserialize(deserializer)?))}
 }
 
 #[cfg(test)]
@@ -147,27 +150,90 @@ mod test {
 
     #[test]
     fn test() {
-        let mut a = Ams::<Vec<String>, usize>::new(vec![]);
-        let mut lock = a.lock();
+        let mut a = Ams::<Vec<String>, Vec<usize>>::new(vec![]);
+        let mut lock = a.lock(false);
         lock.push("Hello".to_string());
-        lock.commit(5);
+        lock.commit(vec![5]);
 
-        assert_eq!(a.get_update(), None);
-        assert_eq!(*a.load(), vec!["Hello".to_string()]);
+        assert_eq!(a.load_change().map(|i| ((*i.0).clone(), i.1)), Some((vec!["Hello".to_string()], vec![5])));
 
         let mut b = a.clone();
-        let mut lock = b.lock();
+        let mut lock = b.lock(false);
         lock.push("Hi".to_string());
-        lock.commit(2);
+        lock.commit(vec![2]);
 
-        assert_eq!(a.get_update(), Some(2));
-        assert_eq!(*a.load(), vec!["Hello".to_string(), "Hi".to_string()]);
-        assert_eq!(*b.load(), vec!["Hello".to_string(), "Hi".to_string()]);
+        assert_eq!(a.load_change().map(|i| ((*i.0).clone(), i.1)), Some((vec!["Hello".to_string(), "Hi".to_string()], vec![2])));
 
-        let mut lock = b.lock();
-        lock.push("Whispers Goodbye".to_string());
-        lock.commit_silent();
+        let mut lock = b.lock(false);
+        lock.push("Hey".to_string());
+        lock.commit(vec![3]);
+        assert_eq!(b.load_change().map(|i| ((*i.0).clone(), i.1)), Some((vec!["Hello".to_string(), "Hi".to_string(), "Hey".to_string()], vec![2, 3])));
 
-        assert_eq!(a.get_update(), None);
+      //let mut lock = b.lock();
+      //lock.push("Whispers Goodbye".to_string());
+      //lock.commit_silent();
+
+      //assert_eq!(a.get_update(), None);
     }
 }
+
+#[derive(Clone, Debug)]
+pub struct Cache {}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

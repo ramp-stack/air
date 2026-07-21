@@ -17,12 +17,12 @@ pub use secp256k1::{Sink, Drain, Message};
 
 const TAG: &str = "AIR_NAMES";
 const ORANGEME_NAME: &str = "03273e58dff6f2e5334c526b0dd0100d20e1ac4bfa22dfd904725eef63931e4853";
-const ORANGEME_URL: &str = if cfg!(test) {"ws://0.0.0.0:5702"} else {"ws://air.orange.me:5702"};
+const ORANGEME_URL: &str = if cfg!(test) {"127.0.0.1:5702"} else {"air.orange.me:5702"};
 
 pub fn now() -> u64 {chrono::Utc::now().timestamp_nanos_opt().unwrap() as u64}
 
 ///30 minutes
-pub const TIMEOUT: u64 = 60_000_000_000;
+pub const TIMEOUT: u64 = 180_000_000_000;
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
@@ -117,6 +117,15 @@ impl Secret {
         }
     }
 
+    pub fn set_path(&self, path: &[Id]) -> Result<Self, Error> {
+        path.strip_prefix::<[Id]>(self.path.as_ref()).ok_or_else(|| Error::MissingPermissions(path.to_vec()))?;
+        Ok(Secret{
+            name: self.name,
+            path: path.to_vec(),
+            temporary: self.temporary
+        })
+    }
+
     pub fn sign(&self, id: Id) -> Signature {Signature::new(self, id)}
     pub fn decrypt(&self, encrypted: Encrypted) -> Result<Vec<u8>, Error> {
         self.temporary.decrypt(encrypted.0)
@@ -166,12 +175,15 @@ impl Identity {
     pub fn get(&self, key: &str) -> Option<&String> {self.data.get(key)}
 }
 
-#[derive(Clone, Debug)]
-pub struct Resolver();
-impl Resolver {
-    pub fn start() -> Self {Resolver()}
+pub trait Resolver {
+    fn resolve(&self, name: Name, timestamp: Option<u64>) -> impl Future<Output = Identity>;
+}
 
-    pub async fn resolve(&self, name: Name, _timestamp: Option<u64>) -> Identity {
+#[derive(Clone, Debug)]
+pub struct DefaultResolver();
+impl DefaultResolver {pub fn start() -> Self {Self()}}
+impl Resolver for DefaultResolver {
+    async fn resolve(&self, name: Name, _timestamp: Option<u64>) -> Identity {
         if name == Name::orange_me() {
             Identity{name, url: vec![ORANGEME_URL.to_string()], servers: vec![], data: HashMap::new()}
         } else {
@@ -274,7 +286,7 @@ mod test {
     async fn encryption() {
         let secret = Secret::new();
         let name = secret.name();
-        let resolver = Resolver::start();
+        let resolver = DefaultResolver::start();
         let identity = resolver.resolve(name, None).await;
 
         let m = b"hello".to_vec();
@@ -287,7 +299,7 @@ mod test {
         let secret = Secret::new();
         let name = secret.name();
 
-        let resolver = Resolver::start();
+        let resolver = DefaultResolver::start();
         let identity = resolver.resolve(name, None).await;
 
         let path = &[Id::random()];

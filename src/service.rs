@@ -51,6 +51,13 @@ use tokio::time::{sleep, Sleep, Duration};
 pub const LOCK: u64 = 20_000_000_000;//20 seconds
 pub const MARGIN: u64 = 10_000_000_000;//10 seconds
 
+//Lock needs to be a super Contract as well as a super Service
+//The data stored needs to be part of the contract to enforce that the other sub reactants cannot be
+//applied unless a lock has been obtained
+//
+//The service needs to look at the state of the contract and wait untill the lock expirese or
+//something changed. And when the lock is free it can attept to lock it for itself and it then
+//waits for change to the confirmed state before it checks all over again.
 pub struct Lock<S>(S, Instance<ServiceLock>, Id, Secret, Option<Pin<Box<Sleep>>>);
 impl<S: Service> Lock<S> {
     async fn obtain(instance: &mut Instance<ServiceLock>, my_id: Id, remaining: &mut Option<Pin<Box<Sleep>>>) -> bool {
