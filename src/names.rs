@@ -1,5 +1,5 @@
-use bitcoin_hashes::sha256::Midstate;
-use bitcoin_hashes::sha256t::{self, Tag};
+use hashes::sha256::{HashEngine, Midstate};
+use hashes::sha256t::{self, Tag};
 
 use serde::{Serialize, Deserialize};
 use serde::ser::Serializer;
@@ -7,27 +7,30 @@ use serde::de::Deserializer;
 
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::hash::Hash;
 use std::fmt::Debug;
+use std::hash::Hash;
+use std::sync::Arc;
 
 mod fschacha20poly1305;
 pub mod secp256k1;
+use secp256k1::hashes;
 
-pub use secp256k1::{Sink, Drain, Message};
+pub use secp256k1::{Sink, Drain, Party};
 
 const TAG: &str = "AIR_NAMES";
-const ORANGEME_NAME: &str = "03273e58dff6f2e5334c526b0dd0100d20e1ac4bfa22dfd904725eef63931e4853";
+const ORANGEME_NAME: &str = "020cbb5648b4257a455abc29e7104bc2b6156f650e29f9479ad517435e59a28ddd";
 const ORANGEME_URL: &str = if cfg!(test) {"127.0.0.1:5702"} else {"air.orange.me:5702"};
 
 pub fn now() -> u64 {chrono::Utc::now().timestamp_nanos_opt().unwrap() as u64}
 
-///30 minutes
-pub const TIMEOUT: u64 = 180_000_000_000;
+///10 minutes
+pub const EXPIRATION: u64 = 600_000_000_000;
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
     ///This occures if an Identity has not been refreshed in the last TIMEOUT nano seconds
     InvalidPublicKey,
+    InvalidSecretKey,
     IdentityExpired,
     MissingPermissions(Vec<Id>),
     ValidationFailed,
@@ -54,7 +57,7 @@ impl Id {
     pub const MAX: Id = Id([u8::MAX; 32]);
     pub const MIN: Id = Id([u8::MIN; 32]);
     pub fn hash<H: Hash + ?Sized>(h: &H) -> Self {
-        Id(*AirHash::hash(&HashReader::read(h)).as_ref())
+        Id(*<AirHash as hashes::Hash>::hash(&HashReader::read(h)).as_ref())
     }
     pub fn random() -> Self {Id(secp256k1::rand::random())}
 }
@@ -92,7 +95,6 @@ impl std::str::FromStr for Name {
     }
 }
 
-
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Secret {
     name: Name,
@@ -102,8 +104,10 @@ pub struct Secret {
 impl Secret {
     pub fn name(&self) -> Name {self.name}
     pub fn path(&self) -> &Vec<Id> {&self.path}
-    pub fn harden(&self) -> secp256k1::SecretKey {self.temporary.derive(&self.path)}
+    pub fn harden(&self, _time: Option<u64>) -> secp256k1::SecretKey {self.temporary.derive(&self.path)}
+    pub fn public(&self, _time: Option<u64>) -> secp256k1::SecretKey {self.temporary.derive_risky(&self.path)}
 
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         let temporary = secp256k1::SecretKey::new();
         Secret{name: Name(temporary.public_key()), path: vec![], temporary}
@@ -127,11 +131,10 @@ impl Secret {
     }
 
     pub fn sign(&self, id: Id) -> Signature {Signature::new(self, id)}
-    pub fn decrypt(&self, encrypted: Encrypted) -> Result<Vec<u8>, Error> {
-        self.temporary.decrypt(encrypted.0)
+    pub fn decrypt(&self, _time: Option<u64>, encrypted: Vec<u8>) -> Result<Vec<u8>, Error> {
+        self.temporary.decrypt(encrypted)
     }
 }
-impl Default for Secret {fn default() -> Self {Self::new()}}
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Signature(secp256k1::Signature);
@@ -145,10 +148,14 @@ impl Signature {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct StreamRequest(secp256k1::PublicKey);
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Identity {
     name: Name,
     servers: Vec<Name>,
+    public_key: secp256k1::PublicKey,
     url: Vec<String>,
     #[serde(flatten)]
     data: HashMap<String, String>
@@ -161,9 +168,11 @@ impl Identity {
         signature.verify(self, path, id)
     }
 
+    pub fn public(&self) -> &secp256k1::PublicKey {&self.public_key}
+
     ///You always want to encrypt something to the identity now
-    pub fn encrypt(&self, _path: &[Id], payload: Vec<u8>) -> Encrypted {
-        Encrypted(self.name.0.encrypt(payload))
+    pub fn encrypt(&self, _path: &[Id], payload: Vec<u8>) -> Vec<u8> {
+        self.name.0.encrypt(payload)
     }
 
     ///If an Identity has a server it means that they actively listen to missives there
@@ -176,19 +185,23 @@ impl Identity {
 }
 
 pub trait Resolver {
-    fn resolve(&self, name: Name, timestamp: Option<u64>) -> impl Future<Output = Identity>;
+    fn resolve(&mut self, name: Name, timestamp: Option<u64>) -> impl Future<Output = Arc<Identity>> + Send;
 }
 
-#[derive(Clone, Debug)]
 pub struct DefaultResolver();
-impl DefaultResolver {pub fn start() -> Self {Self()}}
-impl Resolver for DefaultResolver {
-    async fn resolve(&self, name: Name, _timestamp: Option<u64>) -> Identity {
+impl DefaultResolver {
+    pub fn start() -> Self {Self()}
+    async fn resolve(&mut self, name: Name, _timestamp: Option<u64>) -> Identity {
         if name == Name::orange_me() {
-            Identity{name, url: vec![ORANGEME_URL.to_string()], servers: vec![], data: HashMap::new()}
+            Identity{name, url: vec![ORANGEME_URL.to_string()], public_key: name.0, servers: vec![], data: HashMap::new()}
         } else {
-            Identity{name, url: vec![], servers: vec![Name::orange_me()], data: HashMap::new()}
+            Identity{name, url: vec![], public_key: name.0, servers: vec![Name::orange_me()], data: HashMap::new()}
         }
+    }
+}
+impl Resolver for DefaultResolver {
+    async fn resolve(&mut self, name: Name, timestamp: Option<u64>) -> Arc<Identity> {
+        Arc::new(Self::resolve(self, name, timestamp).await)
     }
 }
 
@@ -223,35 +236,30 @@ impl<'de, H: Hash + Debug + Deserialize<'de>> Deserialize<'de> for Signed<H> {
 }
 impl<H: Hash + Debug> AsRef<H> for Signed<H> {fn as_ref(&self) -> &H {&self.payload}}
 
-
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct Encrypted(secp256k1::Encrypted);
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct Init(secp256k1::Init);//Will contain a secp256k1 key encrypted to the path of the recipient(BSL is an alt to ECDH Key Exchange)
-
-
-///Pass init to the remote party
-///Messages do not have to be received or exchanged one after the other
-///But they do have to be decrypted in the same order they were encrypted
-pub struct EncryptionStream(secp256k1::EncryptionStream);
-impl EncryptionStream {
-    pub fn new(recipient: &Identity, _path: &[Id]) -> Result<(Self, Init), Error> {
-        let (stream, init) = secp256k1::EncryptionStream::new(&recipient.name.0);
-        Ok((Self(stream), Init(init)))
+///Stream lasts only as long as the Identity is valid check it every identity ttl
+pub struct Stream(secp256k1::Stream);
+impl Stream {
+    pub fn new(secret: &Secret, recipient: &Identity) -> Result<Self, Error> {
+        let party = if secret.temporary.public_key() > recipient.name.0 {Party::Initiator} else {Party::Responder};
+        let shared = secret.temporary.shared(&recipient.name.0, Some(party));
+        let stream = secp256k1::Stream::new(shared, party);
+        Ok(Self(stream))
     }
 
-    //Will error if it cannot decrypt shared key.
-    pub fn receive(secret: &Secret, init: Init) -> Result<Self, Error> {
-        Ok(Self(secp256k1::EncryptionStream::receive(&secret.temporary, init.0)))
+    pub fn send(identity: &Identity, _path: &[Id]) -> (Stream, StreamRequest) {
+        let (stream, public) = secp256k1::Stream::send(identity.name.0);
+        (Stream(stream), StreamRequest(public))
     }
 
-    pub fn encrypt(&mut self, data: Vec<u8>) -> Message {
+    pub fn receive(secret: &Secret, request: StreamRequest) -> Stream {
+        Stream(secp256k1::Stream::receive(&secret.temporary, request.0))
+    }
+
+    pub fn encrypt(&mut self, data: Vec<u8>) -> Vec<u8> {
         self.0.encrypt(data)
     }
 
-    pub fn decrypt(&mut self, message: Message) -> Result<Vec<u8>, Error> {
+    pub fn decrypt(&mut self, message: Vec<u8>) -> Result<Vec<u8>, Error> {
         self.0.decrypt(message)
     }
 
@@ -260,7 +268,8 @@ impl EncryptionStream {
 
 struct AirTag;
 impl Tag for AirTag {
-    const MIDSTATE: Midstate = Midstate::hash_tag(TAG.as_bytes());
+    //const MIDSTATE: Midstate = Midstate::hash_tag(TAG.as_bytes());
+    fn engine() -> HashEngine {HashEngine::from_midstate(Midstate::hash_tag(TAG.as_bytes()), 64)}
 }
 type AirHash = sha256t::Hash<AirTag>;
 
@@ -286,12 +295,12 @@ mod test {
     async fn encryption() {
         let secret = Secret::new();
         let name = secret.name();
-        let resolver = DefaultResolver::start();
+        let mut resolver = DefaultResolver::start();
         let identity = resolver.resolve(name, None).await;
 
         let m = b"hello".to_vec();
         let c = identity.encrypt(&[], m.clone());
-        assert_eq!(m, secret.decrypt(c).unwrap());
+        assert_eq!(m, secret.decrypt(None, c).unwrap());
     }
 
     #[tokio::test]
@@ -299,7 +308,7 @@ mod test {
         let secret = Secret::new();
         let name = secret.name();
 
-        let resolver = DefaultResolver::start();
+        let mut resolver = DefaultResolver::start();
         let identity = resolver.resolve(name, None).await;
 
         let path = &[Id::random()];
