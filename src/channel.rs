@@ -5,10 +5,10 @@ use crate::storage::{Request, Response};
 use serde::{Serialize, Deserialize};
 
 use std::collections::VecDeque;
-use std::hash::Hash;
+use std::hash::{Hasher, Hash};
 use std::fmt::Debug;
 
-#[derive(Serialize, Deserialize, Hash, Debug, Clone, Copy, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Eq)]
 pub enum Key {Secret(SecretKey), Public(PublicKey)}
 impl Key {
     pub fn public(&self) -> PublicKey {match self {
@@ -20,6 +20,7 @@ impl Key {
         Key::Public(_) => None
     }}
 }
+impl Hash for Key {fn hash<H: Hasher>(&self, hasher: &mut H) {self.public().hash(hasher)}}
 impl PartialEq for Key {
     fn eq(&self, other: &Self) -> bool {
         self.public() == other.public()
@@ -176,7 +177,7 @@ mod test {
             encryption: Key::Secret(SecretKey::new()),
         };
         let mut a_channel = Channel::new(location);
-        let mut a_client = Client::new(DefaultResolver::start()).await;
+        let a_client = Client::new(DefaultResolver::start()).await;
 
         let response = a_client.send(a_channel.request().unwrap()).await.recv().await.unwrap();
         assert_eq!(Output::Subscribed, a_channel.response(response));
@@ -187,12 +188,12 @@ mod test {
         let Output::Created(time, msg) = a_channel.response(response) else {panic!("_");};
         assert_eq!(m, msg);
 
-        let mut responder = a_client.send(a_channel.request().unwrap()).await;
+        let responder = a_client.send(a_channel.request().unwrap()).await;
         let response = responder.recv().await.unwrap();
         assert_eq!(Output::Subscribed, a_channel.response(response));
 
         let mut b_channel = Channel::new(location);
-        let mut b_client = Client::new(DefaultResolver::start()).await;
+        let b_client = Client::new(DefaultResolver::start()).await;
 
         let response = b_client.send(b_channel.request().unwrap()).await.recv().await.unwrap();
         let Output::Read(rt, rm) = b_channel.response(response) else {panic!("_");};

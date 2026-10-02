@@ -18,7 +18,7 @@ use secp256k1::hashes;
 pub use secp256k1::{Sink, Drain, Party};
 
 const TAG: &str = "AIR_NAMES";
-const ORANGEME_NAME: &str = "020cbb5648b4257a455abc29e7104bc2b6156f650e29f9479ad517435e59a28ddd";
+const ORANGEME_NAME: &str = "037a581e7728ce94d3fd67bdb1309672c4884aae774f911d0cada94fc9e50c955f";
 const ORANGEME_URL: &str = if cfg!(test) {"127.0.0.1:5702"} else {"air.orange.me:5702"};
 
 pub fn now() -> u64 {chrono::Utc::now().timestamp_nanos_opt().unwrap() as u64}
@@ -78,7 +78,9 @@ impl std::str::FromStr for Id {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, Hash, Ord, Eq, PartialOrd, PartialEq)]
+#[derive(Clone, Copy, Debug, Hash, Ord, Eq, PartialOrd, PartialEq)]
+#[derive(serde_with::SerializeDisplay)]
+#[derive(serde_with::DeserializeFromStr)]
 pub struct Name(secp256k1::PublicKey);
 impl Name {
     pub fn orange_me() -> Name {Name::from_str(ORANGEME_NAME).unwrap()}
@@ -95,7 +97,7 @@ impl std::str::FromStr for Name {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Hash, Clone, Debug, PartialEq, Eq)]
 pub struct Secret {
     name: Name,
     temporary: secp256k1::SecretKey,

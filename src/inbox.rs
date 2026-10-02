@@ -1,17 +1,17 @@
-use crate::names::{Resolver, Secret, Name, Id, now, Error};
+use crate::names::{Resolver, Secret, Name, Id, Error};
 use crate::names::secp256k1::{SecretKey};
-use crate::channel::{self, Channel, Location, Key, Output};
+use crate::channel::{Channel, Location, Key, Output};
 use crate::storage::{Request, Response};
-use crate::contract::{self, Contract, Instance};
+use crate::contract;
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
-use std::ops::Deref;
 use std::fmt::Debug;
 
 use serde::{Serialize, Deserialize};
 
 const INBOX: &str = "INBOX";
+const STORAGE: &str = "STORAGE";
 const NOTIFIED: &str = "NOTIFIED";
 const NOTIFICATIONS: &str = "NOTIFICATIONS";
 
@@ -23,12 +23,14 @@ pub enum RequestType {
     Notifications
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Inbox {
     secret: Secret,
     notified: (Channel<Name>, HashSet<Name>),
-    channels: HashMap<Name, Channel<(Id, contract::Location)>>,
+    channels: HashMap<Name, Channel<contract::Location>>,
     notifications: Channel<Name>,
     notifying: HashMap<Name, Channel<Name>>,
+    locations: HashMap<Id, HashSet<contract::Location>>
 }
 impl Inbox {
     pub fn new(secret: Secret) -> Result<Self, Error> {
@@ -40,12 +42,15 @@ impl Inbox {
             discovery: Key::Secret(SecretKey::from_array(*Id::hash(&secret.name())).unwrap()),
             encryption: Key::Secret(secret.public(None).derive_risky(&[Id::hash(NOTIFICATIONS)]))
         };
-        Ok(Self {
-            secret,
+        let key = Key::Secret(secret.harden(None).derive(&[Id::hash(STORAGE)]));
+        let storage = Location{server: Name::orange_me(), discovery: key, encryption: key};
+        Ok(Self{
             notified: (Channel::new(notified), HashSet::new()),
-            channels: HashMap::new(),
+            channels: HashMap::from([(secret.name(), Channel::new(storage))]),
             notifications: Channel::new(notifications),
-            notifying: HashMap::new()
+            notifying: HashMap::new(),
+            locations: HashMap::new(),
+            secret,
         })
     }
 
@@ -59,28 +64,40 @@ impl Inbox {
         requests
     }
 
-    pub async fn send<R: Resolver>(&mut self, resolver: &mut R, name: Name, location: contract::Location) {
-        let public = resolver.resolve(name, None).await.public().derive_risky(&[Id::hash(INBOX)]);
-        if !self.notified.1.contains(&name) && !self.notifying.contains_key(&name) {
-            let notifying = Location{
-                server: Name::orange_me(),
-                discovery: Key::Secret(SecretKey::from_array(*Id::hash(&name)).unwrap()),
-                encryption: Key::Public(public.derive_risky(&[Id::hash(NOTIFICATIONS)]))
-            };
-            let mut channel = Channel::new(notifying);
-            channel.queue_mut().push_back(self.secret.name());
-            self.notifying.insert(name, channel);
-        }
-        let channel = self.channels.entry(name).or_insert_with(|| {
-            let key = self.secret.public(None).shared(&public, None);
-            let location = Location{
-                server: Name::orange_me(),
-                discovery: Key::Secret(key),
-                encryption: Key::Secret(key)
-            };
-            Channel::new(location)
-        });
-        channel.queue_mut().push_back((C::id(), location));
+    pub fn list(&self, contract: &Id) -> HashSet<contract::Location> {
+        self.locations.get(contract).cloned().unwrap_or_default()
+    }
+
+    pub async fn send<R: Resolver>(&mut self, resolver: &mut R, name: Name, location: contract::Location) -> bool {
+        let channel = if name == self.secret.name() {
+            if !self.locations.entry(location.contract).or_default().insert(location) {
+                return false;
+            }
+            self.channels.get_mut(&name).unwrap()
+        } else {
+            let public = resolver.resolve(name, None).await.public().derive_risky(&[Id::hash(INBOX)]);
+            if !self.notified.1.contains(&name) && !self.notifying.contains_key(&name) {
+                let notifying = Location{
+                    server: Name::orange_me(),
+                    discovery: Key::Secret(SecretKey::from_array(*Id::hash(&name)).unwrap()),
+                    encryption: Key::Public(public.derive_risky(&[Id::hash(NOTIFICATIONS)]))
+                };
+                let mut channel = Channel::new(notifying);
+                channel.queue_mut().push_back(self.secret.name());
+                self.notifying.insert(name, channel);
+            }
+            self.channels.entry(name).or_insert_with(|| {
+                let key = self.secret.public(None).shared(&public, None);
+                let location = Location{
+                    server: Name::orange_me(),
+                    discovery: Key::Secret(key),
+                    encryption: Key::Secret(key)
+                };
+                Channel::new(location)
+            })
+        };
+        channel.queue_mut().push_back(location);
+        true
     }
 
     pub fn requests(&mut self) -> HashMap<RequestType, Request> {
@@ -96,7 +113,7 @@ impl Inbox {
         requests
     }
 
-    pub async fn response<R: Resolver>(&mut self, resolver: &mut R, request_type: RequestType, response: Response) -> Option<(Name, (Id, contract::Location))> {
+    pub async fn response<R: Resolver>(&mut self, resolver: &mut R, request_type: RequestType, response: Response) -> Option<(Name, contract::Location)> {
         match request_type {
             RequestType::Notified => match self.notified.0.response(response) {
                 Output::Created(_, _) => {},
@@ -122,7 +139,9 @@ impl Inbox {
                 let channel = self.channels.get_mut(&name).unwrap();
                 match channel.response(response) {
                     Output::Created(_, _location) => {},
-                    Output::Read(_, location) => {return Some((name, location));},
+                    Output::Read(_, location) => {
+                        return self.locations.entry(location.contract).or_default().insert(location).then_some((name, location));
+                    },
                     Output::Subscribed => {},
                     Output::Garbage => {}
                 }
@@ -246,9 +265,9 @@ mod test {
         let mut b_inbox = Inbox::new(bob.clone()).unwrap();
         make_requests(&mut a_inbox, alice.name(), true).await;
         make_requests(&mut b_inbox, bob.name(), true).await;
-        let mut a_room = Instance::<Room>::new(alice.clone(), "MyRoom".to_string()).unwrap();
+        let a_room = Instance::<Room>::new(alice.clone(), "MyRoom".to_string()).unwrap();
 
-        a_inbox.send(&mut resolver, bob.name(), &a_room).await;
+        a_inbox.send(&mut resolver, bob.name(), *a_room.location()).await;
         assert_eq!(a_inbox.notifying.get(&bob.name()).unwrap().location(), b_inbox.notifications.location());
         //Status: channel with bob has a queued location, notifying bob has alices name queued
         make_requests(&mut a_inbox, alice.name(), false).await;
@@ -268,6 +287,6 @@ mod test {
         assert!(b_inbox.notified.1.contains(&alice.name()));
         assert!(b_inbox.notified.0.queue_mut().len() == 1);
 
-        assert_eq!(make_requests(&mut b_inbox, bob.name(), false).await, vec![(alice.name(), (Room::id(), *a_room.location()))]);
+        assert_eq!(make_requests(&mut b_inbox, bob.name(), false).await, vec![(alice.name(), *a_room.location())]);
     }
 }

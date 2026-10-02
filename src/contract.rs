@@ -19,9 +19,10 @@ pub enum Output<R> {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash, Copy)]
 pub struct Location {
-    server: Name,
-    key: SecretKey,
-    hash: Id
+    pub server: Name,
+    pub key: SecretKey,
+    pub contract: Id,
+    pub instance: Id
 }
 
 pub struct Metadata {
@@ -60,14 +61,10 @@ pub struct Instance<C: Contract> {
     pending: Option<C>,
 }
 impl<C: Contract> Instance<C> {
-    fn generate_location(secret: &Secret, init: &C::Init) -> Result<Location, Error> {
-        let hash = Id::hash(&(&init, secret.name()));
-        let key = secret.set_path(&[C::id(), hash])?.harden(None);
-        Ok(Location{server: Name::orange_me(), key, hash})
-    }
-
-    pub fn generate_id(secret: &Secret, init: &C::Init) -> Result<Id, Error> {
-        Ok(Id::hash(&Self::generate_location(secret, init)?))
+    pub fn generate_location(secret: &Secret, init: &C::Init) -> Result<Location, Error> {
+        let instance = Id::hash(&(&init, secret.name()));
+        let key = secret.set_path(&[C::id(), instance])?.harden(None);
+        Ok(Location{server: Name::orange_me(), key, contract: C::id(), instance})
     }
 
     pub fn new(secret: Secret, init: C::Init) -> Result<Self, Error> {
@@ -125,7 +122,9 @@ impl<C: Contract> Instance<C> {
     }
 
     async fn verify<R: Resolver>(&mut self, resolver: &mut R, time: u64, message: Signed<Message<C>>) -> Option<(Name, Message<C>)> {
+        println!("resolving");
         let identity = resolver.resolve(message.signer, Some(time)).await;
+        println!("resolved");
         message.verify(&identity, &[C::id(), Id::hash(&self.location)]).ok()?;
         Some((message.signer, message.payload))
     }
@@ -135,7 +134,7 @@ impl<C: Contract> Instance<C> {
             (Some(confirmed), Message::Message(msg)) => {
                 Some(confirmed.apply(msg, Metadata::confirmed(name, time)))
             },
-            (none, Message::Init(init)) if none.is_none() && Id::hash(&(&init, name)) == self.location.hash => {
+            (none, Message::Init(init)) if none.is_none() && Id::hash(&(&init, name)) == self.location.instance => {
                 *none = Some(C::init(init, Metadata::confirmed(name, time)));
                 None
             },
@@ -154,6 +153,33 @@ impl<C: Contract> Instance<C> {
         }
     }
 }
+
+//  const STORAGE: &str = "STORAGE";
+
+//  #[derive(Serialize, Deserialize, Debug)]
+//  pub struct Storage(Channel<Location>, HashMap<Id, HashSet<Location>>);
+//  impl Storage {
+//      pub fn new(secret: Secret) -> Self {
+//          let key = Key::Secret(secret.harden(None).derive(&[Id::hash(STORAGE)]));
+//          let storage = channel::Location{server: Name::orange_me(), discovery: key, encryption: key};
+//          Storage(Channel::new(storage), HashMap::new())
+//      }
+
+//      pub fn store(&mut self, location: Location) -> bool {
+//          if self.1.entry(location.contract).or_default().insert(location) {
+//              self.0.queue_mut().push_back(location);
+//              true
+//          } else {false}
+//      }
+
+//      pub fn start(&mut self) -> Request {self.0.start()}
+//      pub fn request(&mut self) -> Option<Request> {self.0.request()}
+//      pub fn response(&mut self, response: Response) -> Option<Location> {
+//          if let channel::Output::Read(_, location) = self.0.response(response) {
+//              self.1.entry(location.contract).or_default().insert(location).then_some(location)
+//          } else {None}
+//      }
+//  }
 
 #[cfg(test)]
 mod test {
@@ -207,7 +233,7 @@ mod test {
 
         let mut a_room = Instance::new(alice.clone(), "MyRoom".to_string()).unwrap();
         let mut resolver = DefaultResolver::start();
-        let mut client = Client::new(DefaultResolver::start()).await;
+        let client = Client::new(DefaultResolver::start()).await;
 
         let mut make_request = async |room: &mut Instance<Room>| {
             let response = client.send(room.request().unwrap()).await.recv().await.unwrap();
