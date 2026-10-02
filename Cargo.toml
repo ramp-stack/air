@@ -22,7 +22,6 @@ chacha20-poly1305 = "0.1.2"
 secp256k1 = { version = "0.31.1", features = ["serde", "global-context", "rand", "hashes", "alloc"] }
 chrono = "0.4.44"
 
-substance = {path="../substance"}
 crossfire = {version="3.1.7", features=["tokio"]}
 tokio-tungstenite = "0.29.0"
 futures-util = {version="0.3.32", optional=true}
