@@ -190,20 +190,17 @@ pub trait Resolver {
     fn resolve(&mut self, name: Name, timestamp: Option<u64>) -> impl Future<Output = Arc<Identity>> + Send;
 }
 
-pub struct DefaultResolver();
-impl DefaultResolver {
-    pub fn start() -> Self {Self()}
-    async fn resolve(&mut self, name: Name, _timestamp: Option<u64>) -> Identity {
-        if name == Name::orange_me() {
-            Identity{name, url: vec![ORANGEME_URL.to_string()], public_key: name.0, servers: vec![], data: HashMap::new()}
-        } else {
-            Identity{name, url: vec![], public_key: name.0, servers: vec![Name::orange_me()], data: HashMap::new()}
-        }
-    }
-}
+#[derive(Serialize, Deserialize, Default)]
+pub struct DefaultResolver(HashMap<Name, Arc<Identity>>);
 impl Resolver for DefaultResolver {
-    async fn resolve(&mut self, name: Name, timestamp: Option<u64>) -> Arc<Identity> {
-        Arc::new(Self::resolve(self, name, timestamp).await)
+    async fn resolve(&mut self, name: Name, _timestamp: Option<u64>) -> Arc<Identity> {
+        self.0.entry(name).or_insert_with(|| {
+            Arc::new(if name == Name::orange_me() {
+                Identity{name, url: vec![ORANGEME_URL.to_string()], public_key: name.0, servers: vec![], data: HashMap::new()}
+            } else {
+                Identity{name, url: vec![], public_key: name.0, servers: vec![Name::orange_me()], data: HashMap::new()}
+            })
+        }).clone()
     }
 }
 

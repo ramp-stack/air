@@ -39,7 +39,7 @@ pub trait Contract: Serialize + for<'a> Deserialize<'a> + Hash + Clone + Debug +
     type Message: Serialize + for<'a> Deserialize<'a> + Hash + Clone + Debug + Send + Sync;
     type Init: Serialize + for<'a> Deserialize<'a> + Hash + Clone + Debug + Send + Sync;
 
-    type Result: Debug + Send + Sync;
+    type Result: Clone + Debug + Send + Sync;
     
     fn id() -> Id;
 
@@ -153,33 +153,6 @@ impl<C: Contract> Instance<C> {
         }
     }
 }
-
-//  const STORAGE: &str = "STORAGE";
-
-//  #[derive(Serialize, Deserialize, Debug)]
-//  pub struct Storage(Channel<Location>, HashMap<Id, HashSet<Location>>);
-//  impl Storage {
-//      pub fn new(secret: Secret) -> Self {
-//          let key = Key::Secret(secret.harden(None).derive(&[Id::hash(STORAGE)]));
-//          let storage = channel::Location{server: Name::orange_me(), discovery: key, encryption: key};
-//          Storage(Channel::new(storage), HashMap::new())
-//      }
-
-//      pub fn store(&mut self, location: Location) -> bool {
-//          if self.1.entry(location.contract).or_default().insert(location) {
-//              self.0.queue_mut().push_back(location);
-//              true
-//          } else {false}
-//      }
-
-//      pub fn start(&mut self) -> Request {self.0.start()}
-//      pub fn request(&mut self) -> Option<Request> {self.0.request()}
-//      pub fn response(&mut self, response: Response) -> Option<Location> {
-//          if let channel::Output::Read(_, location) = self.0.response(response) {
-//              self.1.entry(location.contract).or_default().insert(location).then_some(location)
-//          } else {None}
-//      }
-//  }
 
 #[cfg(test)]
 mod test {
