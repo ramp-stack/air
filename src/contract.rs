@@ -99,7 +99,7 @@ impl<C: Contract> Instance<C> {
     pub fn location(&self) -> &Location {&self.location}
     pub fn id(&self) -> Id {Id::hash(&self.location)}
     pub fn confirmed(&self) -> Option<&C> {self.confirmed.as_ref()}
-    pub fn pending(&self) -> &C {self.pending.as_ref().unwrap()}
+    pub fn pending(&self) -> Option<&C> {self.pending.as_ref()}
 
     pub fn send(&mut self, message: C::Message) -> C::Result {
         self.channel.queue_mut().push_back(Signed::new(&self.secret, Message::Message(message.clone())));
