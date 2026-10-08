@@ -122,9 +122,7 @@ impl<C: Contract> Instance<C> {
     }
 
     async fn verify<R: Resolver>(&mut self, resolver: &mut R, time: u64, message: Signed<Message<C>>) -> Option<(Name, Message<C>)> {
-        println!("resolving");
         let identity = resolver.resolve(message.signer, Some(time)).await;
-        println!("resolved");
         message.verify(&identity, &[C::id(), Id::hash(&self.location)]).ok()?;
         Some((message.signer, message.payload))
     }
