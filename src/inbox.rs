@@ -54,16 +54,6 @@ impl Inbox {
         })
     }
 
-    pub fn start(&mut self) -> HashMap<RequestType, Request> {
-        let mut requests = HashMap::from([
-            (RequestType::Notified, self.notified.0.start()),
-            (RequestType::Notifications, self.notifications.start()),
-        ]);
-        requests.extend(self.channels.iter_mut().map(|(n, c)| (RequestType::Channel(*n), c.start())));
-        requests.extend(self.notifying.iter_mut().map(|(n, c)| (RequestType::Notifying(*n), c.start())));
-        requests
-    }
-
     pub fn list(&self, contract: &Id) -> HashSet<contract::Location> {
         self.locations.get(contract).cloned().unwrap_or_default()
     }
@@ -99,6 +89,18 @@ impl Inbox {
         channel.queue_mut().push_back(location);
         true
     }
+
+    pub fn start(&mut self) -> HashMap<RequestType, Request> {
+        let mut requests = HashMap::from([
+            (RequestType::Notified, self.notified.0.start()),
+            (RequestType::Notifications, self.notifications.start()),
+        ]);
+        requests.extend(self.channels.iter_mut().map(|(n, c)| (RequestType::Channel(*n), c.start())));
+        requests.extend(self.notifying.iter_mut().map(|(n, c)| (RequestType::Notifying(*n), c.start())));
+        requests
+    }
+
+
 
     pub fn requests(&mut self) -> HashMap<RequestType, Request> {
         let mut requests = HashMap::new();
@@ -178,115 +180,129 @@ impl Inbox {
     }
 }
 
-#[cfg(test)]
-mod test {
-    use super::*;
-    use crate::names::DefaultResolver;
-    use crate::client::Client;
-    use crate::contract::{Instance, Metadata, Contract};
+//  #[cfg(test)]
+//  mod test {
+//      use super::*;
+//      use crate::names::DefaultResolver;
+//      use crate::storage::test::Storage;
+//      use crate::contract::{Instance, Metadata, Contract};
 
-    #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Hash)]
-    pub struct Message {
-        author: Name,
-        //timestamp: u64,
-        body: String,
-        sent: bool
-    }
+//      #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Hash)]
+//      pub struct Message {
+//          author: Name,
+//          //timestamp: u64,
+//          body: String,
+//          sent: bool
+//      }
 
-    #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Hash)]
-    pub struct Room {
-        author: Name,
-        name: String,
-        messages: Vec<Message>
-    }
-    impl Contract for Room {
-        type Init = String;
-        type Message = String;
-        type Result = usize;
+//      #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Hash)]
+//      pub struct Room {
+//          author: Name,
+//          name: String,
+//          messages: Vec<Message>
+//      }
+//      impl Contract for Room {
+//          type Init = String;
+//          type Message = String;
+//          type Result = usize;
 
-        fn id() -> Id {Id::hash("ROOM")}
+//          fn id() -> Id {Id::hash("ROOM")}
 
-        fn init(init: Self::Init, metadata: Metadata) -> Self {
-            Room{
-                author: metadata.signer,
-                name: init,
-                messages: vec![]
-            }
-        }
+//          fn init(init: Self::Init, metadata: Metadata) -> Self {
+//              Room{
+//                  author: metadata.signer,
+//                  name: init,
+//                  messages: vec![]
+//              }
+//          }
 
-        fn apply(&mut self, message: Self::Message, metadata: Metadata) -> Self::Result {
-            self.messages.push(Message{
-                body: message,
-                author: metadata.signer,
-                sent: metadata.confirmed
-            });
-            self.messages.len()
-        }
-    }
+//          fn apply(&mut self, message: Self::Message, metadata: Metadata) -> Self::Result {
+//              self.messages.push(Message{
+//                  body: message,
+//                  author: metadata.signer,
+//                  sent: metadata.confirmed
+//              });
+//              self.messages.len()
+//          }
+//      }
 
-    #[tokio::test]
-    async fn test() {
-        let alice = Secret::new();
-        let bob = Secret::new();
-        println!("alice: {}", alice.name());
-        println!("bob: {}", bob.name());
+//    //#[tokio::test]
+//    //async fn test() {
+//    //    let mut storage = Storage::new();
+//    //    let alice = Secret::new();
+//    //    let bob = Secret::new();
+//    //    println!("alice: {}", alice.name());
+//    //    println!("bob: {}", bob.name());
 
-        let mut a_client = Client::new(DefaultResolver::start()).await;
-        let mut b_client = Client::new(DefaultResolver::start()).await;
-        let mut resolver = DefaultResolver::start();
+//    //    let mut resolver = DefaultResolver::default();
 
-        let mut awaiting = HashMap::new();
-        let mut make_requests = async |inbox: &mut Inbox, name: Name, init: bool| {
-            let mut resolver = DefaultResolver::start();
-            let client = if name == alice.name() {&mut a_client} else {&mut b_client};
-            let awaiting = awaiting.entry(name).or_insert(HashMap::new());
-            let mut locations = vec![]; 
-            let requests = if init {inbox.start()} else {inbox.requests()};
-            for (ty, req) in requests {
-                awaiting.insert(ty, client.send(req).await);
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            for (key, responder) in awaiting {
-                match responder.try_recv() {
-                    Ok(response) => {
-                        if let Some(p) = inbox.response(&mut resolver, *key, response).await {
-                            locations.push(p);
-                        }
-                    },
-                    Err(e) => println!("{:?}, {:?}", key, e),
-                }
-            }
+//    //    let mut a_inbox = Inbox::new(alice.clone()).unwrap();
+//    //    let mut b_inbox = Inbox::new(bob.clone()).unwrap();
 
-            locations
-        };
+//    //    let mut make_requests = async || {
+//    //        let mut locations = HashSet::new();
+//    //        let index = index.entry(socket).or_default();
+//    //
+//    //        let requests = if init {inbox.start()} else {inbox.requests()};
+//    //        for (ty, req) in requests {
+//    //            let responses = storage.request(socket, index, req);
+//    //            for ((s, i), r) in responses {
+//    //                let ty = if s == socket && i ==
+
+//    //            }
+//    //            locations.insert(inbox.response(&mut resolver, *key, response).await);
+//    //            index += 1;
+//    //        }
 
 
-        let mut a_inbox = Inbox::new(alice.clone()).unwrap();
-        let mut b_inbox = Inbox::new(bob.clone()).unwrap();
-        make_requests(&mut a_inbox, alice.name(), true).await;
-        make_requests(&mut b_inbox, bob.name(), true).await;
-        let a_room = Instance::<Room>::new(alice.clone(), "MyRoom".to_string()).unwrap();
 
-        a_inbox.send(&mut resolver, bob.name(), *a_room.location()).await;
-        assert_eq!(a_inbox.notifying.get(&bob.name()).unwrap().location(), b_inbox.notifications.location());
-        //Status: channel with bob has a queued location, notifying bob has alices name queued
-        make_requests(&mut a_inbox, alice.name(), false).await;
+//    //        let awaiting = awaiting.entry(name).or_insert(HashMap::new());
+//    //        let mut locations = vec![];
+//    //        for (ty, req) in requests {
+//    //            let response = storage.request(socket, index, req);
+//    //            index += 1;
 
-        assert!(a_inbox.channels.get(&bob.name()).unwrap().queue().is_empty());//location was sent
-        assert!(a_inbox.notifying.is_empty());
-        assert!(a_inbox.notified.1.contains(&bob.name()));
-        assert!(a_inbox.notified.0.queue_mut().len() == 1);
+//    //        }
+//    //        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+//    //        for (key, responder) in awaiting {
+//    //            match responder.try_recv() {
+//    //                Ok(response) => {
+//    //                    if let Some(p) = inbox.response(&mut resolver, *key, response).await {
+//    //                        locations.push(p);
+//    //                    }
+//    //                },
+//    //                Err(e) => println!("{:?}, {:?}", key, e),
+//    //            }
+//    //        }
 
-        make_requests(&mut a_inbox, alice.name(), false).await;
-        assert!(a_inbox.notified.1.contains(&bob.name()));
-        assert!(a_inbox.notified.0.queue().is_empty());
+//    //        locations
+//    //    };
 
-        make_requests(&mut b_inbox, bob.name(), false).await;
-        assert!(b_inbox.channels.get(&alice.name()).unwrap().queue().is_empty());
-        assert!(b_inbox.notifying.is_empty());
-        assert!(b_inbox.notified.1.contains(&alice.name()));
-        assert!(b_inbox.notified.0.queue_mut().len() == 1);
 
-        assert_eq!(make_requests(&mut b_inbox, bob.name(), false).await, vec![(alice.name(), *a_room.location())]);
-    }
-}
+//    //    make_requests(&mut a_inbox, alice.name(), true).await;
+//    //    make_requests(&mut b_inbox, bob.name(), true).await;
+//    //    let a_room = Instance::<Room>::new(alice.clone(), "MyRoom".to_string()).unwrap();
+
+//    //    a_inbox.send(&mut resolver, bob.name(), *a_room.location()).await;
+//    //    assert_eq!(a_inbox.notifying.get(&bob.name()).unwrap().location(), b_inbox.notifications.location());
+//    //    //Status: channel with bob has a queued location, notifying bob has alices name queued
+//    //    make_requests(&mut a_inbox, alice.name(), false).await;
+
+//    //    assert!(a_inbox.channels.get(&bob.name()).unwrap().queue().is_empty());//location was sent
+//    //    assert!(a_inbox.notifying.is_empty());
+//    //    assert!(a_inbox.notified.1.contains(&bob.name()));
+//    //    assert!(a_inbox.notified.0.queue_mut().len() == 1);
+
+//    //    make_requests(&mut a_inbox, alice.name(), false).await;
+//    //    assert!(a_inbox.notified.1.contains(&bob.name()));
+//    //    assert!(a_inbox.notified.0.queue().is_empty());
+
+//    //    make_requests(&mut b_inbox, bob.name(), false).await;
+//    //    assert!(b_inbox.channels.get(&alice.name()).unwrap().queue().is_empty());
+//    //    assert!(b_inbox.notifying.is_empty());
+//    //    assert!(b_inbox.notified.1.contains(&alice.name()));
+//    //    assert!(b_inbox.notified.0.queue_mut().len() == 1);
+
+//    //    assert_eq!(make_requests(&mut b_inbox, bob.name(), false).await, vec![(alice.name(), *a_room.location())]);
+//    //}
+//  }

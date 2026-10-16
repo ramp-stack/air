@@ -50,8 +50,8 @@ impl PublicKey {
         PublicKey(key)
     }
 
-    pub fn to_array(&self) -> [u8; 64] {ElligatorSwift::from_pubkey(self.0).to_array()}
-    pub fn to_vec(&self) -> Vec<u8> {self.to_array().to_vec()}
+    pub fn to_array(self) -> [u8; 64] {ElligatorSwift::from_pubkey(self.0).to_array()}
+    pub fn to_vec(self) -> Vec<u8> {self.to_array().to_vec()}
     pub fn from_array(a: [u8; 64]) -> Self {
         Self(secp256k1::PublicKey::from_ellswift(ElligatorSwift::from_array(a)))
     }
@@ -134,8 +134,8 @@ impl SecretKey {
         SecretKey(key)
     }
 
-    pub fn to_array(&self) -> [u8; 32] {self.0.secret_bytes()}
-    pub fn to_vec(&self) -> Vec<u8> {self.to_array().to_vec()}
+    pub fn to_array(self) -> [u8; 32] {self.0.secret_bytes()}
+    pub fn to_vec(self) -> Vec<u8> {self.to_array().to_vec()}
     pub fn from_array(a: [u8; 32]) -> Result<Self, Error> {Ok(Self(secp256k1::SecretKey::from_byte_array(a).map_err(|_| Error::InvalidSecretKey)?))}
     pub fn from_bytes(b: &[u8]) -> Result<Self, Error> {
         Self::from_array(b.try_into().map_err(|_| Error::InvalidSecretKey)?)

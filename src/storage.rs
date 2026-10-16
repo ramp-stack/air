@@ -1,4 +1,4 @@
-use crate::names::{now, Error, Id};
+use crate::names::{now, Id, Signed, Secret};
 use crate::names::secp256k1::{Signed as KeySigned, PublicKey, Signature as KeySignature};
 
 use serde::{Serialize, Deserialize};
@@ -7,22 +7,13 @@ use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::fmt::Debug;
 
+pub type DBResponse = Option<(u64, KeySignature, Vec<u8>)>;
+
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
-pub enum Request{
-    Create(KeySigned<Vec<u8>>),
-    Read(PublicKey),
-}
+pub enum Request{ Create(KeySigned<Vec<u8>>), Read(PublicKey) }
 
-#[derive(Debug)]
-pub enum DBRequest {
-    FileRead(PublicKey),
-    FileWrite(u64, KeySigned<Vec<u8>>),
-}
-
-#[derive(Debug)]
-pub enum DBResponse {
-    File(Option<(u64, KeySignature, Vec<u8>)>),
-}
+#[derive(Debug, Clone)]
+pub enum DBRequest { Read(PublicKey), Write(u64, KeySigned<Vec<u8>>)}
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 pub enum Response {
@@ -31,77 +22,89 @@ pub enum Response {
     InvalidSignature,
 }
 
-#[derive(Debug)]
-pub enum Output {
-    Read,
-    Empty(PublicKey),
-    Created(KeySigned<Vec<u8>>),
-    InvalidSignature
+pub struct Storage{
+    secret: Secret,
+    subscriptions: HashMap<PublicKey, HashSet<(u64, u64, Id)>>,
+    pending: Option<(u64, u64, Id, DBRequest)>
 }
-
-#[derive(Default)]
-pub struct Storage;
 impl Storage {
-    async fn request(request: Request) -> Result<DBRequest, Error> {
-        Ok(match request {
-            Request::Create(signed) => {
-                signed.verify()?;
-                //let hash = Id::hash(&signed.payload);
-                let timestamp = now();
-                //let signature = secret.sign(Id::hash(&(signed.key, timestamp, hash)));
-                DBRequest::FileWrite(timestamp, signed)
-            },
-            Request::Read(key) => DBRequest::FileRead(key),
-        })
+    pub fn new(secret: Secret) -> Self {Storage{secret, subscriptions: HashMap::new(), pending: None}}
+
+    #[allow(clippy::result_large_err)]
+    pub fn request(&mut self, socket: u64, index: u64, request: Request) -> Result<DBRequest, Signed<(Id, Response)>> {
+        let hash = Id::hash(&request);
+        let db_request = match request {
+            Request::Create(signed) => signed.verify()
+                .map(|_| DBRequest::Write(now(), signed))
+                .map_err(|_| self.sign(hash, Response::InvalidSignature))?,
+            Request::Read(key) => DBRequest::Read(key)
+        };
+        self.pending = Some((socket, index, hash, db_request.clone()));
+        Ok(db_request)
     }
 
-    async fn response(request: DBRequest, response: DBResponse) -> (Output, Response) {match (request, response) {
-        (DBRequest::FileWrite(_, _) | DBRequest::FileRead(_), DBResponse::File(Some((timestamp, key_sig, payload)))) =>
-            (Output::Read, Response::Read(timestamp, Some((key_sig, payload)))),
-        (DBRequest::FileWrite(timestamp, signed), DBResponse::File(None)) => 
-            (Output::Created(signed), Response::Created(timestamp)),
-        (DBRequest::FileRead(key), DBResponse::File(None)) => {
-            let time = now();
-            //let hash = Id::hash(&(key, time, Id::MIN));
-            (Output::Empty(key), Response::Read(time, None))
-        },
-    }}
-
-    pub async fn run(request: Request, mut handle: impl FnMut(&DBRequest) -> DBResponse) -> (Output, Response) {
-        match Storage::request(request).await {
-            Ok(req) => {
-                let res = handle(&req);
-                Self::response(req, res).await
+    pub fn response(&mut self, response: DBResponse) -> HashMap<(u64, u64), Signed<(Id, Response)>> {
+        let (socket, index, hash, db_request) = self.pending.take().expect("Must call request before response");
+        let mut results = HashMap::new();
+        let response = match (db_request, response) {
+            (DBRequest::Write(_, _) | DBRequest::Read(_), Some((timestamp, key_sig, payload))) =>
+                Response::Read(timestamp, Some((key_sig, payload))),
+            (DBRequest::Write(timestamp, signed), None) => {
+                if let Some(subscriptions) = self.subscriptions.remove(&signed.key) {
+                    subscriptions.into_iter().filter(|id| id.0 != socket).for_each(|(s, i, h)| {
+                        results.insert((s, i), self.sign(h, Response::Read(timestamp, Some((signed.signature, signed.payload.clone())))));
+                    })
+                }
+                Response::Created(timestamp)
             },
-            Err(_) => (Output::InvalidSignature, Response::InvalidSignature)
+            (DBRequest::Read(key), None) => {
+                self.subscriptions.entry(key).or_default().insert((socket, index, hash));
+                Response::Read(now(), None)
+            },
+        };
+        results.insert((socket, index), self.sign(hash, response));
+        results
+    }
+
+    pub fn handle(&mut self,
+        socket: u64, index: u64, request: Request,
+        mut db_handle: impl FnMut(DBRequest) -> DBResponse
+    ) -> HashMap<(u64, u64), Signed<(Id, Response)>> {
+        match self.request(socket, index, request) {
+            Ok(req) => {
+                let res = db_handle(req);
+                self.response(res)
+            },
+            Err(response) => HashMap::from([((socket, index), response)])
         }
     }
+
+    fn sign(&self, request: Id, response: Response) -> Signed<(Id, Response)> {
+        Signed::new(&self.secret, (request, response))
+    }
 }
 
-#[derive(Default)]
-pub struct Subscriptions {
-    files: HashMap<PublicKey, HashSet<(u64, u64, Id)>>,
-}
-impl Subscriptions {
-    pub fn process(&mut self, id: (u64, u64, Id), output: Output, response: Response) -> HashMap<(u64, u64, Id), Response> {match (output, response) {
-        (Output::Created(signed), Response::Created(time)) => {
-            println!("files: {:?}", self.files);
-            let mut map = self.files.remove(&signed.key).map(|ids| ids.into_iter().filter(|i| i.0 != id.0).map(|i|
-                (i, Response::Read(time, Some((signed.signature, signed.payload.clone()))))
-            ).collect::<HashMap<_, _>>()).unwrap_or_default();
-            map.insert(id, Response::Created(time));
-            map
-        },
-        (Output::Read, response) => HashMap::from([(id, response)]),
-        (Output::Empty(key), response) => {
-            self.files.entry(key).or_default().insert(id);
-            HashMap::from([(id, response)])
-        },
-        (Output::InvalidSignature, Response::InvalidSignature) => HashMap::from([(id, Response::InvalidSignature)]),
-        (o, r) => panic!("Unknown Output: {o:?}, {r:?}")
-    }}
+#[cfg(test)]
+pub mod test {
+    use crate::names::Secret;
+    use crate::names::secp256k1::{Signature as KeySignature, PublicKey};
+    use super::{DBRequest, Request, Response};
+    use std::collections::HashMap;
 
-    pub fn close_socket(&mut self, socket: u64) {
-        self.files.retain(|_, s| {s.retain(|s| s.0 != socket); !s.is_empty()});
+    pub struct Storage(super::Storage, HashMap<PublicKey, (u64, KeySignature, Vec<u8>)>);
+    impl Storage {
+        pub fn new() -> Self {Self(super::Storage::new(Secret::new()), HashMap::new())}
+        pub fn request(&mut self, socket: u64, index: u64, request: Request) -> HashMap<(u64, u64), Response> {
+            self.0.handle(socket, index, request, |req| match req {
+                DBRequest::Read(key) => self.1.get(&key).cloned(),
+                DBRequest::Write(time, signed) => match self.1.get(&signed.key) {
+                    Some(p) => Some(p.clone()),
+                    None => {
+                        self.1.insert(signed.key, (time, signed.signature, signed.payload.clone()));
+                        None
+                    }
+                }
+            }).into_iter().map(|(i, r)| (i, r.payload.1)).collect()
+        }
     }
 }

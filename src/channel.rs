@@ -76,10 +76,10 @@ impl<M: Serialize + for<'a> Deserialize<'a> + Debug> Channel<M> {
         location, timestamp: 0, index: 0, queue: VecDeque::new(), outgoing: None
     }}
 
-    pub fn location(&self) -> &Location {&self.location}
-    pub fn timestamp(&self) -> u64 {self.timestamp}
-    pub fn is_subscribed(&self) -> bool {matches!(self.outgoing, Some(Outgoing::Read(true)))}
-    pub fn outgoing(&self) -> Option<&M> {match &self.outgoing {Some(Outgoing::Create(_, m)) => Some(m), _ => None}}
+  //pub fn location(&self) -> &Location {&self.location}
+  //pub fn timestamp(&self) -> u64 {self.timestamp}
+  //pub fn is_subscribed(&self) -> bool {matches!(self.outgoing, Some(Outgoing::Read(true)))}
+  //pub fn outgoing(&self) -> Option<&M> {match &self.outgoing {Some(Outgoing::Create(_, m)) => Some(m), _ => None}}
     pub fn queue(&self) -> &VecDeque<M> {&self.queue}
 
     pub fn queue_mut(&mut self) -> &mut VecDeque<M> {&mut self.queue}
@@ -166,50 +166,50 @@ impl<M: Serialize + for<'a> Deserialize<'a> + Debug> Channel<M> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::names::DefaultResolver;
-    use crate::client::Client;
+    use crate::storage::test::Storage;
 
     #[tokio::test]
     async fn test() {
+        let mut storage = Storage::new();
+
         let location = Location{
             server: Name::orange_me(),
             discovery: Key::Secret(SecretKey::new()),
             encryption: Key::Secret(SecretKey::new()),
         };
         let mut a_channel = Channel::new(location);
-        let a_client = Client::new(DefaultResolver::start()).await;
 
-        let response = a_client.send(a_channel.request().unwrap()).await.recv().await.unwrap();
+        let response = storage.request(0, 0, a_channel.request().unwrap()).remove(&(0, 0)).unwrap();
         assert_eq!(Output::Subscribed, a_channel.response(response));
 
         let m = "Hello".to_string();
         a_channel.queue_mut().push_back(m.clone());
-        let response = a_client.send(a_channel.request().unwrap()).await.recv().await.unwrap();
+
+        let response = storage.request(0, 1, a_channel.request().unwrap()).remove(&(0, 1)).unwrap();
         let Output::Created(time, msg) = a_channel.response(response) else {panic!("_");};
         assert_eq!(m, msg);
 
-        let responder = a_client.send(a_channel.request().unwrap()).await;
-        let response = responder.recv().await.unwrap();
+        let response = storage.request(0, 2, a_channel.request().unwrap()).remove(&(0, 2)).unwrap();
         assert_eq!(Output::Subscribed, a_channel.response(response));
 
         let mut b_channel = Channel::new(location);
-        let b_client = Client::new(DefaultResolver::start()).await;
 
-        let response = b_client.send(b_channel.request().unwrap()).await.recv().await.unwrap();
+        let response = storage.request(1, 0, b_channel.request().unwrap()).remove(&(1, 0)).unwrap();
         let Output::Read(rt, rm) = b_channel.response(response) else {panic!("_");};
         assert_eq!(rt, time);
         assert_eq!(rm, m);
 
-        let response = b_client.send(b_channel.request().unwrap()).await.recv().await.unwrap();
+        let response = storage.request(1, 1, b_channel.request().unwrap()).remove(&(1, 1)).unwrap();
         assert_eq!(Output::Subscribed, b_channel.response(response));
 
         let m = "Hi".to_string();
         b_channel.queue_mut().push_back(m.clone());
-        let response = b_client.send(b_channel.request().unwrap()).await.recv().await.unwrap();
+        let mut responses = storage.request(1, 2, b_channel.request().unwrap());
+        let response = responses.remove(&(1, 2)).unwrap();
         let Output::Created(time, msg) = b_channel.response(response) else {panic!("_");};
         assert_eq!(m, msg);
 
-        let response = responder.recv_timeout(std::time::Duration::from_millis(100)).await.unwrap();
+        let response = responses.remove(&(0, 2)).unwrap();
         let Output::Read(rt, rm) = a_channel.response(response) else {panic!("_");};
         assert_eq!(rt, time);
         assert_eq!(rm, m);

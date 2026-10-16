@@ -38,7 +38,6 @@ impl Metadata {
 pub trait Contract: Serialize + for<'a> Deserialize<'a> + Hash + Clone + Debug + Send + Sync + 'static {
     type Message: Serialize + for<'a> Deserialize<'a> + Hash + Clone + Debug + Send + Sync;
     type Init: Serialize + for<'a> Deserialize<'a> + Hash + Clone + Debug + Send + Sync;
-
     type Result: Clone + Debug + Send + Sync;
     
     fn id() -> Id;
@@ -156,7 +155,7 @@ impl<C: Contract> Instance<C> {
 mod test {
     use super::*;
     use crate::names::DefaultResolver;
-    use crate::client::Client;
+    use crate::storage::test::Storage;
 
     #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Hash)]
     pub struct Message {
@@ -199,19 +198,19 @@ mod test {
 
     #[tokio::test]
     async fn test() {
+        let mut storage = Storage::new();
         let alice = Secret::new();
         let bob = Secret::new();
 
         let mut a_room = Instance::new(alice.clone(), "MyRoom".to_string()).unwrap();
-        let mut resolver = DefaultResolver::start();
-        let client = Client::new(DefaultResolver::start()).await;
+        let mut resolver = DefaultResolver::default();
 
         let mut make_request = async |room: &mut Instance<Room>| {
-            let response = client.send(room.request().unwrap()).await.recv().await.unwrap();
+            let response = storage.request(0, 0, room.request().unwrap()).remove(&(0, 0)).unwrap();
             room.response(&mut resolver, response).await
         };
 
-        assert_eq!(a_room.pending(), &Room{author: alice.name(), name: "MyRoom".to_string(), messages: vec![]});
+        assert_eq!(a_room.pending(), Some(&Room{author: alice.name(), name: "MyRoom".to_string(), messages: vec![]}));
         assert_eq!(a_room.confirmed(), None);
 
         assert_eq!(make_request(&mut a_room).await, Output::Init(vec![]));
@@ -220,9 +219,9 @@ mod test {
 
         assert_eq!(a_room.send("Hello Bob".to_string()), 1);
 
-        assert_eq!(a_room.pending(), &Room{author: alice.name(), name: "MyRoom".to_string(), messages: vec![
+        assert_eq!(a_room.pending(), Some(&Room{author: alice.name(), name: "MyRoom".to_string(), messages: vec![
             Message{author: alice.name(), body: "Hello Bob".to_string(), sent: false}
-        ]});
+        ]}));
 
         assert_eq!(make_request(&mut a_room).await, Output::Created(1, vec![]));
 
@@ -234,22 +233,22 @@ mod test {
         assert_eq!(b_room.confirmed(), None);
 
         assert_eq!(make_request(&mut b_room).await, Output::Init(vec![]));
-        assert_eq!(b_room.pending(), &Room{author: alice.name(), name: "MyRoom".to_string(), messages: vec![]});
+        assert_eq!(b_room.pending(), Some(&Room{author: alice.name(), name: "MyRoom".to_string(), messages: vec![]}));
         assert_eq!(b_room.confirmed(), Some(&Room{author: alice.name(), name: "MyRoom".to_string(), messages: vec![]}));
         
         assert_eq!(b_room.send("Hi Alice".to_string()), 1);
-        assert_eq!(b_room.pending(), &Room{author: alice.name(), name: "MyRoom".to_string(), messages: vec![
+        assert_eq!(b_room.pending(), Some(&Room{author: alice.name(), name: "MyRoom".to_string(), messages: vec![
             Message{author: bob.name(), body: "Hi Alice".to_string(), sent: false}
-        ]});
+        ]}));
 
         assert_eq!(make_request(&mut b_room).await, Output::Read(1, vec![2]));
         assert_eq!(b_room.confirmed(), Some(&Room{author: alice.name(), name: "MyRoom".to_string(), messages: vec![
             Message{author: alice.name(), body: "Hello Bob".to_string(), sent: true}
         ]}));
 
-        assert_eq!(b_room.pending(), &Room{author: alice.name(), name: "MyRoom".to_string(), messages: vec![
+        assert_eq!(b_room.pending(), Some(&Room{author: alice.name(), name: "MyRoom".to_string(), messages: vec![
             Message{author: alice.name(), body: "Hello Bob".to_string(), sent: true},
             Message{author: bob.name(), body: "Hi Alice".to_string(), sent: false}
-        ]});
+        ]}));
     }
 }

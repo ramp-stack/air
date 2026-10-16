@@ -15,16 +15,16 @@ mod fschacha20poly1305;
 pub mod secp256k1;
 use secp256k1::hashes;
 
-pub use secp256k1::{Sink, Drain, Party};
+pub use secp256k1::{Sink, Drain};
 
 const TAG: &str = "AIR_NAMES";
 const ORANGEME_NAME: &str = "037a581e7728ce94d3fd67bdb1309672c4884aae774f911d0cada94fc9e50c955f";
-const ORANGEME_URL: &str = if cfg!(test) {"127.0.0.1:5702"} else {"air.orange.me:5702"};
+const ORANGEME_URL: &str = if cfg!(any(test, feature = "local")) {"127.0.0.1"} else {"air.orange.me"};
 
 pub fn now() -> u64 {chrono::Utc::now().timestamp_nanos_opt().unwrap() as u64}
 
 ///10 minutes
-pub const EXPIRATION: u64 = 600_000_000_000;
+//pub const EXPIRATION: u64 = 600_000_000_000;
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
@@ -158,7 +158,7 @@ pub struct Identity {
     name: Name,
     servers: Vec<Name>,
     public_key: secp256k1::PublicKey,
-    url: Vec<String>,
+    connection: HashMap<String, Vec<String>>,
     #[serde(flatten)]
     data: HashMap<String, String>
 }
@@ -180,8 +180,8 @@ impl Identity {
     ///If an Identity has a server it means that they actively listen to missives there
     pub fn servers(&self) -> &Vec<Name> {&self.servers}
 
-    ///If an Identity has a url it means they have a chandler running at that location
-    pub fn url(&self) -> &Vec<String> {&self.url}
+    ///If an Identity has connections it means they have a chandler running at that location
+    pub fn connection(&self) -> &HashMap<String, Vec<String>> {&self.connection}
 
     pub fn get(&self, key: &str) -> Option<&String> {self.data.get(key)}
 }
@@ -195,10 +195,14 @@ pub struct DefaultResolver(HashMap<Name, Arc<Identity>>);
 impl Resolver for DefaultResolver {
     async fn resolve(&mut self, name: Name, _timestamp: Option<u64>) -> Arc<Identity> {
         self.0.entry(name).or_insert_with(|| {
+            let connection = HashMap::from([
+                ("ws".to_string(), vec![ORANGEME_URL.to_string()]),
+                ("wss".to_string(), vec![ORANGEME_URL.to_string()]),
+            ]);
             Arc::new(if name == Name::orange_me() {
-                Identity{name, url: vec![ORANGEME_URL.to_string()], public_key: name.0, servers: vec![], data: HashMap::new()}
+                Identity{name, connection, public_key: name.0, servers: vec![], data: HashMap::new()}
             } else {
-                Identity{name, url: vec![], public_key: name.0, servers: vec![Name::orange_me()], data: HashMap::new()}
+                Identity{name, connection, public_key: name.0, servers: vec![Name::orange_me()], data: HashMap::new()}
             })
         }).clone()
     }
@@ -238,12 +242,12 @@ impl<H: Hash + Debug> AsRef<H> for Signed<H> {fn as_ref(&self) -> &H {&self.payl
 ///Stream lasts only as long as the Identity is valid check it every identity ttl
 pub struct Stream(secp256k1::Stream);
 impl Stream {
-    pub fn new(secret: &Secret, recipient: &Identity) -> Result<Self, Error> {
-        let party = if secret.temporary.public_key() > recipient.name.0 {Party::Initiator} else {Party::Responder};
-        let shared = secret.temporary.shared(&recipient.name.0, Some(party));
-        let stream = secp256k1::Stream::new(shared, party);
-        Ok(Self(stream))
-    }
+  //pub fn new(secret: &Secret, recipient: &Identity) -> Result<Self, Error> {
+  //    let party = if secret.temporary.public_key() > recipient.name.0 {Party::Initiator} else {Party::Responder};
+  //    let shared = secret.temporary.shared(&recipient.name.0, Some(party));
+  //    let stream = secp256k1::Stream::new(shared, party);
+  //    Ok(Self(stream))
+  //}
 
     pub fn send(identity: &Identity, _path: &[Id]) -> (Stream, StreamRequest) {
         let (stream, public) = secp256k1::Stream::send(identity.name.0);
@@ -254,13 +258,13 @@ impl Stream {
         Stream(secp256k1::Stream::receive(&secret.temporary, request.0))
     }
 
-    pub fn encrypt(&mut self, data: Vec<u8>) -> Vec<u8> {
-        self.0.encrypt(data)
-    }
+  //pub fn encrypt(&mut self, data: Vec<u8>) -> Vec<u8> {
+  //    self.0.encrypt(data)
+  //}
 
-    pub fn decrypt(&mut self, message: Vec<u8>) -> Result<Vec<u8>, Error> {
-        self.0.decrypt(message)
-    }
+  //pub fn decrypt(&mut self, message: Vec<u8>) -> Result<Vec<u8>, Error> {
+  //    self.0.decrypt(message)
+  //}
 
     pub fn split(self) -> (Sink, Drain) {self.0.split()}
 }
@@ -294,7 +298,7 @@ mod test {
     async fn encryption() {
         let secret = Secret::new();
         let name = secret.name();
-        let mut resolver = DefaultResolver::start();
+        let mut resolver = DefaultResolver::default();
         let identity = resolver.resolve(name, None).await;
 
         let m = b"hello".to_vec();
@@ -307,7 +311,7 @@ mod test {
         let secret = Secret::new();
         let name = secret.name();
 
-        let mut resolver = DefaultResolver::start();
+        let mut resolver = DefaultResolver::default();
         let identity = resolver.resolve(name, None).await;
 
         let path = &[Id::random()];

@@ -6,7 +6,19 @@ AIR is the RAMP stack's protocol for encrypted data storage and messaging. Its d
 - **Isolated:** Each piece of data has its own keys, with no shared account or identifier exposing its relationship to other data.
 - **Redundant:** Keeping data on servers run by multiple companies keeps it available if one goes offline or blocks your access.
 
-## Run the typing demo
+## Version 2.1.0
+
+Transport clients and servers now live in
+[`air_server`](https://github.com/ramp-stack/air_server). AIR provides the
+identity, encryption, contract, inbox, and storage APIs shared by them.
+This release changes public exports and removes the old transport modules
+and `stream` feature. Applications using those APIs must update to the new
+client. The new session protocol is not compatible with older clients.
+
+## Historical typing demo
+
+The pinned demo below uses the older API and requires a server running its
+matching protocol. It cannot connect to the current `air.orange.me` server.
 
 The [typing demo](https://github.com/ramp-stack/maverick_os/tree/5841507e3eefd51a8ce852e8730d04b998877d35/demo) saves each character through AIR. Use **macOS**, current stable Rust with Cargo, and Xcode Command Line Tools. It needs internet access to `air.orange.me:5702`; no account, API key, or local server setup is required.
 
