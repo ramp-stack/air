@@ -61,7 +61,7 @@ pub enum Output<M> {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-enum Outgoing<M> { Create(Id, M), Read(bool) }
+enum Outgoing<M> { Create(KeySigned<Vec<u8>>, M), Read(bool) }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Channel<M> {
@@ -85,7 +85,11 @@ impl<M: Serialize + for<'a> Deserialize<'a> + Debug> Channel<M> {
     pub fn queue_mut(&mut self) -> &mut VecDeque<M> {&mut self.queue}
 
     pub fn start(&mut self) -> Request {
-        if let Some(Outgoing::Create(_, m)) = self.outgoing.take() {self.request_create(m)} else {self.request().unwrap()}
+        if let Some(Outgoing::Create(request, _)) = &self.outgoing {
+            return Request::Create(request.clone())
+        }
+        self.outgoing = None;
+        self.request().unwrap()
     }
 
     pub fn request(&mut self) -> Option<Request> {
@@ -102,15 +106,16 @@ impl<M: Serialize + for<'a> Deserialize<'a> + Debug> Channel<M> {
 
     pub fn response(&mut self, response: Response) -> Output<M> {
         match (self.outgoing.take(), response) {
-            (Some(Outgoing::Create(hash, m)), Response::Created(time)) if self.verify(time, Some((None, hash))) =>
+            (Some(Outgoing::Create(request, m)), Response::Created(time))
+                if self.verify(time, Some((None, Id::hash(&request.payload)))) =>
                 Output::Created(time, m),
             (Some(Outgoing::Read(_)), Response::Read(time, None)) if self.verify(time, None) => {
                 self.outgoing = Some(Outgoing::Read(true));
                 Output::Subscribed
             },
-            (Some(Outgoing::Create(h, m)), Response::Read(time, Some((key_sig, payload)))) => {
+            (Some(Outgoing::Create(request, m)), Response::Read(time, Some((key_sig, payload)))) => {
                 let hash = Id::hash(&payload);
-                let read_created = h == hash;
+                let read_created = Id::hash(&request.payload) == hash;
                 let key_sig = (!read_created).then_some(key_sig);//skip key_sig verification if I created it
                 match (read_created, self.verify(time, Some((key_sig, hash)))) {
                     (true, true) => Output::Created(time, m),
@@ -158,8 +163,9 @@ impl<M: Serialize + for<'a> Deserialize<'a> + Debug> Channel<M> {
         let key = self.location.writing(self.index).unwrap();
         let encryption = self.location.encryption(self.index);
         let encrypted = encryption.encrypt(postcard::to_allocvec(&outgoing).unwrap());
-        self.outgoing = Some(Outgoing::Create(Id::hash(&encrypted), outgoing));
-        Request::Create(KeySigned::new(&key, encrypted))
+        let request = KeySigned::new(&key, encrypted);
+        self.outgoing = Some(Outgoing::Create(request.clone(), outgoing));
+        Request::Create(request)
     }
 }
 
