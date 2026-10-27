@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "air"
-version = "3.0.1"
+version = "4.0.0"
 dependencies = [
  "chacha20-poly1305",
  "chrono",

@@ -6,6 +6,35 @@ AIR is the RAMP stack's protocol for encrypted data storage and messaging. Its d
 - **Isolated:** Each piece of data has its own keys, with no shared account or identifier exposing its relationship to other data.
 - **Redundant:** Keeping data on servers run by multiple companies keeps it available if one goes offline or blocks your access.
 
+## Account state
+
+`Air::new(secret)` owns the account's contract catalog and its encrypted storage
+channel. `Air::create::<C>(init)` creates an instance and registers its location
+immediately. `Air::list(&C::id())` lists known locations for that contract.
+`Air::share(resolver, recipient, location)` sends access to another identity through
+its `Inbox`. The inbox handles peer exchanges; it no longer stores the
+account's catalog or accepts sends to the account itself. `Air` provides the account
+entry point, with requests routed by `RequestType::Storage` or
+`RequestType::Inbox(inbox::RequestType)`. The inbox retains its own request types
+and protocol implementation independently of `Air`.
+
+Drive `Air::start()`, `Air::requests()`, and `Air::response(...)` through the chosen
+transport. A response returns a location when it becomes newly known. Received
+shares join the catalog, which synchronizes across devices using the same secret.
+The returned contract instances have their own request/response flow.
+
+AIR owns protocol state without spawning tasks or requiring a shared-state runtime.
+Cloning `Air` copies that state; runtime adapters provide shared handles. Creation
+queues catalog storage and returns local instance state; the caller must persist
+both states and drive their requests to complete remote storage. Serialized `Air`
+state includes queued and outstanding catalog and inbox requests.
+
+The `names`, `storage`, `channel`, `contract`, and `inbox` modules are public.
+Callers can use their APIs directly, including cryptographic primitives under
+`names::secp256k1`, encrypted streams, server storage, and standalone inboxes.
+Identity, contract, and storage root re-exports remain available. Use `air::inbox::Inbox`
+for standalone peer exchanges; account catalogs now belong to `air::Air`.
+
 ## Version 2.1.0
 
 Transport clients and servers now live in
