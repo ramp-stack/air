@@ -102,6 +102,10 @@ pub mod test {
     use std::collections::HashMap;
 
     pub struct Storage(super::Storage, HashMap<PublicKey, (u64, KeySignature, Vec<u8>)>);
+    impl Default for Storage {
+        fn default() -> Self {Self::new()}
+    }
+
     impl Storage {
         pub fn new() -> Self { Self(super::Storage::new(Secret::new()), HashMap::new()) }
         pub fn request(&mut self, socket: u64, index: u64, request: Request) -> HashMap<(u64, u64), Response> {

@@ -1,6 +1,6 @@
 [package]
 name = "air"
-version = "4.0.0"
+version = "4.0.1"
 edition = "2024"
 authors = ["Caleb Couch <caleb@orange.me>"]
 description = "A.I.R"
@@ -17,14 +17,12 @@ local = []
 [dependencies]
 hex = "0.4.3"
 serde = {version = "1.0.202", features=["rc", "derive"]}
-serde_json = { version = "1.0.*", features = ["raw_value"] }
-url = { version = "2.5.0", features = ["serde"] }
 serde_with = "3.14.0"
-rusqlite = {version="0.39.0", features =["serde_json", "bundled"]}
-tokio = {version = "1.47.1", features = ["sync", "time", "macros", "rt-multi-thread", "net", "io-util"]}
-log = "0.4.29"
 
 chacha20-poly1305 = "0.1.2"
 secp256k1 = { version = "0.31.1", features = ["serde", "global-context", "rand", "hashes", "alloc"] }
 chrono = "0.4.44"
 postcard = {version = "1.1.3", features = ["alloc"]}
+
+[dev-dependencies]
+tokio = {version = "1.47.1", features = ["macros", "rt"]}
